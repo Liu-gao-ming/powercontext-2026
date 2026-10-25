@@ -237,3 +237,8 @@ docs/website/node_modules/
 
 .codefuse/
 apps/vscode-extension/package-lock.json
+
+# Local competition workspace (VLDB 2026)
+.venv312/
+temp/
+docs/*.pdf

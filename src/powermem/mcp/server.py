@@ -40,8 +40,10 @@ from typing import Any, Dict, List, Optional, Union
 logger = logging.getLogger(__name__)
 
 from fastmcp import FastMCP
+from pydantic import BaseModel
 
 from powermem import auto_config, create_memory
+from powermem.mcp.access import access_logged
 from powermem.mcp.args import build_arg_parser
 from powermem.user_memory import UserMemory
 
@@ -139,6 +141,55 @@ def _coerce_memory_id(memory_id: str) -> int:
         raise ValueError("memory_id must be a numeric string")
 
 
+class MemoryCitation(BaseModel):
+    """Nested citation for addressing an exact memory entry (U4).
+
+    Mirrors the archive powercontext contract: exact-entry tools accept a
+    nested ``citation`` object (``memory_ref`` / ``entry_id`` /
+    ``entry_version_id``) instead of exposing a bare flat ``memory_id``.
+    Resolution precedence: ``memory_ref`` > ``entry_id`` > ``entry_version_id``;
+    the legacy flat ``memory_id`` remains supported as a backward-compatible
+    alias and is only consulted when the citation is absent or empty.
+    """
+
+    memory_ref: Optional[str] = None
+    entry_id: Optional[str] = None
+    entry_version_id: Optional[str] = None
+
+
+_REF_PREFIXES = ("memory:", "entry:", "ref:")
+
+
+def _resolve_memory_id(memory_id: Optional[str], citation: Optional[MemoryCitation]) -> int:
+    """Resolve the effective numeric memory id from citation or legacy id.
+
+    Accepts either a :class:`MemoryCitation` instance or a plain mapping (the
+    MCP transport performs the pydantic coercion before invoking the tool;
+    direct in-process calls may pass a dict).
+
+    Raises ValueError with the same message used by :func:`_coerce_memory_id`
+    when neither source yields a numeric value.
+    """
+    raw: Optional[str] = None
+    if citation is not None:
+        if isinstance(citation, dict):
+            citation = MemoryCitation(**citation)
+        raw = citation.memory_ref or citation.entry_id or citation.entry_version_id or None
+    if raw is None:
+        raw = memory_id
+    if raw is None:
+        raise ValueError("memory_id must be a numeric string")
+    text = str(raw).strip()
+    for prefix in _REF_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        raise ValueError("memory_id must be a numeric string")
+
+
 def _normalise_messages(messages: Union[str, Dict, List[Dict]]) -> Union[str, List[Dict], None]:
     """
     Validate and normalise messages into the format Memory.add() expects.
@@ -166,6 +217,7 @@ def _normalise_messages(messages: Union[str, Dict, List[Dict]]) -> Union[str, Li
 # ============================================================================
 
 @mcp.tool()
+@access_logged()
 def add_memory(
     messages: Union[str, Dict, List[Dict]],
     user_id: Optional[str] = None,
@@ -212,6 +264,7 @@ def add_memory(
 
 
 @mcp.tool()
+@access_logged()
 def search_memories(
     query: str,
     user_id: Optional[str] = None,
@@ -249,24 +302,30 @@ def search_memories(
 
 
 @mcp.tool()
+@access_logged()
 def get_memory_by_id(
     memory_id: str,
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    citation: Optional[MemoryCitation] = None,
 ) -> str:
     """
     Retrieve a single memory by its ID.
 
     Args:
-        memory_id: Memory ID (string-encoded to preserve Snowflake precision).
+        memory_id: Legacy flat Memory ID (string-encoded to preserve
+                   Snowflake precision). Ignored when ``citation`` is given.
         user_id: User identifier.
         agent_id: Agent identifier.
+        citation: Nested citation object (U4). Exactly one of
+                  ``memory_ref`` / ``entry_id`` / ``entry_version_id`` is used
+                  to address the entry; ``memory_ref`` takes precedence.
 
     Returns:
         JSON string with the memory record, or an error if not found.
     """
     try:
-        mid = _coerce_memory_id(memory_id)
+        mid = _resolve_memory_id(memory_id, citation)
     except ValueError as exc:
         return _fmt({"success": False, "error": str(exc)})
     result = get_memory().get(memory_id=mid, user_id=user_id, agent_id=agent_id)
@@ -276,28 +335,34 @@ def get_memory_by_id(
 
 
 @mcp.tool()
+@access_logged()
 def update_memory(
     memory_id: str,
     content: str,
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    citation: Optional[MemoryCitation] = None,
 ) -> str:
     """
     Update the content of an existing memory.
 
     Args:
-        memory_id: Memory ID (string-encoded to preserve Snowflake precision).
+        memory_id: Legacy flat Memory ID (string-encoded to preserve
+                   Snowflake precision). Ignored when ``citation`` is given.
         content: New content string.
         user_id: User identifier.
         agent_id: Agent identifier.
         metadata: Metadata to update.
+        citation: Nested citation object (U4). Exactly one of
+                  ``memory_ref`` / ``entry_id`` / ``entry_version_id`` is used
+                  to address the entry; ``memory_ref`` takes precedence.
 
     Returns:
         JSON string with the update result.
     """
     try:
-        mid = _coerce_memory_id(memory_id)
+        mid = _resolve_memory_id(memory_id, citation)
     except ValueError as exc:
         return _fmt({"success": False, "error": str(exc)})
     result = get_memory().update(
@@ -311,24 +376,30 @@ def update_memory(
 
 
 @mcp.tool()
+@access_logged()
 def delete_memory(
     memory_id: str,
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    citation: Optional[MemoryCitation] = None,
 ) -> str:
     """
     Delete a single memory by ID.
 
     Args:
-        memory_id: Memory ID (string-encoded to preserve Snowflake precision).
+        memory_id: Legacy flat Memory ID (string-encoded to preserve
+                   Snowflake precision). Ignored when ``citation`` is given.
         user_id: User identifier.
         agent_id: Agent identifier.
+        citation: Nested citation object (U4). Exactly one of
+                  ``memory_ref`` / ``entry_id`` / ``entry_version_id`` is used
+                  to address the entry; ``memory_ref`` takes precedence.
 
     Returns:
         JSON string with ``{"success": bool, "memory_id": str}``.
     """
     try:
-        mid = _coerce_memory_id(memory_id)
+        mid = _resolve_memory_id(memory_id, citation)
     except ValueError as exc:
         return _fmt({"success": False, "error": str(exc)})
     success = get_memory().delete(memory_id=mid, user_id=user_id, agent_id=agent_id)
@@ -336,6 +407,7 @@ def delete_memory(
 
 
 @mcp.tool()
+@access_logged()
 def delete_all_memories(
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
@@ -357,6 +429,7 @@ def delete_all_memories(
 
 
 @mcp.tool()
+@access_logged()
 def list_memories(
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
@@ -394,6 +467,7 @@ def list_memories(
 # ============================================================================
 
 @mcp.tool()
+@access_logged()
 def add_memory_with_profile(
     messages: Union[str, Dict, List[Dict]],
     user_id: str,
@@ -449,6 +523,7 @@ def add_memory_with_profile(
 
 
 @mcp.tool()
+@access_logged()
 def search_memories_with_profile(
     query: str,
     user_id: str,
@@ -489,6 +564,7 @@ def search_memories_with_profile(
 
 
 @mcp.tool()
+@access_logged()
 def get_user_profile(user_id: str) -> str:
     """
     Retrieve the full profile for a user.
@@ -506,6 +582,7 @@ def get_user_profile(user_id: str) -> str:
 
 
 @mcp.tool()
+@access_logged()
 def list_user_profiles(
     user_id: Optional[str] = None,
     main_topic: Optional[List[str]] = None,
@@ -540,6 +617,7 @@ def list_user_profiles(
 
 
 @mcp.tool()
+@access_logged()
 def delete_user_profile(user_id: str) -> str:
     """
     Delete a user's profile (does not delete their memories).
@@ -563,26 +641,32 @@ def delete_user_profile(user_id: str) -> str:
 
 
 @mcp.tool()
+@access_logged()
 def delete_memory_with_profile(
     memory_id: str,
     user_id: str,
     agent_id: Optional[str] = None,
     delete_profile: bool = False,
+    citation: Optional[MemoryCitation] = None,
 ) -> str:
     """
     Delete a memory and optionally the user's profile.
 
     Args:
-        memory_id: Memory ID (string-encoded to preserve Snowflake precision).
+        memory_id: Legacy flat Memory ID (string-encoded to preserve
+                   Snowflake precision). Ignored when ``citation`` is given.
         user_id: User identifier (required).
         agent_id: Agent identifier.
         delete_profile: Also delete the user's profile when True (default False).
+        citation: Nested citation object (U4). Exactly one of
+                  ``memory_ref`` / ``entry_id`` / ``entry_version_id`` is used
+                  to address the entry; ``memory_ref`` takes precedence.
 
     Returns:
         JSON string with success status.
     """
     try:
-        mid = _coerce_memory_id(memory_id)
+        mid = _resolve_memory_id(memory_id, citation)
     except ValueError as exc:
         return _fmt({"success": False, "error": str(exc)})
     success = get_user_memory().delete(
