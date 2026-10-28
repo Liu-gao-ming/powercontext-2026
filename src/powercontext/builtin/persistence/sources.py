@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ from powercontext.sources import (
     SourceObservation,
     SourceRef,
 )
+from powercontext.sources.evidence import log_evidence_neutralized
 
 _AnySourceAdapter = SourceAdapter[Any, Any, Any]
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
@@ -73,6 +75,20 @@ SOURCE_PROCESSING_BINDINGS = (
     PROFILE_SOURCE_WINDOW_BINDING,
 )
 _SOURCE_LOOKUP_KEYS_PER_STATEMENT = 400  # Two bind values per key, including SQLite's 999-variable builds.
+_VALIDATORS: dict[str, Any] = {}
+
+
+def _source_validator(manifest: SourceDefinitionManifest) -> Any:
+    """Compile a retained schema once per immutable manifest fingerprint."""
+
+    validator = _VALIDATORS.get(manifest.fingerprint)
+    if validator is None:
+        schema = manifest.source_schema
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema, registry=Registry())
+        if len(_VALIDATORS) < 128:
+            _VALIDATORS[manifest.fingerprint] = validator
+    return validator
 
 
 class _StoredSourcePayload(BaseModel):
@@ -211,8 +227,11 @@ class SourceRepository:
                 .values(position=position)
             )
             await connection.execute(insert(SOURCES_TABLE), new_rows)
+            # Reuse only within this journal-locked batch; a rollback or later
+            # registration must never inherit an earlier transaction's result.
+            native_manifests: dict[tuple[str, str], SourceDefinitionManifest | None] = {}
             for ref, source in new_sources.values():
-                await self._bind_memory_evidence(connection, scope_id, ref, source)
+                await self._bind_memory_evidence(connection, scope_id, ref, source, native_manifests)
         for (source_type, source_id), payload in upgrades.items():
             await connection.execute(
                 update(SOURCES_TABLE)
@@ -360,21 +379,25 @@ class SourceRepository:
         identities = tuple(dict.fromkeys((ref.source_type, ref.source_id) for ref in refs))
         if not identities:
             return ()
-        rows = (
-            (
-                await connection.execute(
-                    select(SOURCES_TABLE).where(
-                        SOURCES_TABLE.c.scope_id == scope_id,
-                        tuple_(SOURCES_TABLE.c.source_type, SOURCES_TABLE.c.source_id).in_(identities),
+        by_ref: dict[tuple[str, str], Mapping[Any, Any]] = {}
+        for offset in range(0, len(identities), _SOURCE_LOOKUP_KEYS_PER_STATEMENT):
+            rows = (
+                (
+                    await connection.execute(
+                        select(SOURCES_TABLE).where(
+                            SOURCES_TABLE.c.scope_id == scope_id,
+                            tuple_(SOURCES_TABLE.c.source_type, SOURCES_TABLE.c.source_id).in_(
+                                identities[offset : offset + _SOURCE_LOOKUP_KEYS_PER_STATEMENT]
+                            ),
+                        )
                     )
                 )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
-        )
-        by_ref = {(row["source_type"], row["source_id"]): row for row in rows}
+            by_ref.update(((row["source_type"], row["source_id"]), row) for row in rows)
         materials: list[SourceEvidence] = []
-        fingerprints: dict[tuple[str, str], str] = {}
+        fingerprints: dict[tuple[str, str], str | None] = {}
         for ref in identities:
             reference = SourceRef(source_type=ref[0], source_id=ref[1])
             row = by_ref.get(ref)
@@ -382,7 +405,7 @@ class SourceRepository:
                 raise RepositoryNotFoundError("source", (scope_id, reference))
             source, material, verifiable = await self._historical_material(connection, reference, row)
             if not verifiable:
-                fingerprints[ref] = ""  # Never authorize a retained declaration for this capture.
+                fingerprints[ref] = None  # Deliberately unverifiable, not a fingerprint mismatch.
             if isinstance(source, SourceObservation):
                 fingerprints[ref] = source.definition_fingerprint
             elif ref[0] == CONTENT_SOURCE_NAME:
@@ -446,15 +469,15 @@ class SourceRepository:
         manifest = await _find_evidence_manifest(connection, reference.source_type, source.definition_version)
         if manifest is not None and binding is not None and manifest.fingerprint == binding.manifest_fingerprint:
             try:
-                Draft202012Validator.check_schema(manifest.source_schema)
                 value = source.payload if isinstance(source, SourceObservation) else material
-                Draft202012Validator(manifest.source_schema, registry=Registry()).validate(value)
+                _source_validator(manifest).validate(value)
             except JsonSchemaValidationError as error:
                 if envelope.representation == "native" and binding.material_digest == _source_material_digest_material(
                     material
                 ):
                     # Older releases bound declarations without checking serialization
                     # compatibility. Exact accepted bytes remain readable, but neutral.
+                    log_evidence_neutralized("schema_mismatch", unit="source", level=logging.DEBUG)
                     return source, material, False
                 raise InvalidStoredPayloadError(
                     "source", reference.source_type, "payload does not match the historical schema"
@@ -628,6 +651,8 @@ class SourceRepository:
         try:
             definition = self._registry.definition_for_name(reference.source_type)
         except SourceDefinitionNotFoundError:
+            # No configured Definition can perform the live-decoder cross-check.
+            log_evidence_neutralized("definition_missing", unit="source", level=logging.DEBUG)
             return
         if _claims_identity_keys(definition.source_class):
             # The retained canonical identity/header is authoritative; a live business alias may claim it.
@@ -646,63 +671,67 @@ class SourceRepository:
         connection: AsyncConnection,
         scope_id: str,
         materials: tuple[SourceEvidence, ...],
-        fingerprints: Mapping[tuple[str, str], str],
+        fingerprints: Mapping[tuple[str, str], str | None],
     ) -> tuple[SourceEvidence, ...]:
         if not materials:
             return ()
         table = SOURCE_EVIDENCE_BINDINGS_TABLE
-        rows = (
-            (
-                await connection.execute(
-                    select(table).where(
-                        table.c.scope_id == scope_id,
-                        tuple_(table.c.source_type, table.c.source_id).in_(
-                            tuple((value.source_ref.source_type, value.source_ref.source_id) for value in materials)
-                        ),
+        identities = tuple((value.source_ref.source_type, value.source_ref.source_id) for value in materials)
+        bindings: dict[tuple[str, str], Mapping[Any, Any]] = {}
+        for offset in range(0, len(identities), _SOURCE_LOOKUP_KEYS_PER_STATEMENT):
+            rows = (
+                (
+                    await connection.execute(
+                        select(table).where(
+                            table.c.scope_id == scope_id,
+                            tuple_(table.c.source_type, table.c.source_id).in_(
+                                identities[offset : offset + _SOURCE_LOOKUP_KEYS_PER_STATEMENT]
+                            ),
+                        )
                     )
                 )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
-        )
-        bindings = {(row["source_type"], row["source_id"]): row for row in rows}
+            bindings.update(((row["source_type"], row["source_id"]), row) for row in rows)
         manifests: dict[tuple[str, str], SourceDefinitionManifest | None] = {}
         evidence: list[SourceEvidence] = []
         for value in materials:
             identity = (value.source_ref.source_type, value.source_ref.source_id)
+            if identity in fingerprints and fingerprints[identity] is None:
+                evidence.append(value)
+                continue
             binding = bindings.get(identity)
-            if binding is None or (
+            if binding is None:
+                # Captured before evidence bindings existed; no declaration was accepted.
+                log_evidence_neutralized("legacy_unverifiable", unit="source", level=logging.DEBUG)
+                evidence.append(value)
+                continue
+            if (
                 binding["material_digest"] != value.material_digest
                 or binding["definition_name"] != value.definition_name
                 or binding["definition_version"] != value.definition_version
-                or not isinstance(binding["manifest_fingerprint"], str)
+                or (
+                    binding["manifest_fingerprint"] is not None and not isinstance(binding["manifest_fingerprint"], str)
+                )
             ):
+                log_evidence_neutralized("digest_mismatch", unit="source", level=logging.WARNING)
+                evidence.append(value)
+                continue
+            if binding["manifest_fingerprint"] is None:
+                log_evidence_neutralized("no_manifest", unit="manifest")
                 evidence.append(value)
                 continue
             definition_identity = (value.definition_name, value.definition_version)
             if definition_identity not in manifests:
                 manifests[definition_identity] = await _find_evidence_manifest(connection, *definition_identity)
             manifest = manifests[definition_identity]
-            if (
-                manifest is None
-                or manifest.fingerprint != binding["manifest_fingerprint"]
-                or (identity in fingerprints and fingerprints[identity] != manifest.fingerprint)
-            ):
+            if manifest is None:
+                log_evidence_neutralized("no_manifest", unit="manifest")
                 evidence.append(value)
                 continue
-            try:
-                declaration = MemoryEvidenceDeclaration.model_validate_json(
-                    stored_bytes(binding["declaration"], column="declaration")
-                )
-            except (InvalidStoredColumnError, TypeError, ValueError):
-                declaration = MemoryEvidenceDeclaration()
             evidence.append(
-                value.model_copy(
-                    update={
-                        "manifest_fingerprint": manifest.fingerprint,
-                        "declaration": declaration,
-                    }
-                )
+                _apply_bound_declaration(value, binding, manifest, fingerprints.get(identity, manifest.fingerprint))
             )
         return tuple(evidence)
 
@@ -712,25 +741,30 @@ class SourceRepository:
         scope_id: str,
         ref: SourceRef,
         source: Source,
+        native_manifests: dict[tuple[str, str], SourceDefinitionManifest | None],
     ) -> None:
         """Freeze registration evidence only for a newly accepted Source row."""
 
         if isinstance(source, SourceObservation):
             manifest = await _find_evidence_manifest(connection, ref.source_type, source.definition_version)
             if manifest is not None and manifest.fingerprint != source.definition_fingerprint:
+                log_evidence_neutralized("digest_mismatch", unit="manifest", level=logging.WARNING)
                 manifest = None
         else:
             definition = self._registry.definition_for_source(source)
-            manifest = await SourceDefinitionManifestRepository().register_native(connection, definition)
+            identity = (definition.name, definition.version)
+            if identity not in native_manifests:
+                native_manifests[identity] = await SourceDefinitionManifestRepository().register_native(
+                    connection, definition
+                )
+            manifest = native_manifests[identity]
             if manifest is not None:
                 # A native decoder can accept representations its generated schema
                 # cannot describe. Such captures are valid, but cannot attest evidence.
                 try:
-                    Draft202012Validator.check_schema(manifest.source_schema)
-                    Draft202012Validator(manifest.source_schema, registry=Registry()).validate(
-                        source.model_dump(mode="json", by_alias=True)
-                    )
+                    _source_validator(manifest).validate(source.model_dump(mode="json", by_alias=True))
                 except (JsonSchemaValidationError, SchemaError, Unresolvable):
+                    log_evidence_neutralized("schema_mismatch", unit="source", level=logging.DEBUG)
                     manifest = None
         declaration = (
             MemoryEvidenceDeclaration() if manifest is None else self._registry.memory_evidence_for_source(source)
@@ -1006,6 +1040,32 @@ class SourceRepository:
             self._registry.definition_for_source(source)
             decoded = SourceRef(source_type=definition.name, source_id=source.name)
         return cast(Source, source), decoded
+
+
+def _apply_bound_declaration(
+    value: SourceEvidence,
+    binding: Mapping[Any, Any],
+    manifest: SourceDefinitionManifest,
+    expected_fingerprint: str | None,
+) -> SourceEvidence:
+    """Apply only a declaration bound to the verified historical manifest."""
+
+    if manifest.fingerprint != binding["manifest_fingerprint"] or expected_fingerprint != manifest.fingerprint:
+        log_evidence_neutralized("digest_mismatch", unit="manifest", level=logging.WARNING)
+        return value
+    try:
+        declaration = MemoryEvidenceDeclaration.model_validate_json(
+            stored_bytes(binding["declaration"], column="declaration")
+        )
+    except (InvalidStoredColumnError, TypeError, ValueError):
+        log_evidence_neutralized("decode_failed", unit="declaration", level=logging.WARNING)
+        declaration = MemoryEvidenceDeclaration()
+    return value.model_copy(
+        update={
+            "manifest_fingerprint": manifest.fingerprint,
+            "declaration": declaration,
+        }
+    )
 
 
 def _source_material_digest(source: Source) -> str:

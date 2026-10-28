@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -33,6 +34,7 @@ from powercontext.builtin.persistence.errors import (
 )
 from powercontext.builtin.persistence.tables import SOURCE_DEFINITION_MANIFESTS_TABLE
 from powercontext.sources import SourceDefinition, SourceDefinitionManifest
+from powercontext.sources.evidence import log_evidence_neutralized
 from powercontext.sources.observations import _manifest_for_definition
 
 
@@ -89,10 +91,16 @@ class SourceDefinitionManifestRepository:
         try:
             manifest = _manifest_for_definition(definition, transport=False)
         except Exception:  # Native schema providers may not expose a valid manifest.
+            log_evidence_neutralized("no_manifest", unit="manifest")
             return None
         try:
             return await self.register(connection, manifest)
-        except (IdentityMismatchError, InvalidStoredColumnError, InvalidStoredPayloadError, StoredPayloadConflictError):
+        except StoredPayloadConflictError:
+            # Two manifests exist under one identity; evidence cannot choose either.
+            log_evidence_neutralized("manifest_conflict", unit="manifest", level=logging.WARNING)
+            return None
+        except (IdentityMismatchError, InvalidStoredColumnError, InvalidStoredPayloadError):
+            log_evidence_neutralized("digest_mismatch", unit="manifest", level=logging.WARNING)
             return None
 
     async def get(

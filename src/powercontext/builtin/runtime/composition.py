@@ -929,6 +929,9 @@ def _validate_processing_source_registry(
         type(source_registry) is not SourceDefinitionRegistry
         or len(definitions) != len(builtin_definitions)
         or any(
+            # A host may replace only the evidence declaration while keeping the
+            # builtin adapter, version and projections. `memory_evidence` is
+            # deliberately excluded: it is the dimension this registration adds.
             not (
                 definition is expected
                 or (

@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+from typing import cast
 from urllib.parse import quote, unquote
 
+import aiosqlite
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from pydantic.alias_generators import to_camel
@@ -186,6 +189,92 @@ def test_source_batch_binds_each_new_identity_and_preserves_replayed_evidence() 
                 assert [stored.journal_position for stored, _ in replayed] == [2, 1, 2]
                 assert await neutral.historical_evidence(connection, "scope", refs) == evidence
                 assert await neutral.journal_position(connection, "scope") == 2
+
+    asyncio.run(scenario())
+
+
+def test_evidence_reads_large_source_batches_with_sqlite_variable_limit() -> None:
+    async def scenario() -> None:
+        declaration = MemoryEvidenceDeclaration(authority="repository_attested", verification="verified")
+        registry = SourceDefinitionRegistry((AdapterSourceDefinition(SOURCE_ADAPTERS[1], memory_evidence=declaration),))
+        repository = SourceRepository(registry)
+        sources = tuple(
+            NoteSource(name=f"note-{index}", materialization=SourceMaterialization.CAPTURED, body="Retained text.")
+            for index in range(501)
+        )
+        async with (
+            SQLiteProfile.open(SQLiteConfig(), tables=SHARED_TABLES) as profile,
+            profile.database.transaction() as connection,
+        ):
+            stored = await repository.add_many_with_status(connection, "scope", sources)
+            refs = tuple(item.ref for item, _ in stored)
+            driver = cast(aiosqlite.Connection, (await connection.get_raw_connection()).driver_connection)
+            previous_limit = await driver._execute(driver._conn.setlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+            try:
+                evidence = await repository.evidence(connection, "scope", (*reversed(refs), refs[0]))
+            finally:
+                await driver._execute(driver._conn.setlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+            assert tuple(item.source_ref for item in evidence) == tuple(reversed(refs))
+            assert all(item.declaration == declaration for item in evidence)
+
+    asyncio.run(scenario())
+
+
+def test_source_batches_register_evidence_again_after_savepoint_rollback() -> None:
+    async def scenario() -> None:
+        declaration = MemoryEvidenceDeclaration(authority="repository_attested", verification="verified")
+        repository = SourceRepository(
+            SourceDefinitionRegistry((AdapterSourceDefinition(SOURCE_ADAPTERS[1], memory_evidence=declaration),))
+        )
+        sources = tuple(
+            NoteSource(name=f"note-{index}", materialization=SourceMaterialization.CAPTURED, body="Retained text.")
+            for index in range(2)
+        )
+        async with (
+            SQLiteProfile.open(SQLiteConfig(), tables=SHARED_TABLES) as profile,
+            profile.database.transaction() as connection,
+        ):
+            async with connection.begin_nested() as savepoint:
+                await repository.add_many_with_status(connection, "scope", sources)
+                await savepoint.rollback()
+            stored = await repository.add_many_with_status(connection, "scope", sources)
+            assert all(created for _, created in stored)
+            evidence = await repository.evidence(connection, "scope", tuple(item.ref for item, _ in stored))
+            assert all(item.declaration == declaration for item in evidence)
+
+    asyncio.run(scenario())
+
+
+def test_source_batch_validates_each_capture_against_reused_manifest() -> None:
+    class MixedSource(SerializationAliasSource):
+        body: str
+
+        @field_serializer("body")
+        def serialize_body(self, value: str):
+            return {"text": value} if value == "incompatible" else value
+
+        @field_validator("body", mode="before")
+        @classmethod
+        def deserialize_body(cls, value):
+            return value["text"] if isinstance(value, dict) else value
+
+    async def scenario() -> None:
+        declaration = MemoryEvidenceDeclaration(authority="repository_attested", verification="verified")
+        registry = SourceDefinitionRegistry((
+            AdapterSourceDefinition(SerializationAliasAdapter(MixedSource), version="2", memory_evidence=declaration),
+        ))
+        sources = [
+            await registry.resolve(SerializationAliasInput(source_id=f"note-{index}", body=body))
+            for index, body in enumerate(("compatible", "incompatible", "compatible"))
+        ]
+        repository = SourceRepository(registry)
+        async with (
+            SQLiteProfile.open(SQLiteConfig(), tables=SHARED_TABLES) as profile,
+            profile.database.transaction() as connection,
+        ):
+            stored = await repository.add_many_with_status(connection, "scope", sources)
+            evidence = await repository.evidence(connection, "scope", tuple(item.ref for item, _ in stored))
+            assert [item.declaration for item in evidence] == [declaration, MemoryEvidenceDeclaration(), declaration]
 
     asyncio.run(scenario())
 

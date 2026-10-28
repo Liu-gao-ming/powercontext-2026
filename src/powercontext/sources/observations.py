@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Literal
+from types import UnionType
+from typing import Any, Literal, Union, get_args, get_origin
 
 import rfc8785
 from pydantic import (
@@ -248,28 +249,74 @@ def _validation_schema_matches_payload(
     source_class: type[BaseModel],
     seen: set[type[BaseModel]] | None = None,
 ) -> bool:
-    """Return whether validation-mode keys already describe the serialized payload."""
+    """Return whether validation-mode keys accept the serialized payload."""
 
     visited = set() if seen is None else seen
     if source_class in visited:
         return True
     visited.add(source_class)
     serialize_by_alias = bool(source_class.model_config.get("serialize_by_alias"))
+    # Preserve existing permissive manifests; optional renamed keys only fail when extras are forbidden.
+    forbid_extra = source_class.model_config.get("extra") == "forbid"
     for name, field in source_class.model_fields.items():
         if field.exclude:
             continue
         serialization_key = (field.serialization_alias or field.alias or name) if serialize_by_alias else name
-        if field.is_required() and _validation_schema_key(name, field) != serialization_key:
+        if (field.is_required() or forbid_extra) and _validation_schema_key(name, field) != serialization_key:
             return False
-        annotation = field.annotation
-        if (
-            field.is_required()
-            and isinstance(annotation, type)
-            and issubclass(annotation, BaseModel)
-            and not _validation_schema_matches_payload(annotation, visited)
+        if not _validation_schema_matches_annotation(field.annotation, visited):
+            return False
+    return True
+
+
+def _validation_schema_matches_annotation(annotation: Any, seen: set[type[BaseModel]]) -> bool:
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _validation_schema_matches_payload(annotation, seen)
+    arguments = get_args(annotation)
+    if get_origin(annotation) in (Union, UnionType):
+        return _union_validation_covers_payloads(arguments, seen)
+    return all(_validation_schema_matches_annotation(argument, seen) for argument in arguments)
+
+
+def _union_validation_covers_payloads(arguments: tuple[Any, ...], seen: set[type[BaseModel]]) -> bool:
+    # Every possible output needs coverage, not merely one compatible branch.
+    for branch in arguments:
+        if _validation_schema_matches_annotation(branch, set(seen)):
+            continue
+        if not isinstance(branch, type) or not issubclass(branch, BaseModel):
+            return False
+        serialized = branch.model_json_schema(
+            mode="serialization", by_alias=bool(branch.model_config.get("serialize_by_alias"))
+        )
+        if not any(
+            isinstance(candidate, type)
+            and issubclass(candidate, BaseModel)
+            and _same_flat_schema(serialized, candidate.model_json_schema())
+            for candidate in arguments
         ):
             return False
     return True
+
+
+def _same_flat_schema(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Prove flat model equivalence without interpreting references or nested schemas."""
+    supported = {"title", "type", "properties", "required", "additionalProperties"}
+    if left.keys() - supported or right.keys() - supported:
+        return False
+    left_properties = left.get("properties", {})
+    right_properties = right.get("properties", {})
+    if left_properties.keys() != right_properties.keys():
+        return False
+    for name, schema in left_properties.items():
+        other = right_properties[name]
+        # Only primitive properties: no refs, unions, containers or nested schemas.
+        if schema.get("type") not in {"string", "integer", "number", "boolean", "null"}:
+            return False
+        if {key: value for key, value in schema.items() if key != "title"} != {
+            key: value for key, value in other.items() if key != "title"
+        }:
+            return False
+    return all(left.get(key) == right.get(key) for key in supported - {"title", "properties"})
 
 
 def _validation_schema_key(name: str, field: Any) -> str | None:

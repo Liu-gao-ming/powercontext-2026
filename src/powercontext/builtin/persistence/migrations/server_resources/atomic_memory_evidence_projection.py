@@ -14,7 +14,10 @@
 
 """Rebuild disposable exact-revision evidence from retained declarations."""
 
+from sqlalchemy import inspect, select
+
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
+from powercontext.builtin.persistence.atomic_memory_evidence_schema import ATOMIC_MEMORY_EVIDENCE_SCHEMA_TABLE
 from powercontext.builtin.persistence.migrations.atomic_memory_evidence import require_atomic_memory_evidence_schema
 from powercontext.builtin.persistence.migrations.models import MigrationError
 from powercontext.builtin.persistence.migrations.pinned import finish, pinned
@@ -38,10 +41,13 @@ def _index(connection, configuration):
 
 
 def preflight(connection, *, configuration):
-    # Earlier pending revisions may not yet have created retained evidence tables.
-    from sqlalchemy import inspect
-
-    if "pc_atomic_memory_evidence_schema" in inspect(connection).get_table_names():
+    # The marker table may precede other retained tables in a committed MySQL
+    # DDL prefix. Its final row distinguishes readiness from resumable work.
+    marker = ATOMIC_MEMORY_EVIDENCE_SCHEMA_TABLE
+    if (
+        marker.name in inspect(connection).get_table_names()
+        and connection.execute(select(marker.c.schema_version).limit(1)).first() is not None
+    ):
         finish(require_atomic_memory_evidence_schema(pinned(connection)))
 
 

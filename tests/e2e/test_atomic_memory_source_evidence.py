@@ -33,6 +33,7 @@ from powercontext.builtin.artifacts.atomic_memory.extraction import (
     AtomicMemoryExtractionOutput,
 )
 from powercontext.builtin.inference import GenerationResult
+from powercontext.builtin.persistence import InvalidStoredPayloadError
 from powercontext.builtin.persistence.tables import SOURCES_TABLE
 from powercontext.builtin.runtime import (
     BuiltinConfig,
@@ -41,6 +42,7 @@ from powercontext.builtin.runtime import (
     open_builtin_runtime,
 )
 from powercontext.builtin.runtime.atomic_memory_rebuild import (
+    rebuild_atomic_memory_current,
     rebuild_atomic_memory_projection,
     verify_atomic_memory_current,
 )
@@ -441,5 +443,59 @@ def test_shared_merge_and_restore_preserve_source_evidence(migration_backend: Mi
             assert (await memory.evidence("a", revision=2)).sources[0].declaration == declaration
             assert await memory.evidence("combined", revision=1) == annotation
             assert await memory.evidence("a", revision=1) == accepted
+
+    asyncio.run(scenario())
+
+
+def test_current_rebuild_accepts_the_configured_source_registry(migration_backend: MigrationBackend) -> None:
+    class AliasedNote(NoteSource):
+        # Retained material keys this identity by its business alias, so only the
+        # registered Definition can decode it; the builtin registry cannot.
+        name: str = Field(alias="source_name")
+
+    class AliasedAdapter(NoteAdapter):
+        source_class = AliasedNote
+
+    registry = SourceDefinitionRegistry((AdapterSourceDefinition(AliasedAdapter()),))
+    config = BuiltinConfig(database=migration_backend.config)
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(config, source_registry=registry) as contexts:
+            context = await contexts.get("scope")
+            source = AliasedNote.model_validate({
+                "source_name": "aliased",
+                "materialization": "captured",
+                "body": "Retained.",
+            })
+            await context.sources.add(source)
+            ref = SourceRef(source_type="note", source_id=source.name)
+            await _commit(contexts, "scope", "rebuild", "Retained fact.", sources=(ref,))
+            # Replay a row captured before evidence bindings existed: no identity
+            # header, only the business-aliased native material.
+            material = source.model_dump(mode="json", by_alias=True)
+            payload = json.dumps({
+                "encoding": "powercontext-source-v1",
+                "representation": "native",
+                "value": material,
+            }).encode()
+            async with contexts.database.transaction() as connection:
+                await connection.execute(
+                    update(SOURCES_TABLE).where(SOURCES_TABLE.c.source_id == "aliased").values(payload=payload)
+                )
+            memory = contexts.atomic_memory.for_scope("scope")
+            expected = await memory.evidence("rebuild", revision=1)
+
+            # Maintenance must judge the row exactly as the configured read path does;
+            # the builtin registry cannot decode it and must not report success.
+            with pytest.raises(InvalidStoredPayloadError):
+                async with contexts.database.transaction() as connection:
+                    await rebuild_atomic_memory_current(connection, contexts.atomic_memory.index)
+
+            async with contexts.database.transaction() as connection:
+                report = await rebuild_atomic_memory_current(
+                    connection, contexts.atomic_memory.index, sources=contexts.repositories.sources
+                )
+            assert report.ready, report.errors
+            assert await memory.evidence("rebuild", revision=1) == expected
 
     asyncio.run(scenario())

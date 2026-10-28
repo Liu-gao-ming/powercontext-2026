@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -35,7 +36,7 @@ from powercontext.errors import (
     SourceProjectionNotFoundError,
 )
 from powercontext.sources.adapters import SourceAdapter
-from powercontext.sources.evidence import MemoryEvidenceDeclaration
+from powercontext.sources.evidence import MemoryEvidenceDeclaration, log_evidence_neutralized
 from powercontext.sources.models import Source, SourceProjectionKey
 
 InputT = TypeVar("InputT")
@@ -105,6 +106,9 @@ class SourceDefinitionRegistry:
     manifest identities, never worker payload or projection values. Declarations
     are validated and copied at construction; invalid or unavailable values are
     neutral and never prevent registration of an otherwise valid Definition.
+    Only host code constructing this registry supplies ``remote_declarations``;
+    no configuration file entry exists, because the keys must match manifests
+    that the deployment itself registered.
     """
 
     def __init__(
@@ -257,6 +261,7 @@ def _snapshot_memory_evidence(value: object) -> MemoryEvidenceDeclaration:
             value = value.model_dump(mode="python")
         return MemoryEvidenceDeclaration.model_validate(value)
     except (TypeError, ValueError):
+        log_evidence_neutralized("invalid_declaration", unit="declaration", level=logging.WARNING)
         return _NEUTRAL_MEMORY_EVIDENCE
 
 

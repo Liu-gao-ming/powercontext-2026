@@ -981,8 +981,17 @@ def _load_full_server_baseline(backend: _BackendTarget) -> None:
         ("ALTER TABLE pc_artifact_candidate_versions RENAME TO pc_candidate_versions", "s1300"),
         ("UPDATE pc_artifact_processing_schema SET config_manifest", "s1300"),
         ("CREATE TABLE pc_memory_artifact_archive", "s1400"),
+        ("CREATE TABLE pc_atomic_memory_evidence_schema", "v1_4_1_004"),
+        ("CREATE TABLE pc_source_evidence_bindings", "v1_4_1_004"),
     ],
-    ids=("retained-copy", "candidate-rename", "domain-processing", "next-revision"),
+    ids=(
+        "retained-copy",
+        "candidate-rename",
+        "domain-processing",
+        "next-revision",
+        "evidence-marker",
+        "evidence-bindings",
+    ),
 )
 def test_mysql_full_server_interruption_preserves_history_and_original_maintenance(
     backend: _BackendTarget, interruption: str, recorded_revision: str

@@ -16,11 +16,56 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from powercontext._logging import log_safely
 from powercontext.sources.models import SourceMaterialization, SourceRef
+
+_EVIDENCE_LOGGER = logging.getLogger(__name__)
+
+EvidenceNeutralReason = Literal[
+    "schema_mismatch",
+    "digest_mismatch",
+    "no_manifest",
+    "decode_failed",
+    "legacy_unverifiable",
+    "invalid_declaration",
+    "manifest_conflict",
+    "definition_missing",
+    "evidence_mismatch",
+]
+"""Bounded reasons why accepted evidence resolved to neutral.
+
+The vocabulary is operational only: it names which retained fact could not be
+attested, never the material, declaration body, or requested content.
+"""
+
+EvidenceNeutralUnit = Literal["source", "declaration", "manifest", "revision"]
+
+
+def log_evidence_neutralized(
+    reason: EvidenceNeutralReason,
+    *,
+    unit: EvidenceNeutralUnit,
+    level: int = logging.INFO,
+) -> None:
+    """Emit one content-free record for a neutralized evidence fact."""
+
+    log_safely(
+        _EVIDENCE_LOGGER,
+        level,
+        "Memory evidence resolved to neutral",
+        extra={
+            "event": "atomic_memory.evidence.neutral",
+            "operation": "atomic_memory.evidence",
+            "unit": unit,
+            "outcome": "neutral",
+            "reason": reason,
+        },
+    )
 
 
 class MemoryEvidenceDeclaration(BaseModel):

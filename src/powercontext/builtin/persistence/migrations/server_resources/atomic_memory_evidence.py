@@ -14,10 +14,10 @@
 
 """Validate retained evidence only after its introducing Server revision."""
 
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
-from powercontext.builtin.persistence.atomic_memory_evidence_schema import ATOMIC_MEMORY_EVIDENCE_TABLES
+from powercontext.builtin.persistence.atomic_memory_evidence_schema import ATOMIC_MEMORY_EVIDENCE_SCHEMA_TABLE
 from powercontext.builtin.persistence.migrations.atomic_memory_evidence import require_atomic_memory_evidence_schema
 from powercontext.builtin.persistence.migrations.models import MigrationError
 from powercontext.builtin.persistence.migrations.pinned import finish, pinned
@@ -27,9 +27,13 @@ from powercontext.builtin.runtime.atomic_memory_rebuild import verify_atomic_mem
 
 
 def preflight(connection, *, configuration):
-    # Planning earlier revisions must not require tables that their pending DDL creates.
-    tables = set(inspect(connection).get_table_names())
-    if any(table.name in tables for table in ATOMIC_MEMORY_EVIDENCE_TABLES):
+    # MySQL may commit the marker table before the remaining DDL. Its row is
+    # inserted last; only that completed declaration requires full readiness.
+    marker = ATOMIC_MEMORY_EVIDENCE_SCHEMA_TABLE
+    if (
+        marker.name in inspect(connection).get_table_names()
+        and connection.execute(select(marker.c.schema_version).limit(1)).first() is not None
+    ):
         finish(require_atomic_memory_evidence_schema(pinned(connection)))
 
 

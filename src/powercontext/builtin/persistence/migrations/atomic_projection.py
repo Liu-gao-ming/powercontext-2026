@@ -96,6 +96,8 @@ class AtomicProjectionMigrationRunner(ManagedMaintenanceRunner):
     def _state(self, connection: Connection, identity: BackendIdentity) -> tuple[str, bool, bool]:
         check_server_layout(connection)
         index = self._index(connection)
+        # Built from the migration bundle, so no host SourceDefinitionRegistry exists:
+        # admission uses BUILTIN_SOURCE_REGISTRY while host reads use the configured one.
         try:
             report = finish(
                 atomic_memory_rebuild.verify_atomic_memory_current(
@@ -169,6 +171,7 @@ class AtomicProjectionMigrationRunner(ManagedMaintenanceRunner):
     @override
     def _apply_operation(self, connection: Connection, guard) -> None:
         index = self._index(connection)
+        # No host registry on this bundle path; see the note in _state.
         report = finish(
             atomic_memory_rebuild.rebuild_atomic_memory_current(
                 pinned(connection), index, batch_size=self.batch_size, guard=guard

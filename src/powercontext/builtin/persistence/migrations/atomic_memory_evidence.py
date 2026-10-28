@@ -43,7 +43,10 @@ class AtomicMemoryEvidenceSchemaError(PersistenceError):
 
     def __init__(self, detail: str) -> None:
         message = {
-            "missing": "Atomic Memory evidence schema is incomplete; apply the registered p0005 migration",
+            "missing": (
+                "Atomic Memory evidence schema is incomplete; apply the registered evidence revision "
+                "(p0005 for runtime bundles, v1_5_0_001 in the Server chain)"
+            ),
             "version": "Atomic Memory evidence schema version is unsupported",
             "shape": "Atomic Memory evidence table has an incompatible shape",
         }[detail]
@@ -103,6 +106,15 @@ async def require_atomic_memory_evidence_schema(connection: AsyncConnection, tab
 
 
 async def _require_shape(connection: AsyncConnection, name: str, statement: str, dialect: str) -> None:
+    """Require the registered table shape: exact for SQLite, structural for MySQL.
+
+    SQLite stores the executed CREATE text in ``sqlite_master``, so exact equality
+    is the check available without a second SQL parser; it also freezes the Server
+    bundle and the runtime revision to one byte-identical DDL copy, asserted by
+    ``tests/builtin/persistence/test_atomic_evidence_schema_copies.py``. MySQL
+    reuses the frozen inventory parser because dumps and replays may normalize
+    physical formatting.
+    """
     if dialect == "sqlite":
         actual = await connection.exec_driver_sql(
             "SELECT type, name, sql FROM sqlite_master WHERE (name = ? OR tbl_name = ?) "

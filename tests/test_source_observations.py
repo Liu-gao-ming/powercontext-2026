@@ -225,6 +225,48 @@ def test_alias_serialization_remote_manifest_and_payload_remain_upgrade_stable(t
     asyncio.run(scenario())
 
 
+def test_optional_alias_with_forbidden_extras_accepts_the_worker_payload() -> None:
+    class OptionalAliasSource(Source):
+        model_config = ConfigDict(extra="forbid")
+        body: str = Field(default="Default body.", alias="wire_text")
+
+    class OptionalAliasAdapter:
+        name = "optional-alias"
+        input_class = str
+        source_class = OptionalAliasSource
+
+        async def resolve(self, value: str, /) -> OptionalAliasSource:
+            return OptionalAliasSource.model_validate({
+                "name": "optional",
+                "materialization": SourceMaterialization.CAPTURED,
+                "body": value,
+            })
+
+        async def read(self, source: OptionalAliasSource, /) -> str:
+            return source.body
+
+    async def scenario() -> None:
+        definition = AdapterSourceDefinition(OptionalAliasAdapter(), version="1")
+        registry = SourceDefinitionRegistry((definition,))
+        source = await registry.resolve("Retain the optional value.")
+        manifest = manifest_for_definition(definition)
+        observation = project_source_for_transport(registry, source)
+
+        async with SQLiteProfile.open(SQLiteConfig(), tables=SHARED_TABLES) as profile:
+            contexts = RelationalContexts(database=profile.database, source_registry=SourceDefinitionRegistry(()))
+            await contexts.register_source_definition(manifest)
+            receipt = await contexts.submit_source_observation(
+                SubmitSourceObservation(scope_id="scope-a", observation=observation)
+            )
+            stored = await (await contexts.get("scope-a")).sources.get(observation)
+
+        assert receipt.source_ref.source_id == "optional"
+        assert isinstance(stored, SourceObservation)
+        assert stored.payload["body"] == "Retain the optional value."
+
+    asyncio.run(scenario())
+
+
 def test_optional_alias_keeps_the_preexisting_manifest_fingerprint(tmp_path) -> None:
     class VersionedSource(Source):
         model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
@@ -277,7 +319,67 @@ def test_optional_alias_keeps_the_preexisting_manifest_fingerprint(tmp_path) -> 
     asyncio.run(scenario())
 
 
-def test_nullable_nested_alias_keeps_the_preexisting_manifest_fingerprint(tmp_path) -> None:
+@pytest.mark.parametrize("wrapper", ["default", "nullable", "list"])
+def test_populated_optional_nested_alias_accepts_the_worker_payload(wrapper: str) -> None:
+    class Detail(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+        label: str = Field(alias="wire_label")
+
+    class DefaultNestedSource(Source):
+        detail: Detail = Field(default_factory=lambda: Detail.model_validate({"label": "Default label."}))
+
+    class NullableNestedSource(Source):
+        detail: Detail | None = None
+
+    class ListNestedSource(Source):
+        detail: list[Detail] = Field(default_factory=list)
+
+    source_model = {
+        "default": DefaultNestedSource,
+        "nullable": NullableNestedSource,
+        "list": ListNestedSource,
+    }[wrapper]
+
+    class NestedAliasAdapter:
+        name = "optional-nested-alias"
+        input_class = str
+        source_class = source_model
+
+        async def resolve(self, value: str, /) -> Source:
+            detail = Detail.model_validate({"label": value})
+            return source_model.model_validate({
+                "name": "optional-nested",
+                "materialization": SourceMaterialization.CAPTURED,
+                "detail": [detail] if wrapper == "list" else detail,
+            })
+
+        async def read(self, source: Source, /) -> str:
+            return source.name
+
+    async def scenario() -> None:
+        definition = AdapterSourceDefinition(NestedAliasAdapter(), version="1")
+        registry = SourceDefinitionRegistry((definition,))
+        source = await registry.resolve("Retain the nested value.")
+        manifest = manifest_for_definition(definition)
+        observation = project_source_for_transport(registry, source)
+
+        async with SQLiteProfile.open(SQLiteConfig(), tables=SHARED_TABLES) as profile:
+            contexts = RelationalContexts(database=profile.database, source_registry=SourceDefinitionRegistry(()))
+            await contexts.register_source_definition(manifest)
+            receipt = await contexts.submit_source_observation(
+                SubmitSourceObservation(scope_id="scope-a", observation=observation)
+            )
+            stored = await (await contexts.get("scope-a")).sources.get(observation)
+
+        expected_detail = {"label": "Retain the nested value."}
+        assert receipt.source_ref.source_id == "optional-nested"
+        assert isinstance(stored, SourceObservation)
+        assert stored.payload["detail"] == ([expected_detail] if wrapper == "list" else expected_detail)
+
+    asyncio.run(scenario())
+
+
+def test_nullable_nested_alias_manifest_accepts_empty_payload(tmp_path) -> None:
     class Detail(BaseModel):
         label: str = Field(alias="wire_label")
 
@@ -306,14 +408,8 @@ def test_nullable_nested_alias_keeps_the_preexisting_manifest_fingerprint(tmp_pa
         source = await registry.resolve("Retained.")
         manifest = manifest_for_definition(definition)
         observation = project_source_for_transport(registry, source)
-        baseline = {
-            "name": definition.name,
-            "version": definition.version,
-            "source_schema": NullableSource.model_json_schema(),
-            "projections": [],
-        }
-        assert manifest.source_schema == NullableSource.model_json_schema()
-        assert manifest.fingerprint == f"sha256:{hashlib.sha256(rfc8785.dumps(baseline)).hexdigest()}"
+        # The declaration must also accept a populated Detail, even for an empty observation.
+        assert manifest.source_schema == NullableSource.model_json_schema(mode="serialization", by_alias=False)
         assert observation.payload["detail"] is None
 
         config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'nullable-nested.db'}")
@@ -515,3 +611,65 @@ def test_remote_schema_references_are_rejected_without_network_access(monkeypatc
             fingerprint=f"sha256:{'0' * 64}",
             source_schema={"$dynamicRef": "https://example.invalid/schema"},
         )
+
+
+def test_covered_union_retains_registered_manifest_and_accepts_both_branches() -> None:
+    class Aliased(BaseModel):
+        model_config = ConfigDict(populate_by_name=True, extra="forbid")
+        label: str = Field(validation_alias="wire_label")
+
+    class Canonical(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        label: str
+
+    class UnionSource(Source):
+        item: Aliased | Canonical
+
+    class UnionAdapter:
+        name = "covered-union"
+        input_class = str
+        source_class = UnionSource
+
+        async def resolve(self, value: str, /) -> UnionSource:
+            return UnionSource.model_validate({
+                "name": value,
+                "definition_version": "1",
+                "materialization": "captured",
+                "item": {"label": value},
+            })
+
+        async def read(self, source: UnionSource, /) -> str:
+            return source.item.label
+
+    async def scenario() -> None:
+        definition = AdapterSourceDefinition(UnionAdapter(), version="1")
+        declaration = {
+            "name": definition.name,
+            "version": definition.version,
+            "source_schema": UnionSource.model_json_schema(),
+            "projections": [],
+        }
+        historical = SourceDefinitionManifest.model_validate(
+            declaration
+            | {
+                "fingerprint": "sha256:" + hashlib.sha256(rfc8785.dumps(declaration)).hexdigest(),
+            }
+        )
+        async with SQLiteProfile.open(SQLiteConfig(), tables=SHARED_TABLES) as profile:
+            contexts = RelationalContexts(database=profile.database, source_registry=SourceDefinitionRegistry(()))
+            await contexts.register_source_definition(historical)
+            await contexts.register_source_definition(manifest_for_definition(definition))
+            for index, branch in enumerate((Aliased.model_validate({"label": "a"}), Canonical(label="b"))):
+                source = UnionSource.model_validate({
+                    "name": f"branch-{index}",
+                    "definition_version": "1",
+                    "materialization": "captured",
+                    "item": branch,
+                })
+                observation = project_source_for_transport(SourceDefinitionRegistry((definition,)), source)
+                receipt = await contexts.submit_source_observation(
+                    SubmitSourceObservation(scope_id="scope-a", observation=observation)
+                )
+                assert receipt.source_ref.source_id == source.name
+
+    asyncio.run(scenario())

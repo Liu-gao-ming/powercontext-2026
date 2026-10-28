@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from hashlib import sha256
+from itertools import groupby
 from time import perf_counter
 
 from pydantic import BaseModel, Field
@@ -151,12 +152,16 @@ async def _evidence_history(
         ).all()
         if not rows:
             break
-        for row in rows:
-            scope_id, artifact_id, revision = str(row.scope_id), str(row.artifact_id), int(row.revision)
-            reference = ArtifactRef(family=AtomicMemory.family, artifact_id=artifact_id, revision=revision)
-            artifact = await artifacts.get(connection, scope_id, reference)
-            yield await evidence.verify(connection, scope_id, reference, artifact.lineage.sources, sources=sources)
-            after = scope_id, artifact_id, revision
+        # Rows are ordered by scope, so one page holds contiguous per-scope groups.
+        for scope_id, group in groupby(rows, key=lambda row: str(row.scope_id)):
+            references = tuple(
+                ArtifactRef(family=AtomicMemory.family, artifact_id=str(row.artifact_id), revision=int(row.revision))
+                for row in group
+            )
+            loaded = await artifacts.get_many(connection, scope_id, references)
+            for reference, artifact in zip(references, loaded, strict=True):
+                yield await evidence.verify(connection, scope_id, reference, artifact.lineage.sources, sources=sources)
+                after = scope_id, reference.artifact_id, reference.revision
 
 
 def _obsolete_evidence():
@@ -402,12 +407,16 @@ async def rebuild_atomic_memory_current(
     index: AtomicMemoryIndex,
     *,
     batch_size: int = 100,
+    sources: SourceRepository | None = None,
     guard: Callable[[], None] = lambda: None,
 ) -> AtomicMemoryProjectionRebuildReport:
     """Repair registered no-vector rows inside the maintenance owner's transaction.
 
     The caller validates the existing schema, owns backup/recovery and commits
     only after full Server validation. No initialization or external I/O occurs.
+    ``sources`` is the deployment's Source registry: passing it keeps this repair's
+    evidence verdict identical to the runtime read path. A maintenance bundle has no
+    host registry, so it omits this and admission uses ``BUILTIN_SOURCE_REGISTRY``.
     """
     if index.capabilities.embedding_profile is not None:
         raise AtomicMemoryIndexError("embedding-profile", "Registered repair requires a no-vector profile")
@@ -425,9 +434,14 @@ async def rebuild_atomic_memory_current(
                 await publisher.remove(connection, scope_id, artifact_id)
             after = scope_id, artifact_id
     await connection.execute(index.table.delete().where(_obsolete_current(index)))
-    await rebuild_atomic_memory_evidence(connection, index, batch_size=batch_size, guard=guard)
+    await rebuild_atomic_memory_evidence(connection, index, batch_size=batch_size, sources=sources, guard=guard)
     return await verify_atomic_memory_current(
-        connection, index, batch_size=batch_size, require_evidence=True, require_evidence_projection=True
+        connection,
+        index,
+        batch_size=batch_size,
+        sources=sources,
+        require_evidence=True,
+        require_evidence_projection=True,
     )
 
 
