@@ -267,11 +267,13 @@ def classify_processing_error(error: BaseException) -> ProcessingDiagnostics | N
             "maintenance-required",
         }:
             return ProcessingDiagnostics(reason=ProcessingFailureReason.CONFIGURATION)
-        if code in {"publication", "authority-orphan", "authority-head", "authority-content", "incomplete-vector"}:
+        if code in {"authority-orphan", "authority-head", "authority-content", "incomplete-vector"}:
             return ProcessingDiagnostics(
                 stage=ProcessingStage.PERSISTENCE,
                 reason=ProcessingFailureReason.STORAGE_FAILURE,
             )
+        if code == "publication":
+            return ProcessingDiagnostics(reason=ProcessingFailureReason.CONFIGURATION)
         return None
     return None
 

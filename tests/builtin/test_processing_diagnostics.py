@@ -44,6 +44,7 @@ from powercontext.builtin.inference.tokens import character_token_estimator
 from powercontext.builtin.persistence.atomic_memory_index import (
     AtomicMemoryIndexError,
     AtomicMemoryIndexFilter,
+    AtomicMemoryProjectionPublisher,
     AtomicMemorySearchRequest,
     RelationalAtomicMemoryIndex,
 )
@@ -278,7 +279,7 @@ def test_json_formatter_serializes_the_new_processing_fields() -> None:
         ("authority-schema", None, ProcessingFailureReason.CONFIGURATION),
         ("migration-pending", None, ProcessingFailureReason.CONFIGURATION),
         ("maintenance-required", None, ProcessingFailureReason.CONFIGURATION),
-        ("publication", ProcessingStage.PERSISTENCE, ProcessingFailureReason.STORAGE_FAILURE),
+        ("publication", None, ProcessingFailureReason.CONFIGURATION),
         ("authority-orphan", ProcessingStage.PERSISTENCE, ProcessingFailureReason.STORAGE_FAILURE),
         ("authority-head", ProcessingStage.PERSISTENCE, ProcessingFailureReason.STORAGE_FAILURE),
         ("authority-content", ProcessingStage.PERSISTENCE, ProcessingFailureReason.STORAGE_FAILURE),
@@ -308,6 +309,16 @@ def test_index_request_validation_is_not_classified_as_a_storage_failure() -> No
     assert diagnostics is not None
     assert diagnostics.stage is ProcessingStage.BUSINESS_VALIDATION
     assert diagnostics.reason is ProcessingFailureReason.INVALID_OUTPUT
+
+
+def test_index_without_replace_many_is_a_capability_not_a_storage_failure() -> None:
+    with pytest.raises(AtomicMemoryIndexError, match="complete projection sets") as raised:
+        AtomicMemoryProjectionPublisher(cast(Any, object()))
+
+    diagnostics = classify_processing_error(raised.value)
+    assert diagnostics is not None
+    assert diagnostics.reason is ProcessingFailureReason.CONFIGURATION
+    assert diagnostics.stage is None
 
 
 def test_safe_classifier_never_escapes() -> None:
