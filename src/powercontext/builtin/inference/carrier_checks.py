@@ -116,7 +116,7 @@ def inspect_sse(policy: PrivacyPolicy, body: bytes, profile_id: str) -> PrivacyD
             return policy.decision(phase, "withhold", "sse_invalid")
         if policy.forbidden(strings):
             return policy.decision(phase, "block", "forbidden_content")
-        if duplicate or contains_opaque_content(value):
+        if duplicate or contains_opaque_content(value, protocol=profile.protocol):
             return policy.decision(phase, "withhold", "content_unsupported")
         model_carrier = value.get("message", value.get("response", value))
         if (

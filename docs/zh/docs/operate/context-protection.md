@@ -63,8 +63,9 @@ Server 可通过 `POWERCONTEXT_SERVER_INFERENCE_PROTECTION` 设置相同对象�
 有界的 `openai-responses` profile 要求显式提供布尔值 `store: false`；省略、null 或启用存储都会暂缓。
 Responses 默认会存储响应，参见提供方的[数据保留约定](https://developers.openai.com/api/docs/guides/conversation-state#data-retention-for-model-responses)。
 内置 Pydantic AI Responses 模型可在对应的 model settings 中设置 `openai_store: false`。
-未展开的 `item_reference` 输入也会暂缓，因为无法检查其历史内容或把它计入窗口预算。
+未展开的 `item_reference` 输入（包括省略 `type` 或将其设为 null 的引用）也会暂缓，因为无法检查其历史内容或把它计入窗口预算。
 请提供受支持的完整文本和工具输入，而不是提供方的历史条目引用。
+Anthropic 文档仅支持内联纯文本来源；PDF/base64、URL、Files API 引用和含图片的文档会暂缓，且不会签发请求绑定。
 
 内置 OpenAI/Anthropic、Embedding、Rerank 路径把检查接在最终 HTTP transport，
 原生 SDK 的格式转换先完成。Enforcing 关闭 SDK 传输层自动重试；原有阶段的输出 schema 重试仍有界，

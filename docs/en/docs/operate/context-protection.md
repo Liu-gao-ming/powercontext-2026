@@ -70,8 +70,10 @@ The bounded `openai-responses` profile requires an explicit boolean `store: fals
 storage is withheld. Responses otherwise stores responses by default; see the provider's
 [data-retention contract](https://developers.openai.com/api/docs/guides/conversation-state#data-retention-for-model-responses).
 For built-in Pydantic AI Responses models, set `openai_store: false` in the relevant model settings.
-Unexpanded `item_reference` inputs are withheld because their historical content is unavailable for inspection
-and window accounting. Pass the complete supported text/tool input instead of a provider-side item reference.
+Unexpanded `item_reference` inputs, including references whose `type` is omitted or null, are withheld because
+their historical content is unavailable for inspection and window accounting. Pass the complete supported
+text/tool input instead of a provider-side item reference. Anthropic documents support only inline plain-text
+sources; PDF/base64, URL, Files API references, and documents containing images are withheld without a request binding.
 
 Built-in OpenAI/Anthropic clients and configured embedding/rerank paths install the checks at the final HTTP
 transport. Native SDK formatting happens first. Enforcing disables SDK transport retries; output-schema retries

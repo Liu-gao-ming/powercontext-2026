@@ -94,27 +94,87 @@ def test_public_responses_check_requires_explicit_non_storing_input(tmp_path):
                     assert result["reason_codes"] == ["provider_state_unsupported"]
                     assert "binding" not in result
 
-            request["payload"]["body"] = json.dumps(
-                body | {"store": False, "input": [{"type": "item_reference", "id": "msg_prior_private"}]}
-            )
-            response = await client.post("/v1/context/check", json=request)
-            assert response.status_code == 200, response.text
-            result = response.json()
-            assert result["decision"] == "withhold" and not result["coverage"]["complete"]
-            assert result["reason_codes"] == ["content_unsupported"]
-            assert "binding" not in result
+            for discriminator in ({"type": "item_reference"}, {}, {"type": None}):
+                request["payload"]["body"] = json.dumps(
+                    body | {"store": False, "input": [{"id": "msg_prior_private", **discriminator}]}
+                )
+                response = await client.post("/v1/context/check", json=request)
+                assert response.status_code == 200, response.text
+                result = response.json()
+                assert result["decision"] == "withhold" and not result["coverage"]["complete"]
+                assert result["reason_codes"] == ["content_unsupported"]
+                assert "binding" not in result
 
-            request["payload"]["body"] = json.dumps(
-                body
-                | {
-                    "store": False,
-                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "safe"}]}],
-                }
-            )
-            response = await client.post("/v1/context/check", json=request)
-            assert response.status_code == 200, response.text
-            result = response.json()
-            assert result["decision"] == "allow" and result["coverage"]["complete"] and result["binding"]
+            for expanded in (
+                [{"role": "user", "content": "safe"}],
+                [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "safe"}]}],
+                [
+                    {
+                        "type": "message",
+                        "id": "msg_expanded",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "safe", "annotations": []}],
+                        "status": "completed",
+                    },
+                    {"type": "function_call", "call_id": "call", "name": "test", "arguments": '{"id":"user-data"}'},
+                    {"type": "function_call_output", "call_id": "call", "output": "safe"},
+                ],
+            ):
+                request["payload"]["body"] = json.dumps(body | {"store": False, "input": expanded})
+                response = await client.post("/v1/context/check", json=request)
+                assert response.status_code == 200, response.text
+                result = response.json()
+                assert result["decision"] == "allow" and result["coverage"]["complete"] and result["binding"]
+
+    asyncio.run(scenario())
+
+
+def test_public_anthropic_check_only_binds_inspectable_document_sources(tmp_path):
+    async def scenario():
+        inference = _inference()
+        target = inference.protection.targets["model"].model_copy(update={"protocol": "anthropic-messages"})
+        inference = inference.model_copy(
+            update={"protection": inference.protection.model_copy(update={"targets": {"model": target}})}
+        )
+        sources = [
+            ({"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"}, "withhold"),
+            ({"type": "url", "url": "https://example.invalid/private.pdf"}, "withhold"),
+            ({"type": "file", "file_id": "file_private"}, "withhold"),
+            ({"type": "future-source"}, "withhold"),
+            (None, "withhold"),
+            ({"type": "text", "media_type": "text/plain"}, "withhold"),
+            (
+                {"type": "content", "content": [{"type": "image", "source": {"type": "url", "url": "image"}}]},
+                "withhold",
+            ),
+            ({"type": "text", "media_type": "text/plain", "data": "safe"}, "allow"),
+            ({"type": "content", "content": "safe"}, "allow"),
+            ({"type": "content", "content": [{"type": "text", "text": "safe"}]}, "allow"),
+            ({"type": "text", "media_type": "text/plain", "data": "synthetic-forbidden-value"}, "block"),
+            (
+                {
+                    "type": "content",
+                    "content": [{"type": "text", "text": "synthetic-"}, {"type": "text", "text": "forbidden-value"}],
+                },
+                "block",
+            ),
+        ]
+        async with _server(tmp_path, inference=inference) as (_, client, _):
+            scope_id = await _scope(client)
+            for source, decision in sources:
+                document = {"type": "document", "source": source}
+                for content in ([document], [{"type": "tool_result", "tool_use_id": "tool", "content": [document]}]):
+                    response = await client.post("/v1/context/check", json=_send(scope_id, content))
+                    assert response.status_code == 200, response.text
+                    result = response.json()
+                    assert result["decision"] == decision
+                    assert result["coverage"]["complete"] is (decision != "withhold")
+                    if decision == "allow":
+                        assert result["binding"]
+                    else:
+                        assert "binding" not in result
+                        reason = "content_unsupported" if decision == "withhold" else "forbidden_content"
+                        assert result["reason_codes"] == [reason]
 
     asyncio.run(scenario())
 

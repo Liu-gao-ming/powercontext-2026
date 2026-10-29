@@ -171,7 +171,28 @@ def parse_model_json(body: bytes, max_depth: int = 64) -> dict[str, object]:
     return value
 
 
-def contains_opaque_content(value: object) -> bool:
+def _opaque_document_source(source: object) -> bool:
+    """Only inline Anthropic text documents expose all content to inspection."""
+
+    if not isinstance(source, dict):
+        return True
+    if source.get("type") == "text":
+        return source.get("media_type") != "text/plain" or not isinstance(source.get("data"), str)
+    if source.get("type") == "content":
+        content = source.get("content")
+        if isinstance(content, str):
+            return False
+        return not isinstance(content, list) or any(
+            not isinstance(block, dict)
+            or block.get("type") != "text"
+            or not isinstance(block.get("text"), str)
+            or contains_opaque_content(block)
+            for block in content
+        )
+    return True
+
+
+def contains_opaque_content(value: object, *, protocol: PrivacyProtocol | None = None) -> bool:
     """Inspect protocol envelopes and blocks without interpreting schemas as content.
 
     Tool declarations and output schemas describe user data, not model content
@@ -180,10 +201,21 @@ def contains_opaque_content(value: object) -> bool:
     """
 
     if isinstance(value, dict):
+        # Responses ItemReference permits an omitted or null discriminator.
+        # Restrict this check to root input items; IDs in schemas/tool data are text.
+        inputs = value.get("input")
+        if (
+            protocol == "openai-responses"
+            and isinstance(inputs, list)
+            and any(isinstance(item, dict) and "id" in item and item.get("type") is None for item in inputs)
+        ):
+            return True
         if any(key in _OPAQUE_KEYS for key in value):
             return True
         content_type = value.get("type")
         if isinstance(content_type, str) and content_type in _OPAQUE_TYPES:
+            return True
+        if content_type == "document" and _opaque_document_source(value.get("source")):
             return True
         return any(
             contains_opaque_content(child)

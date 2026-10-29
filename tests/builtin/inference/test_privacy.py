@@ -24,6 +24,8 @@ from typing import Any
 
 import httpx
 import pytest
+from anthropic import APIConnectionError as AnthropicConnectionError
+from anthropic import AsyncAnthropic
 from openai import APIConnectionError, AsyncOpenAI
 from pydantic import BaseModel, SecretStr
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -157,7 +159,10 @@ def test_unverified_carriers_and_hidden_state_are_withheld(raw: bytes, reason: s
 def test_text_schemas_can_define_opaque_carrier_property_names(protocol, schema_location) -> None:
     schema = {
         "type": "object",
-        "properties": {name: {"type": "string"} for name in ("file_id", "image", "audio")},
+        "properties": {
+            name: {"type": "string"}
+            for name in ("file_id", "image", "audio", "id", "source", "url", "data", "document")
+        },
     }
     request = {"model": "test-model", "max_tokens": 10, "messages": [{"role": "user", "content": "clean"}]}
     if protocol == "openai-chat":
@@ -205,7 +210,17 @@ def test_anthropic_tool_input_property_names_are_text_data_but_result_images_are
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "tool_use", "id": "call", "name": "describe_file", "input": {"file_id": "local-name"}}
+                    {
+                        "type": "tool_use",
+                        "id": "call",
+                        "name": "describe_file",
+                        "input": {
+                            "file_id": "local-name",
+                            "id": "user-data-id",
+                            "type": "document",
+                            "source": {"type": "url", "url": "https://example.invalid/manual.pdf"},
+                        },
+                    }
                 ],
             },
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call", "content": "clean"}]},
@@ -344,6 +359,8 @@ def test_native_responses_sdk_requires_non_storing_expanded_input_before_real_se
                     {"input": [{"type": "item_reference", "id": "msg_prior_private"}], "store": False},
                     "content_unsupported",
                 ),
+                ({"input": [{"id": "msg_prior_private"}], "store": False}, "content_unsupported"),
+                ({"input": [{"id": "msg_prior_private", "type": None}], "store": False}, "content_unsupported"),
             )
             for extra, reason in cases:
                 with pytest.raises(APIConnectionError) as caught:
@@ -359,6 +376,63 @@ def test_native_responses_sdk_requires_non_storing_expanded_input_before_real_se
         asyncio.run(run(endpoint))
         assert len(upstream.requests) == 1
         assert json.loads(upstream.requests[0])["store"] is False
+
+
+def test_native_anthropic_sdk_withholds_opaque_documents_before_real_send() -> None:
+    async def run(endpoint: str) -> None:
+        endpoint = endpoint.replace("/chat/completions", "/messages")
+        protection = config(endpoint)
+        protection = protection.model_copy(
+            update={
+                "targets": {"test": protection.targets["test"].model_copy(update={"protocol": "anthropic-messages"})}
+            }
+        )
+        async with (
+            httpx.AsyncClient(transport=ProtectedAsyncTransport(protection)) as http,
+            AsyncAnthropic(
+                base_url=endpoint.removesuffix("/v1/messages"), api_key="test", max_retries=0, http_client=http
+            ) as sdk,
+        ):
+            sources = [
+                {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+                {"type": "url", "url": "https://example.invalid/private.pdf"},
+                {"type": "file", "file_id": "file_private"},
+                {
+                    "type": "content",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}
+                    ],
+                },
+            ]
+            for source in sources:
+                request: dict[str, Any] = {
+                    "model": "test-model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": [{"type": "document", "source": source}]}],
+                }
+                with pytest.raises(AnthropicConnectionError) as caught:
+                    await sdk.messages.create(**request)
+                refusal = find_privacy_error(caught.value)
+                assert refusal is not None and refusal.phase == "before_send"
+                assert refusal.reason_codes == ("content_unsupported",)
+            accepted = await sdk.messages.create(
+                model="test-model", max_tokens=10, messages=[{"role": "user", "content": "clean"}]
+            )
+            assert accepted.stop_reason == "end_turn"
+
+    payload = json.dumps({
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "safe"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }).encode()
+    with server([(200, "application/json", payload)]) as (upstream, endpoint):
+        asyncio.run(run(endpoint))
+        assert len(upstream.requests) == 1
+        assert json.loads(upstream.requests[0])["messages"] == [{"role": "user", "content": "clean"}]
 
 
 class Value(BaseModel):

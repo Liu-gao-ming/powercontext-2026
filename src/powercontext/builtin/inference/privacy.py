@@ -377,7 +377,7 @@ class PrivacyPolicy:
             return self.decision(phase, "block", "forbidden_content", complete=True)
         if duplicate:
             return self.decision(phase, "withhold", "json_duplicate_key")
-        if contains_opaque_content(value):
+        if contains_opaque_content(value, protocol=profile.protocol):
             return self.decision(phase, "withhold", "content_unsupported")
         if not all(
             complete_tool_arguments(item, self.config.max_json_depth)
