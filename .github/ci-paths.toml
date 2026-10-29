@@ -22,6 +22,7 @@ tests = [
   "tests/**", "integrations/**", "examples/**", "scripts/generate_js_operations.py",
   "scripts/sync_dsh_plugin_tree.py", "scripts/generate_integration_manifest_docs.py",
   "scripts/run_atomic_memory_clean_migration.py", "scripts/scan_e2e_evidence.sh",
+  "scripts/check_atomic_memory_migration_shards.py",
   "scripts/ci_role_smoke.py",
   # These evaluator suites still live under the root tests/ directory.
   "evaluation/memory/locomo/**", "evaluation/memory/locomo_plus/**", "evaluation/memory/write_gate/**",
@@ -36,17 +37,24 @@ database = [
   "scripts/run_atomic_memory_clean_migration.py",
   ".github/workflows/e2e-harness.yml", ".github/actions/setup-upgrade-oceanbase/**",
   "tests/native/test_oceanbase_engine_recovery.py",
-  "tests/*migration*.py",
+  "tests/*migration*.py", "scripts/check_atomic_memory_migration_shards.py",
 ]
 dify = ["integrations/dify/**", "tests/*dify*"]
 hermes = ["integrations/hermes/**", "tests/*hermes*"]
 dsh = ["integrations/dsh/**", "tests/*dsh*", "scripts/generate_js_operations.py", "scripts/sync_dsh_plugin_tree.py"]
+cindy = [
+  "integrations/cindy/**", "tests/e2e/*cindy*", "scripts/generate_js_operations.py",
+  "integrations/dsh/plugins/powercontext/src/**", "integrations/dsh/plugins/powercontext/package.json",
+  "integrations/dsh/plugins/powercontext/pnpm-lock.yaml", "integrations/dsh/plugins/powercontext/pnpm-workspace.yaml",
+  "integrations/dsh/plugins/powercontext/tsconfig.json",
+]
 pi = ["integrations/pi/**", "tests/*pi_*"]
 opencode = ["integrations/opencode/**", "tests/*opencode*"]
 openclaw = ["integrations/openclaw/**", "tests/*openclaw*"]
 opendal = ["integrations/opendal/**"]
 website = [
   "docs/**", "website/**", "assets/**", "README*.md", "scripts/generate_integration_manifest_docs.py",
+  "tests/e2e/test_blog_site.py",
 ]
 # Root tests assert exact sentences in published docs, so documentation edits must
 # exercise them without paying for the complete tests matrix.
@@ -116,7 +124,7 @@ suites = ["tests", "dify", "hermes", "dsh", "pi", "opencode", "openclaw", "zcode
 [shared.runtime]
 patterns = ["src/**", "openapi/**", "pyproject.toml", "uv.lock"]
 suites = [
-  "tests", "evaluation", "database", "dify", "hermes", "dsh", "pi", "opencode", "openclaw", "opendal",
+  "tests", "evaluation", "database", "dify", "hermes", "dsh", "cindy", "pi", "opencode", "openclaw", "opendal",
   "website", "native", "harness", "zcode", "kimi", "upgrade", "observability", "packaging", "desktop",
 ]
 
@@ -128,7 +136,7 @@ suites = ["skill_guidance"]
 [shared.main]
 patterns = [".github/workflows/master.yml"]
 suites = [
-  "tests", "evaluation", "database", "dify", "hermes", "dsh", "pi", "opencode", "openclaw", "opendal",
+  "tests", "evaluation", "database", "dify", "hermes", "dsh", "cindy", "pi", "opencode", "openclaw", "opendal",
   "website", "docs_tests", "upgrade", "observability", "packaging",
 ]
 
