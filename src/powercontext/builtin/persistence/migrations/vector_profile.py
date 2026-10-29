@@ -85,6 +85,16 @@ class ServerVectorProfile:
             layouts["v1_4_1_004"] = layouts["s1402"] + [
                 ["table", "pc_access_owner_recovery", "pc_access_owner_recovery", owner]
             ]
+        if "v1_5_0_001" in manifest["revision_resources"]:
+            evidence = json.loads((directory / "schemas/sqlite-v1_5_0_001.json").read_text(encoding="utf-8"))["create"]
+            layouts["v1_5_0_001"] = layouts["v1_4_1_004"] + [
+                ["table", name, name, statement] for statement in evidence if (name := _created_table(statement))
+            ]
+        if "v1_5_0_002" in manifest["revision_resources"]:
+            evidence = json.loads((directory / "schemas/sqlite-v1_5_0_002.json").read_text(encoding="utf-8"))["create"]
+            layouts["v1_5_0_002"] = layouts["v1_5_0_001"] + [
+                ["table", name, name, statement] for statement in evidence if (name := _created_table(statement))
+            ]
         for entries in layouts.values():
             entries.sort(key=lambda row: (row[0], row[1]))
         return layouts
@@ -107,6 +117,15 @@ class ServerVectorProfile:
 
     def mysql_tables(self) -> dict[str, str]:
         return copy.deepcopy(self.layout["mysql"])
+
+
+def _created_table(statement: str) -> str | None:
+    """Name a created table without rewriting its frozen bytes."""
+
+    prefix = "CREATE TABLE "
+    if not statement.startswith(prefix):
+        return None
+    return statement[len(prefix) :].split(" ", 1)[0].strip('`"')
 
 
 def read_embedding_profile(connection: Connection) -> EmbeddingProfile | None:

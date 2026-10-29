@@ -18,6 +18,7 @@ import json
 import shutil
 import sqlite3
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
@@ -39,13 +40,36 @@ def test_registered_owner_recovery_upgrade_preserves_history_and_revision_checks
     shutil.copytree(current.directory, directory, ignore=shutil.ignore_patterns("__pycache__"))
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    resources = manifest["revision_resources"].pop("v1_4_1_004")
-    for resource in (*resources, "versions/v1_4_1_004_owner_recovery.py", "mysql/versions/v1_4_1_004.py"):
+    appended = current.revisions[current.revisions.index("v1_4_1_004") :]
+    removed_resources = {resource for revision in appended for resource in manifest["revision_resources"].pop(revision)}
+    removed_steps = [step for step in manifest["domain_steps"] if step["revision"] in appended]
+    manifest["domain_steps"] = [step for step in manifest["domain_steps"] if step["revision"] not in appended]
+    for step in removed_steps:
+        removed_resources.update((step["module"], *step.get("resources", ())))
+    retained_resources = {resource for resources in manifest["revision_resources"].values() for resource in resources}
+    for step in manifest["domain_steps"]:
+        retained_resources.update((step["module"], *step.get("resources", ())))
+    for name in appended:
+        revision = current.script.get_revision(name)
+        removed_resources.add(Path(revision.path).relative_to(current.snapshot_directory).as_posix())
+        removed_resources.add(f"mysql/versions/{name}.py")
+    for resource in removed_resources - retained_resources:
         (directory / resource).unlink()
-    del manifest["sqlite_fingerprints"]["v1_4_1_004"]
-    del manifest["domain_readiness"]["v1_4_1_004"]
-    manifest["mysql_state_layouts"].remove("schemas/mysql-v1_4_1_004.json")
-    manifest["affected_objects"].remove("pc_access_owner_recovery")
+    for revision in appended:
+        del manifest["sqlite_fingerprints"][revision]
+        del manifest["domain_readiness"][revision]
+        manifest.get("mysql_wrappers", {}).pop(revision, None)
+    manifest["mysql_state_layouts"] = [
+        resource for resource in manifest["mysql_state_layouts"] if resource not in removed_resources
+    ]
+    appended_tables = {
+        "pc_access_owner_recovery",
+        "pc_atomic_memory_evidence_schema",
+        "pc_atomic_memory_evidence_history",
+        "pc_atomic_memory_evidence",
+        "pc_source_evidence_bindings",
+    }
+    manifest["affected_objects"] = [name for name in manifest["affected_objects"] if name not in appended_tables]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     previous = MigrationBundle(directory, embedding_profile=embedding)
     database = tmp_path / "managed.db"
@@ -59,8 +83,8 @@ def test_registered_owner_recovery_upgrade_preserves_history_and_revision_checks
     original_evidence = json.loads(old.evidence_path.read_text(encoding="utf-8"))
     upgraded = SQLiteMigrationRunner(database, current, configuration=configuration(embedding))
     plan = upgraded.plan()
-    assert plan.source_revision == "s1402" and plan.revisions == ("v1_4_1_004",)
-    assert apply(upgraded).revision == "v1_4_1_004"
+    assert plan.source_revision == "s1402" and plan.revisions == appended
+    assert apply(upgraded).revision == current.head
     assert upgraded.verify().state == "ready"
     assert not apply(upgraded).changed
     evidence = json.loads(upgraded.evidence_path.read_text(encoding="utf-8"))
@@ -76,8 +100,9 @@ def test_registered_owner_recovery_upgrade_preserves_history_and_revision_checks
     assert upgraded.plan().schema_fingerprint == fresh.plan().schema_fingerprint
 
 
+@pytest.mark.parametrize("target", ["owner", "current"])
 @pytest.mark.parametrize("damage", [None, "payload-collation", "pending-index"])
-def test_owner_recovery_mysql_registration_matches_native_character_and_key_definitions(damage):
+def test_owner_recovery_mysql_registration_matches_native_character_and_key_definitions(damage, target):
     # Simulated SHOW output checks normalization, not execution on a native backend.
     definition = """CREATE TABLE `pc_access_owner_recovery` (
       `operation_id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
@@ -89,8 +114,9 @@ def test_owner_recovery_mysql_registration_matches_native_character_and_key_defi
       UNIQUE KEY `uq_pc_access_owner_recovery_pending` (`deployment_id`,`completed`,`operation_id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"""
     bundle = server_bundle()
+    target_revision = "v1_4_1_004" if target == "owner" else bundle.head
     inventory = {"tables": {}, "views": [], "triggers": []}
-    for revision in bundle.revisions[:-1]:
+    for revision in bundle.revisions[: bundle.revisions.index(target_revision) + 1]:
         path = bundle.directory / f"schemas/mysql-{revision}.json"
         fragment = json.loads(path.read_text(encoding="utf-8"))
         for change in fragment["revisions"][revision]["changes"]:
@@ -109,8 +135,8 @@ def test_owner_recovery_mysql_registration_matches_native_character_and_key_defi
         table["indexes"] = {}
     schema = MySQLSchema(bundle)
     if damage is None:
-        schema.verify(inventory, "v1_4_1_004")
-        assert schema.identify(inventory) == "v1_4_1_004"
+        schema.verify(inventory, target_revision)
+        assert schema.identify(inventory) == target_revision
     else:
         with pytest.raises(MigrationError, match="incompatible_schema"):
-            schema.verify(inventory, "v1_4_1_004")
+            schema.verify(inventory, target_revision)

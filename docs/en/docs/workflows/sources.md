@@ -33,4 +33,50 @@ content under the same identity as if it were a new observation.
 - Subject evidence for a Scope profile: follow [Scope profiles](use-profiles.md).
 - Application or evaluation events: use the application's adapter; [Bub capture](../integrations/evaluation.md) is opt-in.
 
+## Declare source authority
+
+A trusted adapter can declare how its material should be trusted. The optional `memory_evidence` field on a Source
+Definition carries a versioned `MemoryEvidenceDeclaration` with `authority` (`untrusted`, `user_asserted`,
+`repository_attested`, or `system_attested`) and `verification` (`unknown`, `verified`, or `not_verified`). Only
+adapter or deployment code supplies it; Source text, references, model output, and retrieval rank cannot.
+
+```python
+from powercontext.sources import AdapterSourceDefinition, MemoryEvidenceDeclaration
+
+definition = AdapterSourceDefinition(
+    existing_adapter,
+    memory_evidence=MemoryEvidenceDeclaration(
+        authority="repository_attested",
+        verification="not_verified",
+    ),
+)
+```
+
+Remote Source observations configure the same declaration in trusted deployment code, keyed by the exact Definition
+name, version, and manifest fingerprint. A missing, invalid, or unavailable declaration resolves to
+`untrusted`/`unknown`; it does not block capture, processing, or existing retrieval.
+
+Observation manifests validate the worker's serialized payload, including populated optional fields and nested models.
+Validation aliases do not require workers to rename serialized keys, including when a model forbids extra fields.
+For unions, an alias-renamed branch may retain the validation manifest when another branch has an equivalent flat
+primitive-property schema covering its serialized output. Unproven branch coverage uses the serialization schema.
+
+Each Memory revision records the declaration and exact Source materialization accepted with it. That retained evidence
+is authoritative and versioned. The index projection beside it is derived: maintenance can discard and rebuild it
+without consulting today's registry. Declarations add no ranking weight, score, or access right.
+
+Read the retained facts back for one exact revision:
+
+```python
+from powercontext.builtin.runtime import AtomicMemoryEvidenceAnnotation
+
+memory = runtime.atomic_memory.for_scope(scope_id)
+annotation: AtomicMemoryEvidenceAnnotation = await memory.evidence(artifact_id, revision=3)
+for source in annotation.sources:
+    print(source.source_ref.source_type, source.declaration.authority, source.declaration.verification)
+```
+
+A declaration that can no longer be attested resolves to `untrusted`/`unknown`. A record that no longer matches its
+exact Source material raises `AtomicMemoryEvidenceError`, which callers catch through the `PowerContextError` family.
+
 Source writes and reads are subject to the selected [Scope and access policy](scopes-and-access.md).

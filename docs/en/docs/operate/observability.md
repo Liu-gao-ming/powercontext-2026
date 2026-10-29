@@ -63,6 +63,14 @@ including code stages. Code-specific diagnostic fields are included only for `co
 | `worker_id`, `family`, `binding`, `request_generation`, `supervisor_group`, `supervisor_generation` | One worker attempt and its accepted work/fence; correlate child output with supervisor diagnostics |
 | `duration_ms`, `error_code`, `error_category` | Duration in milliseconds, diagnostic code, and bounded operational error classification |
 
+`reason` is a bounded cause for a retained-evidence downgrade. The `atomic_memory.evidence.neutral` event reports that
+accepted evidence could not be attested and therefore resolved to `untrusted` / `unknown`; it never carries material,
+declaration bodies, or requested content. Its `unit` is the retained fact (`source`, `declaration`, `manifest`, or
+`revision`), `outcome` is `neutral`, and `reason` is one of `schema_mismatch`, `digest_mismatch`, `no_manifest`,
+`decode_failed`, `legacy_unverifiable`, `invalid_declaration`, `manifest_conflict`, `definition_missing`, or
+`evidence_mismatch`. Integrity causes are emitted at `WARNING`; expected historical gaps stay at `INFO` or `DEBUG`.
+Integrity causes such as `manifest_conflict` are alertable and distinct from an absent declaration.
+
 Server roles are `all` (API and supervisor), `api`, and `background`; child processes use `worker`. Explicit logging
 configuration without a deployment role uses `server`. JSON identity fields correspond to trace resource attributes
 `service.name`, `service.version`, `service.instance.id`, and `powercontext.service.role`. `service_version` is absent

@@ -21,6 +21,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from sqlalchemy.ext.asyncio import AsyncConnection
+from typing_extensions import override
 
 from powercontext.artifacts import ArtifactLineage, ArtifactRef
 from powercontext.builtin.artifacts.atomic_memory.errors import (
@@ -53,6 +54,7 @@ from powercontext.builtin.artifacts.memory.errors import InvalidMemoryCandidateE
 from powercontext.builtin.artifacts.merge import ArtifactMergeSecurity, ArtifactMergeService, MergeTags
 from powercontext.builtin.artifacts.merge_models import (
     ArtifactMergeErrors,
+    ArtifactMergeMutationResult,
     ArtifactMergePlan,
     ArtifactMergeRead,
     ArtifactMergeRecord,
@@ -94,6 +96,9 @@ class AtomicMemoryProjections(Protocol):
         records: Sequence[tuple[AtomicMemoryRecord, PreparedAtomicMemoryProjection]],
     ) -> None: ...
     async def remove(self, connection: AsyncConnection, scope_id: str, artifact_id: str) -> None: ...
+    async def capture_evidence(
+        self, connection: AsyncConnection, scope_id: str, record: AtomicMemoryRecord
+    ) -> None: ...
 
 
 ATOMIC_MERGE_ERRORS = ArtifactMergeErrors(
@@ -300,6 +305,33 @@ class AtomicMemoryMergeAdapter:
         await self.projections.remove(connection, scope_id, artifact_id)
 
 
+class _AtomicMemoryMergeService(ArtifactMergeService):
+    """Accept evidence with every new body, including retired restoration results.
+
+    Shared merges, the Atomic facade and processing all use this commit seam.
+    State-only writes must not attest old bodies. Capture joins the caller's
+    transaction so its failure rolls back authority, governance and projections.
+    """
+
+    @override
+    async def _commit_locked(
+        self,
+        connection: AsyncConnection,
+        prepared: Sequence[tuple[PreparedArtifactMerge, SourceRef | None]],
+        current: dict[str, ArtifactMergeRecord],
+        context: Any,
+        source_read_set: _SourceReadSet | None,
+    ) -> tuple[ArtifactMergeMutationResult, ...]:
+        results = await super()._commit_locked(connection, prepared, current, context, source_read_set)
+        projections = cast(AtomicMemoryMergeAdapter, self.adapter).projections
+        for (item, _), result in zip(prepared, results, strict=True):
+            revisions = {write.artifact_id for write in item.plan.writes if write.draft is not None}
+            for record in result.records:
+                if record.ref.artifact_id in revisions:
+                    await projections.capture_evidence(connection, item.plan.scope_id, _atomic_record(record))
+        return results
+
+
 class _AtomicPreviewAdapter:
     def __init__(self, signer):
         self.signer = signer
@@ -326,7 +358,7 @@ class AtomicMemoryService:
     ) -> None:
         self.artifacts, self.states, self.security = artifacts, states, security
         self.projections, self.merge_tags, self.preview_signer = projections, merge_tags, preview_signer
-        self.shared = ArtifactMergeService(
+        self.shared = _AtomicMemoryMergeService(
             artifacts=artifacts,
             adapter=AtomicMemoryMergeAdapter(projections),
             security=security,

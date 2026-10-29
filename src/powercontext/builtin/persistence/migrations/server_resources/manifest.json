@@ -24,6 +24,14 @@
     "v1_4_1_004": [
       "schemas/sqlite-v1_4_1_004.json",
       "schemas/mysql-v1_4_1_004.json"
+    ],
+    "v1_5_0_001": [
+      "schemas/sqlite-v1_5_0_001.json",
+      "schemas/mysql-v1_5_0_001.json"
+    ],
+    "v1_5_0_002": [
+      "schemas/sqlite-v1_5_0_002.json",
+      "schemas/mysql-v1_5_0_002.json"
     ]
   },
   "sqlite_baselines": {
@@ -44,6 +52,12 @@
     ],
     "v1_4_1_004": [
       "84d736b5e722a56ebe8a32318732543d43548a63a43709dbf0c571e7e4af83b5"
+    ],
+    "v1_5_0_001": [
+      "4817f09fe11f442923b2ae59040e71691fc171a6c15102b9db4df496e78f0fc4"
+    ],
+    "v1_5_0_002": [
+      "36bec00492ba0c8532d3178f1d94f0281e9d5dcaf1fa64598e529b43042a2d56"
     ]
   },
   "affected_objects": [
@@ -138,7 +152,11 @@
     "pc_retained_dream_candidate_versions",
     "pc_memory_artifact_archive",
     "pc_portable_restore_receipts",
-    "pc_access_owner_recovery"
+    "pc_access_owner_recovery",
+    "pc_atomic_memory_evidence_schema",
+    "pc_atomic_memory_evidence_history",
+    "pc_atomic_memory_evidence",
+    "pc_source_evidence_bindings"
   ],
   "readiness_scope": "server",
   "retained_objects": [
@@ -179,6 +197,34 @@
         "seekdb",
         "oceanbase"
       ]
+    },
+    {
+      "id": "atomic_memory_evidence",
+      "revision": "v1_5_0_001",
+      "kind": "projection",
+      "module": "atomic_memory_evidence.py",
+      "depends_on": [
+        "portable_storage"
+      ],
+      "backends": [
+        "sqlite",
+        "seekdb",
+        "oceanbase"
+      ]
+    },
+    {
+      "id": "atomic_memory_evidence_projection",
+      "revision": "v1_5_0_002",
+      "kind": "projection",
+      "module": "atomic_memory_evidence_projection.py",
+      "depends_on": [
+        "atomic_memory_evidence"
+      ],
+      "backends": [
+        "sqlite",
+        "seekdb",
+        "oceanbase"
+      ]
     }
   ],
   "domain_readiness": {
@@ -195,6 +241,16 @@
     "v1_4_1_004": [
       "server_upgrade",
       "portable_storage"
+    ],
+    "v1_5_0_001": [
+      "server_upgrade",
+      "portable_storage",
+      "atomic_memory_evidence"
+    ],
+    "v1_5_0_002": [
+      "server_upgrade",
+      "portable_storage",
+      "atomic_memory_evidence_projection"
     ]
   },
   "retained_fingerprints": {
@@ -210,7 +266,9 @@
     "schemas/mysql-s1400.json",
     "schemas/mysql-s1401.json",
     "schemas/mysql-s1402.json",
-    "schemas/mysql-v1_4_1_004.json"
+    "schemas/mysql-v1_4_1_004.json",
+    "schemas/mysql-v1_5_0_001.json",
+    "schemas/mysql-v1_5_0_002.json"
   ],
   "mysql_history": "mysql",
   "mysql_schema_extensions": {
