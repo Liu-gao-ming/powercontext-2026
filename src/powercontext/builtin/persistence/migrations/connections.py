@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +32,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from powercontext.builtin.persistence.bootstrap import (
+    DatabaseAccessError,
+    DatabaseCreationError,
+    database_is_available,
+    ensure_database,
+)
 from powercontext.builtin.persistence.database import begin_mysql_read_snapshot
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
 from powercontext.builtin.persistence.oceanbase import profile as oceanbase_profile
@@ -116,7 +122,7 @@ class MaintenanceConnections:
                 nonempty = path.exists() and any(path.iterdir())
                 if not writable and not nonempty:
                     return operation(None, identity, lambda: None)
-                if nonempty and not _seekdb_storage_exists(path):
+                if nonempty and not seekdb_profile.has_native_storage(path):
                     raise MigrationError(
                         "unsupported_target", "A nonempty seekdb directory must contain recognized native storage."
                     )
@@ -165,7 +171,7 @@ class MaintenanceConnections:
             finally:
                 engine.dispose()
 
-    async def _seekdb(
+    async def _seekdb(  # noqa: C901
         self,
         operation: Callable[[Connection | None, BackendIdentity, Callable[[], None]], _T],
         config: SeekDBConfig,
@@ -188,6 +194,17 @@ class MaintenanceConnections:
                 config.model_copy(update={"echo": False}), instance.connection_options()
             )
             try:
+                await _require_explicit_database(config, instance.connection_options())
+                if writable:
+                    await _provision_database(
+                        engine,
+                        lambda: seekdb_profile._create_engine(
+                            config.model_copy(update={"echo": False}), instance.connection_options(), database=""
+                        ),
+                        name=config.database,
+                    )
+                elif not await database_is_available(engine):
+                    return operation(None, identity, lambda: None)
                 inode = _directory_inode(path)
                 if initial_inode is not None and initial_inode != inode:
                     raise MigrationError("migration_lock_lost", "The seekdb directory changed during engine startup.")
@@ -274,9 +291,36 @@ class MaintenanceConnections:
             await _dispose_engine(engine)
 
 
-def _seekdb_storage_exists(path: Path) -> bool:
-    # These native markers are verified by the isolated seekdb reopen test.
-    return (path / "etc" / "seekdb.data_version.bin").is_file() and (path / "store" / "sstable" / "meta.db").is_file()
+async def _provision_database(
+    engine: AsyncEngine,
+    instance_engine: Callable[[], AsyncEngine],
+    *,
+    name: str,
+) -> None:
+    """Turn provisioning failures into the maintenance error contract.
+
+    The bootstrap layer already produced administrator guidance; without this
+    translation ``db-migrate`` would report a traceback instead of its documented
+    blocked JSON payload.
+    """
+    try:
+        await ensure_database(engine, instance_engine, name=name)
+    except DatabaseAccessError as error:
+        raise MigrationError("database_access_denied", str(error)) from error
+    except DatabaseCreationError as error:
+        raise MigrationError("database_creation_required", str(error)) from error
+
+
+async def _require_explicit_database(config: SeekDBConfig, options: Mapping[str, object]) -> None:
+    """Turn the expected legacy-database refusal into the maintenance error contract.
+
+    An uncaught exception would replace the documented blocked JSON payload with a
+    traceback, so the operator-facing guidance is preserved inside a MigrationError.
+    """
+    try:
+        await seekdb_profile._require_explicit_legacy_database(config, options)
+    except seekdb_profile.LegacySeekDBDatabaseError as error:
+        raise MigrationError("explicit_database_required", str(error)) from error
 
 
 def _directory_inode(path: Path) -> tuple[int, int]:
