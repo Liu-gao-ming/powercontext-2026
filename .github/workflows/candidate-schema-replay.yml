@@ -1,10 +1,12 @@
 name: Candidate schema replay
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  push:
-    branches: [master]
+  workflow_call:
+    inputs:
+      suites:
+        description: Scope already selected by the Main orchestrator
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
@@ -12,22 +14,24 @@ permissions:
   contents: read
 
 concurrency:
-  group: candidate-replay-${{ github.event.pull_request.number || github.ref }}
+  group: candidate-replay-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   changes:
+    if: ${{ inputs.suites == '' }}
     uses: ./.github/workflows/ci-changes.yml
     with:
       baseline-workflow: candidate-schema-replay.yml
 
   replay:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || fromJSON(needs.changes.outputs.suites || '{}').candidate_replay) }}
+    if: ${{ !cancelled() && ((inputs.suites == '' && needs.changes.result != 'success') || fromJSON(inputs.suites || needs.changes.outputs.suites || '{}').candidate_replay) }}
     name: Candidate replay (${{ matrix.backend }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
+      max-parallel: 2
       fail-fast: false
       matrix:
         backend: [sqlite, seekdb, oceanbase]

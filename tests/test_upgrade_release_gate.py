@@ -447,7 +447,8 @@ def test_publishing_jobs_require_upgrade_acceptance_unless_manually_bypassed():
     main = yaml.safe_load((root / ".github/workflows/master.yml").read_text())["jobs"]
     assert main["upgrade-acceptance"]["uses"] == build["uses"]
     verdict = main["upgrade-release-gate"]
-    assert verdict["name"] == "Upgrade release gate" and verdict["if"] == "always()"
+    assert verdict["name"] == "Upgrade release gate"
+    assert "!cancelled()" in verdict["if"]
     dependencies = verdict["needs"]
     assert {"changes", "upgrade-acceptance"} <= set([dependencies] if isinstance(dependencies, str) else dependencies)
     assert not verdict.get("continue-on-error")

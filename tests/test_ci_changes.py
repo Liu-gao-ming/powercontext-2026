@@ -96,6 +96,7 @@ def test_pr_selects_affected_suites(paths: list[str], expected: set[str]) -> Non
     [
         ".github/actions/setup-python-env/action.yml",
         ".github/workflows/ci-changes.yml",
+        ".github/workflows/master.yml",
         ".github/ci-paths.toml",
         "tests/e2e/conftest.py",
         "new-component/code.py",
@@ -108,9 +109,18 @@ def test_shared_or_unclassified_changes_run_every_suite(path: str) -> None:
 @pytest.mark.parametrize("path", ["src/powercontext/server/authz/owner_recovery.py", "uv.lock", "pyproject.toml"])
 def test_shared_runtime_inputs_keep_backend_upgrade_and_consumer_coverage(path: str) -> None:
     selected = select_suites([path], RULES)
-    assert {"tests", "database", "upgrade", "observability", "packaging", "native", "desktop", "pi", "zcode"} <= {
-        suite for suite, enabled in selected.items() if enabled
-    }
+    assert {
+        "tests",
+        "database",
+        "upgrade",
+        "observability",
+        "packaging",
+        "native",
+        "desktop",
+        "pi",
+        "zcode",
+        "cindy",
+    } <= {suite for suite, enabled in selected.items() if enabled}
     assert not selected["release_schema"]
     assert not selected["seekdb_lock"]
 
@@ -162,7 +172,8 @@ def run_selector(repository: Path, event: str, base: str = "", head: str = "") -
         text=True,
         env={**os.environ, "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(repository / "summary.md")},
     )
-    return json.loads(output.read_text(encoding="utf-8").removeprefix("suites="))
+    outputs = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+    return json.loads(outputs["suites"])
 
 
 @pytest.mark.parametrize(
@@ -244,10 +255,16 @@ def test_large_diff_includes_code_after_hundreds_of_docs(repository: Path) -> No
     assert selected["desktop"] and selected["website"]
 
 
-@pytest.mark.parametrize("event", ["workflow_dispatch", "schedule", "merge_group"])
+@pytest.mark.parametrize("event", ["workflow_dispatch", "merge_group"])
 def test_non_pr_events_run_every_suite(repository: Path, event: str) -> None:
     head = commit(repository, "docs/README.md")
     assert all(run_selector(repository, event, head, head).values())
+
+
+def test_nightly_keeps_full_acceptance_without_archive_generation_or_lock_experiments(repository: Path) -> None:
+    head = commit(repository, "docs/README.md")
+    selected = run_selector(repository, "schedule", head, head)
+    assert {suite for suite, enabled in selected.items() if not enabled} == {"release_schema", "seekdb_lock"}
 
 
 @pytest.mark.parametrize("base", ["", "not-a-commit", "0" * 40])
@@ -312,7 +329,8 @@ def test_successful_push_baseline_retains_changes_from_cancelled_runs(repository
 
     ci_changes.main()
 
-    selected = json.loads(output.read_text().removeprefix("suites="))
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    selected = json.loads(outputs["suites"])
     assert {suite for suite, enabled in selected.items() if enabled} == {"upgrade", "website", "docs_tests"}
 
 
@@ -338,3 +356,17 @@ def test_successful_baseline_ignores_a_newer_success_on_rewritten_history(reposi
     monkeypatch.setattr(subprocess, "run", run)
 
     assert ci_changes.successful_baseline("master.yml", "example/project", "master", head) == base
+
+
+def test_selector_cli_exposes_full_matrix_and_required_jobs_on_missing_baseline(repository: Path) -> None:
+    run_selector(repository, "pull_request", "", git(repository, "rev-parse", "HEAD"))
+    outputs = dict(line.split("=", 1) for line in (repository / "outputs.txt").read_text().splitlines())
+    matrix = json.loads(outputs["test-matrix"])
+    assert set(matrix["python-version"]) == {"3.11", "3.12", "3.13", "3.14"}
+    assert set(matrix["suite"]) == {"unit", "e2e"}
+    assert set(json.loads(outputs["required-jobs"])) == {job for jobs in RULES["checks"].values() for job in jobs} | {
+        "changes",
+        "quality",
+        "license-check",
+        "upgrade-release-gate",
+    }

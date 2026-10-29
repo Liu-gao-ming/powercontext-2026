@@ -11,6 +11,12 @@ on:
       suites:
         description: JSON object of suites selected for this event
         value: ${{ jobs.detect.outputs.suites }}
+      required-jobs:
+        description: Selected root jobs that must succeed
+        value: ${{ jobs.detect.outputs.required-jobs }}
+      test-matrix:
+        description: Python and suite combinations for this validation profile
+        value: ${{ jobs.detect.outputs.test-matrix }}
 
 permissions:
   actions: read
@@ -22,6 +28,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       suites: ${{ steps.select.outputs.suites }}
+      test-matrix: ${{ steps.select.outputs.test-matrix }}
+      required-jobs: ${{ steps.select.outputs.required-jobs }}
     steps:
       - name: Check out the complete branch history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -34,5 +42,6 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CI_BASELINE_WORKFLOW: ${{ inputs.baseline-workflow }}
+          CI_FULL_VALIDATION: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci_changes.py

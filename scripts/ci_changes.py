@@ -52,6 +52,22 @@ def select_suites(paths: list[str], rules: dict[str, Any]) -> dict[str, bool]:
     return selected
 
 
+def test_matrix(event: str, paths: list[str], rules: dict[str, Any], *, full: bool = False) -> dict[str, Any]:
+    """Retain full compatibility for dependencies, CI policy and unclassified inputs."""
+    shared = any(fnmatchcase(path, pattern) for path in paths for pattern in rules["full"])
+    dependencies = any(path in {"pyproject.toml", "uv.lock"} for path in paths)
+    unknown = any(all(select_suites([path], rules).values()) for path in paths)
+    if event != "pull_request" or full or shared or dependencies or unknown:
+        return {"python-version": ["3.11", "3.12", "3.13", "3.14"], "suite": ["unit", "e2e"]}
+    return {
+        "include": [
+            {"python-version": "3.11", "suite": "unit"},
+            {"python-version": "3.14", "suite": "unit"},
+            {"python-version": "3.12", "suite": "e2e"},
+        ]
+    }
+
+
 def changed_paths(base: str, head: str, *, pull_request: bool = True) -> list[str]:
     if not all(re.fullmatch(r"[0-9a-fA-F]{40}", commit) for commit in (base, head)):
         message = "Expected full base and head commit SHAs"
@@ -111,9 +127,14 @@ def main() -> None:
     parser.add_argument("--baseline-workflow", default=os.environ.get("CI_BASELINE_WORKFLOW", ""))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--branch", default=os.environ.get("GITHUB_REF_NAME", ""))
+    parser.add_argument(
+        "--full-validation", action="store_true", default=os.environ.get("CI_FULL_VALIDATION") == "true"
+    )
     arguments = parser.parse_args()
     rules = tomllib.loads((ROOT / ".github/ci-paths.toml").read_text(encoding="utf-8"))
     reason = "Full validation requested by this event."
+    paths: list[str] = []
+    full = arguments.full_validation
     if arguments.event_name in {"pull_request", "push"}:
         try:
             base = arguments.base
@@ -128,18 +149,33 @@ def main() -> None:
             reason = "A trustworthy change baseline is unavailable; running every CI suite."
             print(f"::warning::{reason}")
             selected = dict.fromkeys(rules["suites"], True)
+            full = True
     else:
         selected = dict.fromkeys(rules["suites"], True)
+        if arguments.event_name == "schedule":
+            # Archive generation and lock experiments have explicit manual entries.
+            for suite in ("release_schema", "seekdb_lock"):
+                selected[suite] = False
 
+    matrix = test_matrix(arguments.event_name, paths, rules, full=full)
+    if rules["checks"].keys() != selected.keys():
+        raise ValueError("Every CI scope must declare its required result jobs")  # noqa: TRY003
+    required = sorted(
+        {"changes", "quality", "license-check", "upgrade-release-gate"}
+        | {job for suite, jobs in rules["checks"].items() if selected[suite] for job in jobs}
+    )
     print(json.dumps(selected, indent=2))
     if output_path := os.environ.get("GITHUB_OUTPUT"):
         with Path(output_path).open("a", encoding="utf-8") as output:
             output.write(f"suites={json.dumps(selected)}\n")
+            output.write(f"test-matrix={json.dumps(matrix)}\n")
+            output.write(f"required-jobs={json.dumps(required)}\n")
     if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(summary_path).open("a", encoding="utf-8") as summary:
             summary.write(f"## CI scope\n\n{reason}\n\n| Suite | Run |\n| --- | --- |\n")
             for suite, enabled in selected.items():
                 summary.write(f"| {suite} | {'yes' if enabled else 'no'} |\n")
+            summary.write(f"\nPython matrix: `{json.dumps(matrix)}`\n")
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 full = [
   "Makefile", "tox.ini",
   ".mise.toml", ".pre-commit-config.yaml", ".github/actions/setup-python-env/**",
-  ".github/workflows/ci-changes.yml",
-  ".github/ci-paths.toml", "scripts/ci_changes.py", "tests/test_ci_changes.py",
+  ".github/workflows/ci-changes.yml", ".github/workflows/master.yml",
+  ".github/ci-paths.toml", "scripts/ci_changes.py", "tests/test_ci_changes.py", "tests/test_ci_pipeline.py",
   "tests/conftest.py", "tests/**/conftest.py", "tests/fixtures/**", "integrations/capabilities.toml",
   "integrations/langchain/pyproject.toml", "integrations/langgraph/pyproject.toml",
   "integrations/opendal/pyproject.toml",
@@ -15,6 +15,7 @@ ignore = [
   "AGENTS.md", "REVIEW.md", "CONTRIBUTING.md", "GOVERNANCE.md", "LICENSE", "LICENSES/**",
   ".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md", ".github/CODEOWNERS",
   ".github/dependabot.yml", ".github/workflows/license-check.yml", ".licenserc.yaml",
+  "scripts/ci_queue_report.py",
 ]
 
 [suites]
@@ -104,7 +105,7 @@ release_schema = [
   "tests/release_upgrades/test_full_server.py", ".github/workflows/capture-release-schema.yml",
   ".github/actions/setup-upgrade-oceanbase/**",
 ]
-seekdb_lock = ["scripts/probe_seekdb_migration_lock.py", ".github/workflows/seekdb-lock-probe.yml"]
+seekdb_lock = ["scripts/probe_seekdb_migration_lock.py", ".github/workflows/seekdb-lock-probe.yml", ".github/workflows/seekdb-lock-observation.yml"]
 skill_guidance = [
   "evaluation/skills/skill-up/**",
   "integrations/claude-code/plugins/powercontext/skills/powercontext-project-context/**",
@@ -132,14 +133,6 @@ suites = [
 patterns = ["openapi/powercontext.yaml"]
 suites = ["skill_guidance"]
 
-# Editing one workflow must exercise its consumers without launching unrelated hosts.
-[shared.main]
-patterns = [".github/workflows/master.yml"]
-suites = [
-  "tests", "evaluation", "database", "dify", "hermes", "dsh", "cindy", "pi", "opencode", "openclaw", "opendal",
-  "website", "docs_tests", "upgrade", "observability", "packaging",
-]
-
 [shared.native]
 patterns = [".github/workflows/native-service.yml"]
 suites = ["native"]
@@ -159,3 +152,32 @@ suites = ["website"]
 [shared.release_verify]
 patterns = [".github/workflows/release-verify.yml"]
 suites = ["upgrade", "packaging"]
+
+# A selected scope must produce successful root jobs, not silent skips.
+# Main's result gate consumes this contract; reusable workflows own their children.
+[checks]
+tests = ["tests", "windows-unit-portability"]
+evaluation = ["evaluation-tests"]
+database = ["oceanbase-engine-recovery", "code-seekdb", "atomic-memory-clean-seekdb", "harness-validation"]
+dify = ["dify-tools"]
+hermes = ["hermes-skills"]
+dsh = ["dsh-package"]
+cindy = ["cindy-package"]
+pi = ["pi-package"]
+opencode = ["opencode-package"]
+openclaw = ["openclaw-package"]
+opendal = ["opendal-package"]
+website = ["check-website", "website-link-validation-windows"]
+docs_tests = ["docs-tests"]
+native = ["native-service"]
+harness = ["harness-validation"]
+zcode = ["zcode-acceptance"]
+kimi = ["kimi-acceptance"]
+upgrade = ["seekdb-managed-startup", "upgrade-acceptance"]
+observability = ["worker-observability"]
+packaging = ["isolated-installations"]
+desktop = ["desktop-validation"]
+candidate_replay = ["candidate-replay"]
+release_schema = ["release-schema"]
+seekdb_lock = ["seekdb-lock"]
+skill_guidance = ["skill-guidance"]

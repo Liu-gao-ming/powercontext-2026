@@ -1,10 +1,17 @@
 name: Desktop validation
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_call:
+    inputs:
+      suites:
+        description: Scope already selected by the Main orchestrator
+        required: true
+        type: string
+      installer_run:
+        type: string
+        default: ''
   push:
-    branches: [master, codex/desktop-preview]
+    branches: [codex/desktop-preview]
   workflow_dispatch:
     inputs:
       installer_run:
@@ -18,11 +25,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-${{ github.event.pull_request.number || github.ref }}-${{ inputs.installer_run || 'build' }}
+  group: desktop-${{ github.event.pull_request.number || github.ref }}-${{ inputs.installer_run || 'build' }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   changes:
+    if: ${{ inputs.suites == '' }}
     uses: ./.github/workflows/ci-changes.yml
     with:
       baseline-workflow: desktop.yml
@@ -31,7 +39,7 @@ jobs:
     needs: changes
     if: >-
       ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.installer_run == '') &&
-          (needs.changes.result != 'success' || fromJSON(needs.changes.outputs.suites || '{}').desktop) }}
+          ((inputs.suites == '' && needs.changes.result != 'success') || fromJSON(inputs.suites || needs.changes.outputs.suites || '{}').desktop) }}
     runs-on: windows-2025
     timeout-minutes: 40
     defaults:
@@ -162,7 +170,7 @@ jobs:
     needs: changes
     if: >-
       ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.installer_run == '') &&
-          (needs.changes.result != 'success' || fromJSON(needs.changes.outputs.suites || '{}').desktop) }}
+          ((inputs.suites == '' && needs.changes.result != 'success') || fromJSON(inputs.suites || needs.changes.outputs.suites || '{}').desktop) }}
     strategy:
       fail-fast: false
       matrix:
@@ -219,7 +227,7 @@ jobs:
     needs: changes
     if: >-
       ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.installer_run == '') &&
-          (needs.changes.result != 'success' || fromJSON(needs.changes.outputs.suites || '{}').desktop) }}
+          ((inputs.suites == '' && needs.changes.result != 'success') || fromJSON(inputs.suites || needs.changes.outputs.suites || '{}').desktop) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     defaults:
