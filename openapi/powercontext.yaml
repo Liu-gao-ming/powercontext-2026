@@ -5074,7 +5074,9 @@ paths:
         Review Candidates without an owner attestation, and, when named, the background Principal's
         per-Scope write authority. Produces no change. In enforced mode completes as a deployment
         administrator; in disabled mode completes without authentication because the Server cannot yet
-        protect anything.
+        protect anything. A background Principal check requires an available Access store; otherwise it
+        reports 503 relationship_management_unavailable. Use the offline ownership command to check the
+        proposed background Principal before enforcement is enabled.
       x-powercontext-access: {action: access.self, resource: {type: server}}
       requestBody:
         required: true
@@ -5105,7 +5107,9 @@ paths:
       description: >-
         Grant the missing ownership data to the explicitly named Principal; the Server never derives it.
         Existing Artifact owners and Candidate attestations are preserved and reported as conflicts when
-        they disagree with the named Principal. Every item is one idempotent write, so interrupted or
+        they disagree with the named Principal. Identities with recorded ownership recovery evidence
+        are reported as conflicts and must retain their original attribution. Every item is one idempotent
+        write, so interrupted or
         repeated runs refill only still-missing items. Set dry_run first to preview the exact items.
         Requires a deployment administrator; while Access is disabled the Server has no ownership store
         and reports 503 ownership_migration_unavailable.
@@ -12168,7 +12172,8 @@ components:
           nullable: true
           description: >-
             Optional background processing Principal, such as ACCESS_BACKGROUND_PRINCIPAL_ID; each
-            affected Scope is checked for its scope.contribute authority.
+            selected Scope is checked for scope.contribute and write permission on an existing Profile,
+            including after all ownership gaps have been filled. An available Access store is required.
     OwnershipGapKind:
       type: string
       enum: [artifact_owner, candidate_attestation]

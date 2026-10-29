@@ -212,6 +212,9 @@ from powercontext.builtin.records import (
     ArtifactWrite as RuntimeArtifactWrite,
 )
 from powercontext.builtin.records import (
+    LogicalArtifactRecord as RuntimeLogicalArtifactRecord,
+)
+from powercontext.builtin.records import (
     SourceRecord as RuntimeSourceRecord,
 )
 from powercontext.builtin.records import (
@@ -968,6 +971,8 @@ class _ScopedRecordApplication(Protocol):
         *,
         execution_context: Any = None,
     ) -> RuntimeArtifactRecord: ...
+
+    async def logical_artifacts(self) -> tuple[RuntimeLogicalArtifactRecord, ...]: ...
 
     async def query_artifacts(
         self,
@@ -2043,6 +2048,8 @@ async def list_access_audit(payload: ListAccessAuditRequest, request: Request) -
 async def plan_access_ownership(payload: PlanAccessOwnershipRequest, request: Request) -> AccessOwnershipPlan:
     application = _require_application(request)
     scope_ids = await _migration_scope_ids(payload.scope_ids, request)
+    access = request.app.state.access_control
+    background = None if payload.background_principal is None else _access_principal(payload.background_principal)
     if request.app.state.access_mode == "enforced":
         access = _require_access_control(request)
         await access.require(
@@ -2050,10 +2057,7 @@ async def plan_access_ownership(payload: PlanAccessOwnershipRequest, request: Re
             *_binding_administrative_check(None, deployment_id=access.deployment_id),
             context=_access_audit_context(PLAN_ACCESS_OWNERSHIP.operation_id),
         )
-        background = None if payload.background_principal is None else _access_principal(payload.background_principal)
-        plan = await plan_ownership_migration(application, access, scope_ids, background_principal=background)
-    else:
-        plan = await plan_ownership_migration(application, None, scope_ids)
+    plan = await plan_ownership_migration(application, access, scope_ids, background_principal=background)
     return AccessOwnershipPlan(
         mode=TransportAccessControlMode(request.app.state.access_mode),
         scopes=[
@@ -2093,6 +2097,7 @@ async def apply_access_ownership(payload: ApplyAccessOwnershipRequest, request: 
         scope_ids,
         owner=_access_principal(payload.owner),
         dry_run=payload.dry_run,
+        owner_recovery=request.app.state.owner_recovery,
     )
     return AccessOwnershipApplyResult(
         dry_run=payload.dry_run,

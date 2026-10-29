@@ -523,6 +523,10 @@ def access_ownership_migrate(
         list[str] | None,
         typer.Option(help="Scope to migrate; repeat the option for several Scopes. Every Scope when omitted."),
     ] = None,
+    background_principal: Annotated[
+        str | None,
+        typer.Option(help="Background Principal as TYPE:ID to check while planning."),
+    ] = None,
     maintenance_confirmed: Annotated[
         bool,
         typer.Option(help="Confirm every Server process using the deployment database is stopped."),
@@ -541,9 +545,29 @@ def access_ownership_migrate(
             raise typer.BadParameter(  # noqa: TRY003
                 "apply requires --maintenance-confirmed after stopping every Server process"
             )
+    background_ref = None
+    if background_principal is not None:
+        principal_type, separator, principal_id = background_principal.partition(":")
+        if (
+            not separator
+            or principal_type not in {"user", "service"}
+            or not principal_id
+            or principal_id != principal_id.strip()
+            or len(principal_id) > 255
+        ):
+            raise typer.BadParameter("background Principal must use TYPE:ID")  # noqa: TRY003
+        background_ref = PrincipalRef(type=principal_type, id=principal_id)
     env_file = resolve_server_environment_file(env_file, discover=True)
     with server_settings_context(env_file=env_file) as settings:
-        ready = asyncio.run(_access_ownership_maintenance(settings, action, owner=owner, scope_ids=scope_id or ()))
+        ready = asyncio.run(
+            _access_ownership_maintenance(
+                settings,
+                action,
+                owner=owner,
+                scope_ids=scope_id or (),
+                background_principal=background_ref,
+            )
+        )
     if not ready:
         raise typer.Exit(code=1)
 
@@ -554,6 +578,7 @@ async def _access_ownership_maintenance(
     *,
     owner: str | None,
     scope_ids: Sequence[str],
+    background_principal: PrincipalRef | None = None,
 ) -> bool:
     config = BuiltinConfig(
         code=settings.code,
@@ -572,7 +597,13 @@ async def _access_ownership_maintenance(
             raise typer.BadParameter("ownership migration requires a runtime with Scope support")  # noqa: TRY003
         scopes = list(scope_ids) or [scope.scope_id for scope in await runtime.scopes.list()]
         if action == "plan":
-            plan = await plan_ownership_migration(runtime, access, scopes, transport="background")
+            plan = await plan_ownership_migration(
+                runtime,
+                access,
+                scopes,
+                background_principal=background_principal,
+                transport="background",
+            )
             typer.echo(json.dumps(ownership_report(plan)))
             return True
         owner_type, _, owner_id = cast(str, owner).partition(":")

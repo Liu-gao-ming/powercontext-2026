@@ -194,9 +194,12 @@ so an administrator migrates the missing attribution explicitly:
 
 1. Back up the database. The offline command below works while the Server is stopped, before or after the switch:
 2. Inventory the affected data with `powercontext server access-ownership-migrate --action plan`. The same command
-   also runs before the switch, while `ACCESS_MODE=disabled`. Name the configured background Principal with
-   `POST /v1/access/ownership/plan` and `background_principal` (for example `ACCESS_BACKGROUND_PRINCIPAL_ID`) to
-   also list Scopes where scheduled processing would be denied for missing `scope.contribute` authority.
+   also runs before the switch, while `ACCESS_MODE=disabled`. Add
+   `--background-principal service:BACKGROUND_ID` with the future `ACCESS_BACKGROUND_PRINCIPAL_ID` to check
+   every selected Scope for `scope.contribute` and existing Profile write permission. These checks still run
+   after all ownership gaps have been filled. HTTP planning accepts `background_principal` when an Access
+   store is available; otherwise it returns `503 relationship_management_unavailable`. Use the offline
+   command for this check before enabling enforcement.
 3. Backfill with an explicitly named owning Principal — for a single-user static-token deployment that is the
    `server-token` service Principal:
 
@@ -211,12 +214,19 @@ so an administrator migrates the missing attribution explicitly:
    conflicts, never overwritten. Run `apply` again with another `--owner` when different identities must own
    different Scopes; multi-user deployments keep this identity boundary explicit.
 
+   The inventory includes merged and retired Artifact identities so supported restoration remains authorized.
+   HTTP `apply` and its preview report `owner-recovery-pending` or
+   `owner-recovery-delivered_relation_missing` when durable recovery evidence already records an identity.
+   They preserve that evidence and do not replace its owner. Complete pending ownership delivery through the
+   [ownership recovery procedure](../workflows/scopes-and-access.md#recover-external-ownership-writes).
+
    Without a stopped-deployment window, the same flow is available over HTTP on a running Server:
    `POST /v1/access/ownership/apply` with `{"owner": {"type": "service", "id": "server-token"}, "dry_run": true}`
-   previews first; both HTTP operations require `server.admin` and `apply` reports
+   previews first; in enforced mode both HTTP operations require `server.admin`, and `apply` reports
    `503 ownership_migration_unavailable` while `ACCESS_MODE=disabled`.
 4. Verify: modify a previously immutable Artifact, approve a previously blocked Candidate, and confirm `plan` now
-   reports no gaps. Any identity without the migrated ownership or `server.admin` keeps receiving `403`.
+   reports no ownership gaps. Include the background Principal in the plan and check that `background` is empty.
+   Identities without the required Artifact write or Candidate review authority still receive `403`.
 
 ## Check the deployment
 

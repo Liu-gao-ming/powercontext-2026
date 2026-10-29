@@ -178,9 +178,10 @@ Principal，并仅向审核者授予审核权限。参见[分离 Agent 提交与
 
 1. 先备份数据库。下面的离线命令在 Server 停止时执行，切换前后都可以运行。
 2. 用 `powercontext server access-ownership-migrate --action plan` 盘点受影响的数据。`ACCESS_MODE=disabled`
-   期间同样可以运行。把已配置的后台 Principal（例如 `ACCESS_BACKGROUND_PRINCIPAL_ID`）作为
-   `background_principal` 传入 `POST /v1/access/ownership/plan`，还可以列出因缺少 `scope.contribute` 权限、
-   定时处理会被拒绝的 Scope。
+   期间同样可以运行。添加 `--background-principal service:后台身份ID`，填写切换后准备使用的
+   `ACCESS_BACKGROUND_PRINCIPAL_ID`，即可检查每个指定 Scope 的 `scope.contribute` 和已有 Profile 写权限。
+   owner 缺口补齐后仍会执行这些检查。HTTP 预检在授权存储可用时接受 `background_principal`；否则返回
+   `503 relationship_management_unavailable`。开启认证前请使用离线命令执行后台权限预检。
 3. 用显式指定的归属 Principal 回补。单用户静态 token 部署就是 `server-token` 服务 Principal：
 
    ```bash
@@ -193,11 +194,16 @@ Principal，并仅向审核者授予审核权限。参见[分离 Agent 提交与
    attestation 会被保留，冲突时明确报告，不会被覆盖。不同身份需要拥有不同 Scope 时，用另一个 `--owner`
    再次执行；多用户部署由此保持明确的身份边界。
 
+   盘点包含已合并和已退休的 Artifact 身份，以保留恢复操作所需的权限。如果持久化恢复记录已经确定归属，
+   HTTP `apply` 及其预览会报告 `owner-recovery-pending` 或 `owner-recovery-delivered_relation_missing`，
+   并保留原始记录及其归属。待投递的归属信息应按[归属恢复流程](../workflows/scopes-and-access.md)继续处理。
+
    如果没有停机窗口，也可以对运行中的 Server 走 HTTP：`POST /v1/access/ownership/apply`（先用
-   `dry_run: true` 预览）。两个 HTTP 操作都要求 `server.admin`；`ACCESS_MODE=disabled` 时 `apply` 返回
+   `dry_run: true` 预览）。认证模式下两个 HTTP 操作都要求 `server.admin`；`ACCESS_MODE=disabled` 时 `apply` 返回
    `503 ownership_migration_unavailable`。
-4. 验证：修改一个此前不可变的 Artifact，审批一个此前被阻塞的 Candidate，并确认 `plan` 不再报告缺口。没有
-   迁移归属或 `server.admin` 权限的身份仍会收到 `403`。
+4. 验证：修改一个此前不可变的 Artifact，审批一个此前被阻塞的 Candidate，并确认 `plan` 不再报告归属缺口。
+   预检时传入后台 Principal，确认 `background` 为空。没有相应 Artifact 写权限或 Candidate 审批权限的身份
+   仍会收到 `403`。
 
 ## 检查部署
 

@@ -3126,7 +3126,7 @@ class PlanAccessOwnershipRequest(BaseModel):
     background_principal: Annotated[
         AccessPrincipal | None,
         Field(
-            description="Optional background processing Principal, such as ACCESS_BACKGROUND_PRINCIPAL_ID; each affected Scope is checked for its scope.contribute authority."
+            description="Optional background processing Principal, such as ACCESS_BACKGROUND_PRINCIPAL_ID; each selected Scope is checked for scope.contribute and write permission on an existing Profile, including after all ownership gaps have been filled. An available Access store is required."
         ),
     ] = None
 
