@@ -1,15 +1,13 @@
 name: License Check
 
 on:
-  pull_request:
-  push:
-    branches: [master]
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: license-check-${{ github.event.pull_request.number || github.ref }}
+  group: license-check-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
