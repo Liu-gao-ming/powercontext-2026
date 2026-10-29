@@ -23,6 +23,7 @@ import type {
   MemorySearchHit,
   MemoryContext,
   WriteOutcome,
+  WriteRecord,
 } from "../generated/ipc";
 import { desktopApi } from "../shared/ipc";
 import { connectionError, operationRestriction } from "./connection-messages";
@@ -41,7 +42,9 @@ type Props = {
   onOpenScopes?: (trigger: HTMLElement) => void;
   onOpenLocalServer?: () => void;
   contextPending?: boolean;
+  onUncertainDraft?: (draft: UncertainDraft | null) => void;
 };
+export type UncertainDraft = { text: string; record: WriteRecord };
 export const textBytes = (value: string) =>
   new TextEncoder().encode(value).length;
 function WriteTarget({ context }: { context: MemoryContext }) {
@@ -50,6 +53,53 @@ function WriteTarget({ context }: { context: MemoryContext }) {
       {context.endpoint} · {context.serverId && <>{context.serverId} · </>}
       {context.scopeId}
     </code>
+  );
+}
+
+export function SubmittedDraftRecovery({
+  draft,
+  language,
+  onDiscard,
+}: {
+  draft: UncertainDraft;
+  language: Language;
+  onDiscard: () => void;
+}) {
+  const t = memoryMessages[language];
+  const { confirm, confirmation } = useConfirmation(language);
+  const [feedback, setFeedback] = useState("");
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(draft.text);
+      setFeedback(t.copied);
+    } catch {
+      setFeedback(t.copyFailed);
+    }
+  }
+  return (
+    <section className="card stack" role="region" aria-label={t.recovery}>
+      {confirmation}
+      <h2>{t.recovery}</h2>
+      <p>{t.recoveryHint}</p>
+      <p>
+        {t.original}: <WriteTarget context={draft.record.context} />
+      </p>
+      <label>
+        {t.submittedText}
+        <textarea readOnly value={draft.text} rows={3} />
+      </label>
+      <div className="actions">
+        <button onClick={() => void copy()}>{t.copyText}</button>
+        <button
+          onClick={async () => {
+            if (await confirm(t.discardSubmittedConfirm)) onDiscard();
+          }}
+        >
+          {t.discardSubmitted}
+        </button>
+      </div>
+      {feedback && <p role="status">{feedback}</p>}
+    </section>
   );
 }
 
@@ -68,6 +118,7 @@ export function NoteForm({
   contextPending = false,
   onReadSaved,
   invalidateSaved,
+  onUncertainDraft,
 }: NoteFormProps) {
   const t = memoryMessages[language];
   const { confirm, confirmation } = useConfirmation(language);
@@ -131,6 +182,7 @@ export function NoteForm({
     )
       return;
     if (ticket !== lifetime.current || generation.current !== original) return;
+    onUncertainDraft?.(null);
     const contentTicket = contentInvalidation.current;
     const isCurrent = () =>
       ticket === lifetime.current && generation.current === original;
@@ -144,6 +196,9 @@ export function NoteForm({
       const result = await desktopApi.remember(original, text);
       if (isCurrent()) {
         setOutcome(result);
+        if (result.record.status === "unknown") {
+          onUncertainDraft?.({ text, record: result.record });
+        }
         if (result.record.status === "succeeded") {
           // Zero, one, or multiple returned records: represent each honestly.
           const records = result.result?.records ?? [];
@@ -495,6 +550,7 @@ export function MemoryWorkspace(props: Props) {
         onReadSaved={(artifact, trigger) => void readSaved(artifact, trigger)}
         invalidateSaved={invalidateSaved}
         contextPending={contextPending}
+        onUncertainDraft={props.onUncertainDraft}
       />
       <section className="card stack">
         <h2>{t.query}</h2>

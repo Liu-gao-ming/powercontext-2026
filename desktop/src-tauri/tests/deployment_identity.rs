@@ -519,6 +519,74 @@ async fn replacement_during_activation_does_not_mix_deployment_and_principal_fac
 }
 
 #[tokio::test]
+async fn failed_recheck_drops_the_previous_verified_report() {
+    for status in [200, 503] {
+        let fixture = Fixture::new(true).await;
+        fixture.activate().await;
+        assert!(!fixture.manager.state().unwrap().reports.is_empty());
+        fixture.state.lock().unwrap().pause = Some("/v1/access/me".into());
+        let (manager, id) = (fixture.manager.clone(), fixture.id.clone());
+        let check = tokio::spawn(async move { manager.check(&id, true).await });
+        fixture.entered().await;
+        fixture.state.lock().unwrap().discovery = (status, discovery("server-b"));
+        fixture.release.notify_one();
+        assert!(
+            timeout(Duration::from_secs(5), check)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let state = fixture.manager.state().unwrap();
+        assert!(state.active.is_none());
+        assert!(
+            state
+                .reports
+                .iter()
+                .all(|report| report.connection_id != fixture.id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn post_write_discovery_503_disconnects_with_an_unknown_original_receipt() {
+    let fixture = Fixture::new(true).await;
+    let generation = fixture.select().await;
+    fixture.state.lock().unwrap().pause = Some("/v1/memory/remember".into());
+    let manager = fixture.manager.clone();
+    let write = tokio::spawn(async move { manager.remember(generation, "preserve me").await });
+    fixture.entered().await;
+    fixture.state.lock().unwrap().discovery = (503, json!({"error":{"code":"runtime_not_ready"}}));
+    fixture.release.notify_one();
+    let outcome = timeout(Duration::from_secs(5), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.record.status, WriteStatus::Unknown);
+    assert_eq!(
+        outcome.record.error.as_ref().unwrap().code,
+        SafeError::RuntimeNotReady
+    );
+    assert!(outcome.result.is_none());
+    assert_eq!(
+        outcome.record.context.server_id.as_deref(),
+        Some("server-a")
+    );
+    fixture.assert_disconnected(generation);
+    assert_eq!(
+        fixture
+            .manager
+            .state()
+            .unwrap()
+            .last_write
+            .unwrap()
+            .operation_id,
+        outcome.record.operation_id
+    );
+}
+
+#[tokio::test]
 async fn principal_revocation_while_reading_discards_private_results() {
     let fixture = Fixture::new(true).await;
     let generation = fixture.select().await;

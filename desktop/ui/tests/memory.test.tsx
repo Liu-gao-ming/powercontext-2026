@@ -358,6 +358,95 @@ function outcome(status: "succeeded" | "unknown" | "failed"): WriteOutcome {
     result: status === "succeeded" ? { changed: false, records: [] } : null,
   };
 }
+
+test.each(["en", "zh"] as const)(
+  "%s keeps submitted text after post-write verification disconnects and refreshes native state",
+  async (language) => {
+    const user = userEvent.setup();
+    vi.mocked(desktopApi.state).mockResolvedValue(state);
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "设置与诊断" }));
+    await user.selectOptions(screen.getByLabelText("语言"), language);
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "en" ? "Memories" : "记忆",
+      }),
+    );
+    const unknown = outcome("unknown");
+    unknown.record.error = {
+      code: "runtime_not_ready",
+      requestId: null,
+      dispatched: true,
+    };
+    vi.mocked(desktopApi.remember).mockResolvedValueOnce(unknown);
+    vi.mocked(desktopApi.state).mockResolvedValue({
+      ...state,
+      generation: 2,
+      active: null,
+      reports: [],
+      lastWrite: unknown.record,
+    });
+    await user.type(
+      screen.getByRole("textbox", {
+        name: language === "en" ? "Memory text" : "记忆内容",
+      }),
+      "preserve me",
+    );
+    await user.click(
+      screen.getByRole("button", { name: language === "en" ? "Save" : "保存" }),
+    );
+    const original = (await screen.findByRole("textbox", {
+      name: language === "en" ? "Original submitted text" : "原始提交文本",
+    })) as HTMLTextAreaElement;
+    expect(original.value).toBe("preserve me");
+    expect(original.readOnly).toBe(true);
+    expect(
+      screen
+        .getByRole("button", { name: language === "en" ? "Save" : "保存" })
+        .matches(":disabled"),
+    ).toBe(true);
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: language === "en" ? "Memory text" : "记忆内容",
+        }) as HTMLTextAreaElement
+      ).value,
+    ).toBe("");
+    const clipboard = vi
+      .spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue();
+    const region = screen.getByRole("region", {
+      name: language === "en" ? "Submitted draft recovery" : "提交草稿恢复",
+    });
+    expect(region.textContent).toContain("server-a");
+    expect(region.textContent).toContain("scope-a");
+    await user.click(
+      within(region).getByRole("button", {
+        name: language === "en" ? "Copy text" : "复制正文",
+      }),
+    );
+    expect(clipboard).toHaveBeenCalledWith("preserve me");
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "en" ? "Connections" : "连接",
+      }),
+    );
+    await answerConfirmation(user, false);
+    expect(original.value).toBe("preserve me");
+    await user.click(
+      within(region).getByRole("button", {
+        name: language === "en" ? "Discard submitted text" : "丢弃提交文本",
+      }),
+    );
+    await answerConfirmation(user, true);
+    expect(
+      screen.queryByRole("textbox", {
+        name: language === "en" ? "Original submitted text" : "原始提交文本",
+      }),
+    ).toBeNull();
+    expect(desktopApi.remember).toHaveBeenCalledTimes(1);
+  },
+);
 function form(language: "en" | "zh" = "en") {
   vi.mocked(desktopApi.state).mockResolvedValue(state);
   render(
@@ -989,9 +1078,14 @@ test("overview refresh shows the latest readiness instead of the activation snap
   expect(screen.queryByText("Service ready")).toBeNull();
 });
 
-test.each(["scope", "page"])(
-  "late save after a %s switch preserves the new draft's navigation guard",
-  async (switchKind) => {
+test.each([
+  ["scope", "succeeded"],
+  ["page", "succeeded"],
+  ["scope", "unknown"],
+  ["page", "unknown"],
+] as const)(
+  "late %s-switch save with %s outcome preserves the new draft's navigation guard",
+  async (switchKind, status) => {
     const user = userEvent.setup();
     let finish!: (value: WriteOutcome) => void;
     vi.mocked(desktopApi.remember).mockImplementationOnce(
@@ -1045,7 +1139,9 @@ test.each(["scope", "page"])(
     }
     await user.type(screen.getByLabelText("记忆内容"), "draft B");
     await act(async () => {
-      finish(makeSaved(2).outcome);
+      finish(
+        status === "succeeded" ? makeSaved(2).outcome : outcome("unknown"),
+      );
     });
     await user.click(screen.getByRole("button", { name: "总览" }));
     await answerConfirmation(user, false);
@@ -1053,6 +1149,7 @@ test.each(["scope", "page"])(
       (screen.getByLabelText("记忆内容") as HTMLTextAreaElement).value,
     ).toBe("draft B");
     expect(screen.queryAllByText("Atomic note 0")).toHaveLength(0);
+    expect(screen.queryByRole("textbox", { name: "原始提交文本" })).toBeNull();
     expect(
       screen.queryAllByRole("button", { name: "打开保存的记录" }),
     ).toHaveLength(0);
