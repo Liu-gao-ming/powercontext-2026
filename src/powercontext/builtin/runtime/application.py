@@ -740,7 +740,14 @@ class ScopedRecordApplication:
         execution_context: Any = None,
         on_commit: Callable[[Any, ArtifactCreated], Awaitable[None]] | None = None,
     ) -> ArtifactCreated:
-        async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
+        async with (
+            self._runtime._scoped_operation(
+                self.scope_id,
+                generation_purpose=ModelUsagePurpose.MEMORY_EXTRACTION if family == "atomic-memory" else None,
+                embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING if family == "atomic-memory" else None,
+            ),
+            self._runtime._locked(self.scope_id),
+        ):
             return await self._runtime._records().create_artifact(
                 self.scope_id,
                 family,
@@ -846,7 +853,14 @@ class ScopedRecordApplication:
         actor_id: str | None = None,
         execution_context: Any = None,
     ) -> ArtifactRecord:
-        async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
+        async with (
+            self._runtime._scoped_operation(
+                self.scope_id,
+                generation_purpose=ModelUsagePurpose.MEMORY_EXTRACTION if family == "atomic-memory" else None,
+                embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING if family == "atomic-memory" else None,
+            ),
+            self._runtime._locked(self.scope_id),
+        ):
             return await self._runtime._records().replace_artifact(
                 self.scope_id,
                 family,
@@ -3385,6 +3399,10 @@ class ScopedAtomicMemoryApplication:
         async with self._runtime._scope_operation(self.scope_id):
             return await self._scoped._filter_current_candidates(candidates, context=context)
 
+    async def manifest(self, **kwargs):
+        async with self._runtime._scope_operation(self.scope_id):
+            return await self._scoped.manifest(**kwargs)
+
     async def list(self, **kwargs):
         async with self._runtime._scope_operation(self.scope_id):
             return await self._scoped.list(**kwargs)
@@ -3422,7 +3440,11 @@ class ScopedAtomicMemoryApplication:
     async def create(self, contents: Sequence[AtomicMemoryContent], /, *, context=None) -> AtomicMemoryMutationResult:
         """Create explicit Atomic Memories in one all-or-nothing batch."""
         values = tuple(content.model_dump(mode="json", by_alias=True, exclude_none=True) for content in contents)
-        async with self._runtime._scoped_operation(self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING):
+        async with self._runtime._scoped_operation(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+            generation_purpose=ModelUsagePurpose.MEMORY_EXTRACTION,
+        ):
             created = await self._runtime._records().create_atomic_memories(
                 self.scope_id, values, execution_context=context
             )
@@ -3440,7 +3462,11 @@ class ScopedAtomicMemoryApplication:
             return await runtime_context.triggers.cursor()
 
     async def merge(self, inputs, content, **kwargs):
-        async with self._runtime._scoped_operation(self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING):
+        async with self._runtime._scoped_operation(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+            generation_purpose=ModelUsagePurpose.MEMORY_EXTRACTION,
+        ):
             return await self._scoped.merge(inputs, content, **kwargs)
 
     async def forget(self, artifact_id: str, **kwargs):
@@ -3452,7 +3478,11 @@ class ScopedAtomicMemoryApplication:
             return await self._scoped.preview_restoration(artifact_id, **kwargs)
 
     async def restore(self, artifact_id: str, **kwargs):
-        async with self._runtime._scoped_operation(self.scope_id, embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING):
+        async with self._runtime._scoped_operation(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+            generation_purpose=ModelUsagePurpose.MEMORY_EXTRACTION,
+        ):
             return await self._scoped.restore(artifact_id, **kwargs)
 
 

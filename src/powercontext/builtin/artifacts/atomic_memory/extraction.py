@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.atomic_memory.models import AtomicMemoryContent
+from powercontext.builtin.artifacts.atomic_memory.summary import DESCRIPTION_RULES
 from powercontext.builtin.artifacts.memory.prompts import MemoryExtractionProfile
 from powercontext.builtin.inference import InvalidInferenceOutputError, StructuredGenerator, TokenEstimator
 from powercontext.builtin.persistence.records import _canonical_source_text
@@ -62,7 +63,7 @@ A language difference alone is not a factual correction and does not authorize r
 def atomic_memory_extraction_instructions_version(profile: MemoryExtractionProfile) -> str:
     """Return the stable built-in instruction identity for one extraction profile."""
 
-    return f"powercontext.atomic-memory.extract.{profile.value}.v2"
+    return f"powercontext.atomic-memory.extract.{profile.value}.v3"
 
 
 def atomic_memory_extraction_instructions(profile: MemoryExtractionProfile) -> str:
@@ -88,7 +89,9 @@ that material unless it independently contains a durable fact, decision or const
 proposition. Experience or Skill routing is outside this output contract.
 Preserve literal commands, code, paths, configuration keys and quoted text exactly when they are themselves factual
 values.
-Each candidate must cite one or more supplied evidence_ids and contain self-contained kind/text.
+Each candidate must cite one or more supplied evidence_ids and contain kind, text and description.
+The text must preserve the complete atomic fact.
+{DESCRIPTION_RULES}
 Use kind fact, preference, decision, constraint or working_note. Split facts that can change independently.
 Preserve the conditions, effective/event times and uncertainty in text. Do not allocate Artifact IDs or revisions,
 choose existing targets, approve or publish anything. Return empty candidates when nothing is worth remembering.
@@ -118,6 +121,7 @@ class AtomicMemoryCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     kind: Literal["fact", "preference", "decision", "constraint", "working_note"]
     text: str
+    description: str = Field(min_length=1, max_length=200)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
 
 
@@ -140,7 +144,11 @@ class AtomicMemoryGenerationPipeline:
         output = AtomicMemoryExtractionOutput.model_validate(result.output)
         supplied = {item.evidence_id for item in value.evidence}
         for candidate in output.candidates:
-            AtomicMemoryContent(kind=candidate.kind, text=candidate.text)
+            AtomicMemoryContent(
+                kind=candidate.kind,
+                text=candidate.text,
+                description=candidate.description,
+            )
             if not set(candidate.evidence_ids) <= supplied:
                 raise InvalidInferenceOutputError(
                     "atomic-memory-extract", "candidate cites unavailable Source evidence"
