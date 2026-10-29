@@ -161,8 +161,10 @@ test("global Scope confirmation preserves a cancelled connection draft and disca
   await user.click(screen.getByRole("button", { name: "Scope B" }));
   await answerConfirmation(user, true);
   expect(screen.queryByRole("dialog")).toBeNull();
-  expect((screen.getByLabelText("连接名称") as HTMLInputElement).value).toBe(
-    "Second",
+  await waitFor(() =>
+    expect((screen.getByLabelText("连接名称") as HTMLInputElement).value).toBe(
+      "Second",
+    ),
   );
   expect(desktopApi.save).not.toHaveBeenCalled();
   await user.click(screen.getByRole("button", { name: "观察" }));
