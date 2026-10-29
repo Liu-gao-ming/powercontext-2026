@@ -51,13 +51,81 @@ The historical Server c535d816 protocol qualification below records the specific
 
 ## Compatibility scope
 
-[compatibility.json](src-tauri/src/connections/compatibility.json) preserves the recorded Server sources, normalized OpenAPI contract digests and qualification-wheel digests for the historical profiles below. The current contract has source-specific qualifications `sqlite-atomic-dd62723d-v1` and `sqlite-atomic-4ffdf4e9-v1` below. Ordinary builds require explicitly selecting the record whose tested Server source and wheel match the deployment, then checking the connection before business operations become available. The `dd62723d` record covers the migration-framework sources; the `4ffdf4e9` record covers the earlier release-preparation sources. The `sqlite-atomic-c535d816-v1`, `sqlite-atomic-98275dbb-v1`, `sqlite-atomic-1da99747-v1`, `sqlite-atomic-8f10c560-v1`, `sqlite-atomic-d9a78567-v1`, `sqlite-atomic-caf2a35a-v1`, `sqlite-atomic-683e2db0-v1` and `sqlite-atomic-cab054db-v1` records qualify their corresponding Server source deployments and do not match this bundled contract. Historical records are disabled in the selector, and saved unavailable selections remain visible until explicitly replaced. CI builds have their own artifact identities and do not change product qualification.
+[compatibility.json](src-tauri/src/connections/compatibility.json) preserves the recorded Server sources, normalized OpenAPI contract digests and qualification-wheel digests. The current contract is qualified by `sqlite-atomic-7f6b01ce-v1` below. Ordinary builds require explicitly selecting the record whose tested Server source and wheel match the deployment, then checking the connection before business operations become available. Historical profiles retain their source-specific qualifications but do not match this bundled contract. Historical records are disabled in the selector, and saved unavailable selections remain visible until explicitly replaced. CI builds have their own artifact identities and do not change product qualification.
 
 The real Server harness covers SQLite with anonymous loopback, static Bearer, HTTPS with explicit CA/base path, and injected-provider/enforced access. It exercises save/search/exact reads, identity changes, binding revocation, ambiguous writes without replay and Scope pagination. Installed UI checks cover repeated launches preserving the existing editor, late committed-save responses preserving a new Scope draft, explicit connection/Scope selection, clipboard copies, connection isolation, draft cancellation, byte limits and independent Server survival after Desktop exit.
 
 Selecting a compatibility profile does not attest the remote binary identity. Existing `sqlite-1.1.1-v1` / `sqlite-63f918b7-v1` / `sqlite-ab43e3a7-v1` / `sqlite-f1089f4e-v1` / `sqlite-6e237568-v1` / `sqlite-legacy-58f7f4f6-v1` selections require explicitly choosing an available matching profile and rechecking the connection. Desktop reads memories only through Atomic Memory references, so Servers that answer only with Memory entry citations are not qualified. CLI diagnostics separately verify the registered executable path and digest, then validate the diagnostic response schema. The observed version is optional report information; a registration does not require a version.
 
 ### Current Server protocol qualification
+
+#### Server 7f6b01ce protocol qualification
+
+`sqlite-atomic-7f6b01ce-v1` qualifies Server source
+`7f6b01ce2c5dc47eeac8a29ec520bb51ac72b934` for OpenAPI digest
+`ae09287aa03adf7dc96f100292c1de84b8c88f5e7ba3de636e6890af0e9a3a55`.
+The qualification wheel is `powercontext-1.3.1.dev282+g7f6b01ce2-py3-none-any.whl`,
+SHA-256 `5a7b83dd4641027da375eca71fbdb6ab1e12f049ca1f710c25c887598013a804`,
+built from the clean source commit. This development wheel is not a published release.
+
+On 2026-10-28, macOS 15.7.4 ARM64 with Python 3.11.15 and Rust 1.97.1 ran
+the native `ConnectionManager` and `server_probe` against the extracted wheel
+and independent SQLite Server processes. All four modes passed: anonymous
+loopback, static Bearer, HTTPS with an explicit CA/base path, and an injected
+provider with enforced access. The provider mode also exercised identity
+changes, revocation of exact reads, and Scope pagination. Every mode confirmed
+that the Server survives the Desktop probe and that a committed write with a
+lost response remains unknown without replay. The ignored report is under
+`desktop/.artifacts/real-server.json` and records `desktopWorkingTreeDirty=false`.
+
+This qualifies the recorded source, contract and wheel for SQLite protocol
+behavior on that host; it does not qualify the installed UI, Windows, signing,
+notarization, IME or screen-reader behavior.
+
+#### Server 44f934e8 protocol qualification
+
+`sqlite-atomic-44f934e8-v1` qualifies Server source
+`44f934e8023dda7ba7c716d6ad29a962b8d61503` for OpenAPI digest
+`38125b91c8956b443ec7e7686bbc85147b8f3bc3f8fc3968926eeb1f806411c2`.
+The qualification wheel is `powercontext-1.3.1.dev279+g44f934e80-py3-none-any.whl`,
+SHA-256 `f7f2b8dcc0a6c49fff13ffc1fd27df1b42eb0968755906a279a34679c6136003`,
+built from the clean source commit. This development wheel is not a published release.
+
+On 2026-10-27, macOS 15.7.4 ARM64 with Python 3.11.15 and Rust 1.97.1 ran
+the native `ConnectionManager` and `server_probe` against the extracted wheel
+and independent SQLite Server processes. All four modes passed: anonymous
+loopback, static Bearer, HTTPS with an explicit CA/base path, and an injected
+provider with enforced access. The provider mode also exercised identity
+changes, revocation of exact reads, and Scope pagination. Every mode confirmed
+that the Server survives the Desktop probe and that a committed write with a
+lost response remains unknown without replay. The ignored report is under
+`desktop/.artifacts/real-server.json`.
+
+This qualifies the recorded source, contract and wheel for SQLite protocol
+behavior on that host; it does not qualify the installed UI, Windows, signing,
+notarization, IME or screen-reader behavior.
+
+#### Server 8252ebb5 protocol qualification
+
+`sqlite-atomic-8252ebb5-v1` qualifies the Server source at
+`8252ebb5812b5d5972afb2a78efc14fa9b79dd7e` for the bundled OpenAPI digest
+`da214872028f7f181cea894159f3bd99b621d4e9a8158b9aa184159dbfbfc15e`. The qualification wheel is
+`powercontext-1.3.1.dev268+g8252ebb58.d20261026-py3-none-any.whl`, SHA-256
+`4e145007c14665f3d516e803a88c29f06db372a4e3f7011adf3d342626051e40`.
+
+On 2026-10-26, macOS 15.7.4 ARM64 with Python 3.11.15 and Rust 1.95.0 ran the
+native `ConnectionManager` and `server_probe` against the extracted wheel and
+independent SQLite Server processes. All four modes passed: anonymous loopback,
+static Bearer, HTTPS with explicit CA/base path, and injected-provider/enforced
+access. The provider mode also passed identity change invalidation, same-identity
+revocation of exact reads, and Scope pagination. Every mode confirmed that the
+Server remains alive after Desktop exits and that a committed write with a lost
+response remains unknown without replay.
+
+This is protocol qualification for the recorded source and wheel, not binary
+attestation of an arbitrary remote Server. It does not qualify the installed UI,
+Windows, signing, notarization, IME, or screen-reader behavior. The ignored
+evidence is under `desktop/.artifacts/real-server.json`.
 
 #### Server 4ffdf4e9 protocol qualification
 
@@ -589,6 +657,31 @@ The bundled contract digest `5878999ce9e239d6642e4da858074b281ed465629432c578b35
 2026-10-23，合入 master `1da99747` 后，Windows x64 的全量 86 项前端测试、类型检查、lint、构建、生成合同／图标与 IPC 导出检查通过；Rust fmt、全目标 clippy、四项 IPC 测试及六个验收 Python 文件的静态检查、五项 fixture 回归通过。导航测试同时保留 master 的平台策略与本分支的端口、跨平台来源和应用路径保护，原生凭据支持及草稿／焦点修复均保留。
 
 九项传输测试全部通过。当前合同由上述 Server 1da99747 真实协议验收记录资格化，完整 Rust 测试（含随包兼容资格用例）通过。仓库全量钩子仍有未修改代码的既存 Windows Python 类型错误，其余钩子通过。上述结果不代表安装包或 macOS 验收通过。
+
+## Server 9357c2fe protocol qualification
+
+`sqlite-atomic-9357c2fe-v1` qualifies Server source
+`9357c2fe55409a55a612f4a42f883dcf1927b07e` for OpenAPI digest
+`ef00a573b9d57ace1cb8484dd4f39c77f1347bd099655ade5daf82dcb11ac296`.
+The wheel `powercontext-1.3.1.dev327+g9357c2fe5-py3-none-any.whl` has SHA-256
+`3726d6f71523539179c76d02c3111e7b1fed5e0016979efbcf3981663e024dce` and was built from
+that clean source commit.
+
+On macOS 15.7.4 ARM64 with Python 3.11.15, the native `ConnectionManager` and `server_probe`
+passed against four independent wheel-backed SQLite Server processes: anonymous loopback,
+static Bearer, HTTPS with an explicit CA and base path, and an injected authentication provider
+with enforced access. The checks covered discovery, all eleven recorded operations, identity
+change, same-identity revocation of exact reads, Scope pagination, committed writes with lost
+responses remaining unknown without replay, and independent Server survival after the client exited.
+The report is under ignored `.artifacts/real-server.json`.
+
+This qualifies the recorded source, contract and wheel for SQLite protocol behavior on this host.
+It does not qualify the installed UI, Windows, signing, notarization, IME or screen-reader behavior.
+
+`sqlite-atomic-9357c2fe-v1` 将 macOS 15.7.4 ARM64 上的 Server 源码、OpenAPI 摘要及 wheel 摘要绑定。
+原生 `ConnectionManager` 与 `server_probe` 对四种独立 SQLite Server 模式验收通过，覆盖全部十一项协议操作、
+身份变更、同身份权限撤销、Scope 分页、写入响应丢失时不重放，以及 Desktop 退出后 Server 仍运行。
+这只证明所记录构建在该主机上的 SQLite 协议兼容性，不代表 Windows、安装 UI、签名、公证、IME 或屏幕阅读器验收。
 
 ## Remaining release qualification
 
