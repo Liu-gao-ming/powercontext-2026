@@ -109,6 +109,7 @@ class SeekDBProfile:
         config: SeekDBConfig,
         *,
         tables: tuple[Table, ...],
+        create_schema: bool = True,
         _archive_recovery: bool = False,
     ) -> AsyncIterator[SeekDBProfile]:
         """Start seekdb locally and connect through its async Unix socket."""
@@ -130,8 +131,9 @@ class SeekDBProfile:
                     await prepare_topic_memory_recovery_schema(
                         engine, initialize=any(table.name == BUDGET for table in tables)
                     )
-                async with database.transaction() as connection:
-                    await create_tables(connection, tables)
+                if create_schema:
+                    async with database.transaction() as connection:
+                        await create_tables(connection, tables)
                 yield profile
             finally:
                 close_task = asyncio.create_task(database.close())
