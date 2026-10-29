@@ -14,6 +14,7 @@
 
 """Stable public exports for PowerContext clients."""
 
+from powercontext import artifact_plugins
 from powercontext.artifacts import (
     Artifact,
     ArtifactAddress,
@@ -113,4 +114,5 @@ __all__ = [
     "SourceStore",
     "Sources",
     "Trigger",
+    "artifact_plugins",
 ]

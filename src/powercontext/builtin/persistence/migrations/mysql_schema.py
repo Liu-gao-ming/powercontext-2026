@@ -92,6 +92,19 @@ def mysql_inventory(connection: Connection, *, exclude: frozenset[str] = frozens
             key=lambda row: str(row.get("Trigger", "")),
         )
         inventory["views"].sort()
+        if "pc_artifact_vector_spaces" in inventory["tables"]:
+            from sqlalchemy import select
+
+            from powercontext.builtin.persistence.tables import ARTIFACT_VECTOR_SPACES_TABLE
+
+            declarations = (
+                connection
+                .execute(select(ARTIFACT_VECTOR_SPACES_TABLE).order_by(ARTIFACT_VECTOR_SPACES_TABLE.c.space_id))
+                .mappings()
+                .all()
+            )
+            if declarations:
+                inventory["artifact_spaces"] = [dict(space) for space in declarations]
     except DBAPIError as error:
         raise MigrationError(
             "schema_reflection_failed", "Complete database schema reflection is unavailable."
@@ -140,7 +153,10 @@ def read_revision(
 class MySQLSchema:
     """Validate source, intermediate and post-DDL shapes from frozen resources."""
 
-    def __init__(self, bundle: MigrationBundle, *, embedded_code: bool = False) -> None:  # noqa: C901 -- Keep ordered admission checks with their operation.
+    def __init__(  # noqa: C901 -- Keep ordered admission checks with their operation.
+        self, bundle: MigrationBundle, *, embedded_code: bool = False, allow_declared_spaces: bool = False
+    ) -> None:
+        self.allow_declared_spaces = allow_declared_spaces
         self.bundle = bundle
         self.revisions = bundle.revisions
         manifest = json.loads((bundle.snapshot_directory / "manifest.json").read_text())
@@ -334,6 +350,23 @@ class MySQLSchema:
         # Captured backends may expose an explicit default that another backend
         # omits. Only registered values may be absent; retain it in fingerprints.
         actual = copy.deepcopy(inventory)
+        declarations = actual.pop("artifact_spaces", [])
+        if declarations:
+            from powercontext.builtin.persistence.artifact_vector_space import registered_native_layouts
+
+            if "pc_artifact_vector_spaces" not in expected["tables"]:
+                return False
+            try:
+                layouts = registered_native_layouts(
+                    declarations, actual["tables"], allow_declared=self.allow_declared_spaces
+                )
+            except (ValueError, TypeError, KeyError) as error:
+                raise MigrationError(
+                    "incompatible_schema", "A registered native vector space is incomplete or incompatible."
+                ) from error
+            expected = copy.deepcopy(expected)
+            expected["tables"].update(copy.deepcopy(layouts))
+            self.affected_objects = tuple(dict.fromkeys((*self.affected_objects, *sorted(layouts))))
         for name, options in self.optional_table_options.items():
             table = actual["tables"].get(name)
             target = expected["tables"].get(name)

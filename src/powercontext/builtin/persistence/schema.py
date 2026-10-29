@@ -25,6 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 async def create_tables(connection: AsyncConnection, tables: Sequence[Table], /) -> None:
     """Create selected tables only for unmanaged storage; managed schemas are read-only."""
 
+    from powercontext.builtin.persistence.tables import ARTIFACT_VECTORS_TABLE
+
+    tables = tuple(
+        table for table in tables if table is not ARTIFACT_VECTORS_TABLE or connection.dialect.name == "sqlite"
+    )
     names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
     if "pc_schema_revision" in names:
         if not {table.name for table in tables} <= names:
@@ -46,6 +51,24 @@ async def create_tables(connection: AsyncConnection, tables: Sequence[Table], /)
                 checkfirst=True,
             )
         )
+
+    if any(table.name == "pc_artifact_search_text" for table in tables):
+        from powercontext.builtin.persistence.artifact_search_schema import ensure_search_support
+
+        await connection.run_sync(ensure_search_support)
+    if connection.dialect.name != "sqlite" and any(table.name == "pc_artifact_vector_spaces" for table in tables):
+        from sqlalchemy import select
+
+        from powercontext.builtin.persistence.artifact_indexes import SCHEMAS, register_definition, search_declaration
+        from powercontext.builtin.persistence.artifact_vector_space import provision_native_spaces
+
+        rows = (await connection.execute(select(SCHEMAS))).mappings().all()
+        for row in rows:
+            declaration = search_declaration(row["declaration"])
+            if declaration is not None:
+                for index in declaration.indexes:
+                    await register_definition(connection, row["family"], row["schema_version"], index)
+        await connection.run_sync(provision_native_spaces)
 
 
 async def ensure_portable_timestamp_precision(connection: AsyncConnection, tables: Sequence[Table]) -> None:

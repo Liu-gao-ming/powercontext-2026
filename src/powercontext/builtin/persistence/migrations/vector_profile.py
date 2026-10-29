@@ -85,6 +85,15 @@ class ServerVectorProfile:
             layouts["v1_4_1_004"] = layouts["s1402"] + [
                 ["table", "pc_access_owner_recovery", "pc_access_owner_recovery", owner]
             ]
+        artifact_revision = "v1_5_0_001"
+        if artifact_revision in manifest["revision_resources"]:
+            artifact = json.loads((directory / f"schemas/sqlite-{artifact_revision}.json").read_text())["layout"]
+            previous = {(row[0], row[1]): row for row in layouts["v1_4_1_004"]}
+            for row in artifact:
+                key = (row[0], row[1])
+                if key not in previous or row[1] == "pc_artifact_processing_binding_states":
+                    previous[key] = row
+            layouts[artifact_revision] = list(previous.values())
         for entries in layouts.values():
             entries.sort(key=lambda row: (row[0], row[1]))
         return layouts

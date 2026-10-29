@@ -508,7 +508,7 @@ impl ServerApi {
             )
             .await?;
         if result.scope_id != scope
-            || result.family != ArtifactReadFamily::AtomicMemory
+            || result.family != "atomic-memory"
             || result.artifact_id != artifact.artifact_id
             || result.revision != artifact.revision
             || result.content.get("schema").and_then(|v| v.as_str())

@@ -35,20 +35,20 @@ def previous_bundle(directory, embedding):
     shutil.copytree(current.directory, directory, ignore=shutil.ignore_patterns("__pycache__"))
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    owner_resources = manifest["revision_resources"].pop("v1_4_1_004")
-    for resource in (*owner_resources, "versions/v1_4_1_004_owner_recovery.py", "mysql/versions/v1_4_1_004.py"):
-        (directory / resource).unlink()
-    del manifest["sqlite_fingerprints"]["v1_4_1_004"]
-    del manifest["domain_readiness"]["v1_4_1_004"]
-    manifest["mysql_state_layouts"].remove("schemas/mysql-v1_4_1_004.json")
+    removed_revisions = ("s1402", "v1_4_1_004", "v1_5_0_001")
+    for revision in removed_revisions:
+        for resource in manifest["revision_resources"].pop(revision):
+            (directory / resource).unlink()
+        for script in (directory / "versions").glob(f"{revision}_*.py"):
+            script.unlink()
+        (directory / "mysql/versions" / f"{revision}.py").unlink()
+        del manifest["sqlite_fingerprints"][revision]
+        del manifest["domain_readiness"][revision]
+        manifest["mysql_state_layouts"].remove(f"schemas/mysql-{revision}.json")
     manifest["affected_objects"].remove("pc_access_owner_recovery")
-    removed = manifest["revision_resources"].pop("s1402")
-    for resource in (*removed, "versions/s1402_portable_storage.py", "mysql/versions/s1402.py", "portable_storage.py"):
-        (directory / resource).unlink()
-    del manifest["sqlite_fingerprints"]["s1402"]
-    del manifest["domain_readiness"]["s1402"]
-    manifest["domain_steps"] = [step for step in manifest["domain_steps"] if step["revision"] != "s1402"]
-    manifest["mysql_state_layouts"].remove("schemas/mysql-s1402.json")
+    manifest["domain_steps"] = [step for step in manifest["domain_steps"] if step["revision"] not in removed_revisions]
+    for module in ("portable_storage.py", "artifact_storage_readiness.py"):
+        (directory / module).unlink()
     manifest["affected_objects"].remove("pc_portable_restore_receipts")
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return MigrationBundle(directory, embedding_profile=embedding)
@@ -93,8 +93,8 @@ def test_registered_s1401_upgrade_preserves_completed_evidence_and_matches_fresh
     upgraded = SQLiteMigrationRunner(database, bundle, configuration=config)
     plan = upgraded.plan()
     assert plan.source_revision == "s1401"
-    assert plan.revisions == ("s1402", "v1_4_1_004")
-    assert apply(upgraded).revision == "v1_4_1_004"
+    assert plan.revisions == ("s1402", "v1_4_1_004", "v1_5_0_001")
+    assert apply(upgraded).revision == "v1_5_0_001"
     assert upgraded.verify().state == "ready"
     assert not apply(upgraded).changed
     fresh = SQLiteMigrationRunner(tmp_path / "fresh.db", bundle, configuration=config)
