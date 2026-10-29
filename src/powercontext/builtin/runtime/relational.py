@@ -1399,6 +1399,25 @@ class RelationalContexts:
             ).scalars()
             return tuple(str(value) for value in values)
 
+    async def scope_ids_page(self, after: str | None, limit: int, /) -> tuple[str, ...]:
+        """Return one bounded keyset page of scopes that own a Source journal.
+
+        Restored for the Work Ledger discoverers: the scheduler scans scopes in
+        keyset pages, so a full ``scope_ids()`` materialisation is neither
+        bounded nor restartable.
+        """
+
+        if limit < 1 or limit > 100:
+            raise ValueError("scope page limit must be between 1 and 100")  # noqa: TRY003
+        async with self.database.transaction() as connection:
+            statement = select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id)
+            if after is not None:
+                statement = statement.where(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id > validate_scope_id(after))
+            values = (
+                await connection.execute(statement.order_by(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id).limit(limit))
+            ).scalars()
+            return tuple(str(value) for value in values)
+
     async def unconsumed_source_scope_ids(self) -> tuple[str, ...]:
         """Return built-in Source windows that still have journal input."""
 
