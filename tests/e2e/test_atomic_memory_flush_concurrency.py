@@ -45,6 +45,7 @@ from powercontext.builtin.runtime import (
     open_builtin_runtime,
 )
 from powercontext.builtin.scope import ScopeDraft
+from powercontext.sources import SourceSequenceLocator
 from tests.e2e.dream_support import atomic_memory_pipeline, memory_source_text
 
 
@@ -125,7 +126,9 @@ def test_capture_during_extraction_stays_outside_the_selected_window(tmp_path: P
             assert first.current_cursor == first.high_watermark == original.sequence
             (record,) = (await memory.list()).items
             assert record.artifact.content.text == "First fact."
-            assert record.artifact.lineage.sources == (original.source_ref,)
+            assert record.artifact.lineage.sources == (
+                original.source_ref.model_copy(update={"locator": SourceSequenceLocator(sequence=original.sequence)}),
+            )
             following = await memory.flush(limit=1)
             assert following.previous_cursor == original.sequence
             assert following.current_cursor == later.sequence
@@ -166,7 +169,9 @@ def test_overlapping_same_runtime_flushes_publish_the_window_once(tmp_path: Path
             assert second_result.previous_cursor == second_result.current_cursor == source.sequence
             (record,) = (await memory.list()).items
             assert record.ref.revision == 1
-            assert record.artifact.lineage.sources == (source.source_ref,)
+            assert record.artifact.lineage.sources == (
+                source.source_ref.model_copy(update={"locator": SourceSequenceLocator(sequence=source.sequence)}),
+            )
 
     asyncio.run(scenario())
 
@@ -209,7 +214,9 @@ def test_overlapping_runtimes_recheck_the_cursor_before_publication(tmp_path: Pa
             assert (await other_memory.cursor()).sequence == source.sequence
             (record,) = (await memory.list()).items
             assert record.ref.revision == 1
-            assert record.artifact.lineage.sources == (source.source_ref,)
+            assert record.artifact.lineage.sources == (
+                source.source_ref.model_copy(update={"locator": SourceSequenceLocator(sequence=source.sequence)}),
+            )
 
     asyncio.run(scenario())
 

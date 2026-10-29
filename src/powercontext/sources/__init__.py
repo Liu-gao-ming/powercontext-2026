@@ -30,7 +30,15 @@ from powercontext.sources.definitions import (
     SourceDefinitionRegistry,
     SourceProjection,
 )
-from powercontext.sources.models import Source, SourceMaterialization, SourceProjectionKey, SourceRef
+from powercontext.sources.models import (
+    Source,
+    SourceLineRangeLocator,
+    SourceLocator,
+    SourceMaterialization,
+    SourceProjectionKey,
+    SourceRef,
+    SourceSequenceLocator,
+)
 from powercontext.sources.observations import (
     SourceDefinitionManifest,
     SourceObservation,
@@ -60,6 +68,8 @@ __all__ = [
     "SourceDefinition",
     "SourceDefinitionManifest",
     "SourceDefinitionRegistry",
+    "SourceLineRangeLocator",
+    "SourceLocator",
     "SourceMaterialization",
     "SourceObservation",
     "SourceProjection",
@@ -67,6 +77,7 @@ __all__ = [
     "SourceProjectionManifest",
     "SourceProjectionValue",
     "SourceRef",
+    "SourceSequenceLocator",
     "SourceStore",
     "TextEvidence",
     "manifest_for_definition",
