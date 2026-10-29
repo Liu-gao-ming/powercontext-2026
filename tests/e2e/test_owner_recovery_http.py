@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+import sqlite3
+from contextlib import asynccontextmanager, closing
 from typing import cast
 
 import httpx
@@ -178,6 +179,95 @@ def test_candidate_http_failure_retains_a_replayable_proposer_attestation(tmp_pa
             )
             assert response.status_code == 200, response.text
             assert response.json()["candidate_id"] == candidate_id
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("kind", "count"), [("artifact", 1), ("candidate", 101)])
+def test_ownership_migration_cannot_replace_pending_original_attribution(tmp_path, kind, count):
+    async def scenario():
+        async with _server(tmp_path, interrupted=True) as (app, client, access):
+            scope_id = await _scope(client)
+            if kind == "artifact":
+                created = await client.post(
+                    f"/v1/scopes/{scope_id}/artifacts",
+                    json={"family": "profile", "content": {"content": "# Original private profile"}},
+                )
+                assert created.status_code == 503, created.text
+            else:
+                source = await client.post(f"/v1/scopes/{scope_id}/sources", json={"content": "Original evidence."})
+                assert source.status_code == 201, source.text
+                for index in range(count):
+                    created = await client.post(
+                        "/v1/experience/propose",
+                        json={
+                            "scope_id": scope_id,
+                            "proposal": {
+                                "situation": f"Observation {index}.",
+                                "action": "Retain the original proposer.",
+                                "outcome": "Ownership delivery is pending.",
+                                "lesson": "Preserve recorded attribution.",
+                            },
+                            "source_refs": [{"name": "content", "source_id": source.json()["source_id"]}],
+                            "artifact_refs": [],
+                        },
+                    )
+                    assert created.status_code == 503, created.text
+            pending = await app.state.owner_recovery.pending(scope_id=scope_id, limit=500)
+            assert len(pending) == count
+            for dry_run in (True, False):
+                response = await client.post(
+                    "/v1/access/ownership/apply",
+                    json={"scope_ids": [scope_id], "owner": {"type": "user", "id": "bob"}, "dry_run": dry_run},
+                )
+                assert response.status_code == 200, response.text
+                result = response.json()
+                assert result["applied"] == []
+                assert len(result["conflicts"]) == count
+                assert {item["conflict_code"] for item in result["conflicts"]} == {"owner-recovery-pending"}
+            access.relationships.unavailable = False
+            for intent in pending:
+                await app.state.owner_recovery.replay(intent.operation_id)
+                if intent.resource is not None:
+                    relation = await access.artifact_owner(intent.resource)
+                    assert relation is not None and relation.owner == ALICE
+                else:
+                    attestation = await access.candidate_owner(scope_id, intent.candidate_id)
+                    assert attestation is not None and attestation.proposed_owner == ALICE
+            assert await app.state.owner_recovery.pending(scope_id=scope_id) == ()
+
+    asyncio.run(scenario())
+
+
+def test_migration_preserves_completed_ownership_evidence_after_external_relation_loss(tmp_path):
+    async def scenario():
+        async with _server(tmp_path, interrupted=True) as (app, client, access):
+            scope_id = await _scope(client)
+            created = await client.post(
+                f"/v1/scopes/{scope_id}/artifacts",
+                json={"family": "profile", "content": {"content": "# Original private profile"}},
+            )
+            assert created.status_code == 503, created.text
+            (intent,) = await app.state.owner_recovery.pending(scope_id=scope_id)
+            access.relationships.unavailable = False
+            await app.state.owner_recovery.replay(intent.operation_id)
+            # Model out-of-band loss in the external relationship store after delivery was acknowledged.
+            with closing(sqlite3.connect(tmp_path / "relationships.db")) as connection:
+                connection.execute("DELETE FROM pc_access_owners WHERE owner_kind = 'artifact'")
+                connection.commit()
+            for dry_run in (True, False):
+                response = await client.post(
+                    "/v1/access/ownership/apply",
+                    json={"scope_ids": [scope_id], "owner": {"type": "user", "id": "bob"}, "dry_run": dry_run},
+                )
+                assert response.status_code == 200, response.text
+                result = response.json()
+                assert result["applied"] == []
+                assert [item["conflict_code"] for item in result["conflicts"]] == [
+                    "owner-recovery-delivered_relation_missing"
+                ]
+            assert await access.artifact_owner(intent.resource) is None
+            assert await app.state.owner_recovery.pending(scope_id=scope_id) == ()
 
     asyncio.run(scenario())
 
