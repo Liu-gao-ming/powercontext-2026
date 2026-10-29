@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic_ai import Embedder
 from pydantic_ai.embeddings import EmbeddingModel as PydanticAIEmbeddingModelBase
@@ -34,6 +35,7 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemorySearchHit,
     TopicMemorySearchResult,
 )
+from powercontext.builtin.inference import InferenceTimeoutError, InferenceUnavailableError
 from powercontext.builtin.inference.pydantic_ai import PydanticAIEmbeddingModel
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import (
@@ -45,7 +47,7 @@ from powercontext.builtin.runtime import (
 from powercontext.errors import ArtifactNotFoundError
 from powercontext.server.app import create_app
 from powercontext.server.factory import create_server_app
-from powercontext.server.logging import JsonFormatter
+from powercontext.server.logging import JsonFormatter, OperationalContextFilter
 from powercontext.server.settings import McpConfig, ServerSettings
 from powercontext.sources import SourceRef
 
@@ -280,6 +282,57 @@ def test_topic_memory_fallback_failure_redacts_production_provider_context(
     assert provider_sentinel not in rendered
     assert fts_sentinel not in rendered
     assert query not in rendered
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "category"),
+    [
+        (InferenceTimeoutError("private-provider-sentinel", 0.1), "inference_timeout", "timeout"),
+        (InferenceUnavailableError("embed", "private-provider-sentinel"), "inference_unavailable", "dependency"),
+    ],
+)
+def test_topic_memory_inference_failure_log_and_span_agree_without_private_error(caplog, error, code, category) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from powercontext.server.tracing import ServerTracing
+
+    class Unavailable(_TopicMemoryApplication):
+        async def search(self, request):
+            raise error
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracing = ServerTracing(provider)
+    app = create_app(application=SimpleNamespace(topic_memory=Unavailable()), tracing=tracing)
+    filter_ = OperationalContextFilter()
+    caplog.handler.addFilter(filter_)
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger="powercontext"),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/v1/topic-memory/search", json={"scope_id": "scope-a", "query": "private-query-sentinel"}
+            )
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == code
+        record = next(
+            record for record in caplog.records if getattr(record, "event", None) == "application.operation.completed"
+        )
+        assert record.error_category == category
+        assert record.exc_info is None
+        span = next(span for span in exporter.get_finished_spans() if span.name == "powercontext search_topic_memory")
+        assert (span.attributes or {})["powercontext.error.category"] == category
+        assert "error.type" not in (span.attributes or {})
+        rendered = JsonFormatter().format(record) + repr(dict(span.attributes or {}))
+        assert "private-provider-sentinel" not in rendered
+        assert "private-query-sentinel" not in rendered
+    finally:
+        caplog.handler.removeFilter(filter_)
+        tracing.shutdown()
 
 
 def test_composed_fts_runtime_fails_closed_only_for_missing_topic_processing(tmp_path) -> None:

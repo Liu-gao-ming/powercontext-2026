@@ -23,6 +23,18 @@ Use an available skill only when it matches the current task, and read its `SKIL
 
 Target Python 3.11+. Use PEP 8 naming: modules and functions in `snake_case`, classes in `PascalCase`, constants in `UPPER_SNAKE_CASE`. Ruff enforces formatting and linting with a 120-character line length; run `uv run prek run -a` before committing if you do not use the installed hooks. Keep comments focused on non-obvious intent rather than restating code.
 
+## Observability Changes
+
+Before adding or changing operational logs, metrics, or spans, read the developer guide:
+[English](docs/en/development/observability.md) / [中文](docs/zh/development/observability.md).
+The operational field contract is documented in [Logs, metrics, and tracing](docs/en/docs/operate/observability.md).
+
+- Use the owning boundary's stable operation, unit, outcome, and error vocabulary. Emit operational logs through `log_safely`; logging failure must not change business results or suppress cancellation.
+- Reuse bound request/trace/worker identity. Do not invent request IDs for scheduled work or put execution identities in metric labels.
+- Register new structured fields in the appropriate allowlist, document their meaning and units in both locales, and verify their JSON/console output. Arbitrary extras are not a supported output contract.
+- Exclude content, queries, prompts, model responses, vectors, credentials, and sensitive paths. Review exception values before including a traceback; do not dump provider or database errors indiscriminately.
+- Keep logging configuration owned by the Server or embedding application. Preserve unconfigured SDK behavior; verify process-boundary claims with real spawned workers.
+
 ## Design and Implementation
 
 - Start from the current contract and relevant RFC. Change public APIs only as required by the task and avoid unrelated refactors. Do not weaken behavior tests to accommodate an implementation shortcut.
@@ -54,6 +66,25 @@ Use `pytest`; name test files `test_*.py` and test functions `test_*`. Tests mus
 Include doctests when public examples are useful. For changes that affect supported Python versions, prefer `tox` before opening a PR. Tests may use plain `assert`; Ruff allows `S101` under `tests/`.
 
 Run focused checks first and expand based on affected behavior. For claims about an external backend or host, distinguish actual execution from mocks, emulators, and direct hook invocation. Simulated inputs verify local handling; they do not establish that a real service produces those inputs or that a host supports the complete workflow.
+
+## Blog Publishing and i18n
+
+Keep blog changes scoped to the blog. Preserve the existing appearance, navigation,
+content, and behavior of non-blog pages. Load blog styles and scripts only on blog
+pages, and keep blog publishing instructions under `docs/{en,zh}/blog/`.
+
+When the user supplies a blog post as Markdown, prepare both `docs/zh/blog/posts/` and
+`docs/en/blog/posts/` versions. Translate the supplied language faithfully; preserve code,
+commands, links, and technical meaning. The user need not supply a translation or complete
+front matter. Derive the summary and stable slug from the article, reuse known author profiles,
+and ask only for missing facts such as a new author's identity or photo; never invent them.
+
+Keep counterpart posts at matching relative paths with identical slugs, publication/update
+dates, author IDs, draft status, and pin status. Localize titles, summaries, body text,
+category names, and author biographies; share author photos and article assets. Apply edits
+to both languages together. Check blog i18n and pagination with
+`uv run pytest tests/e2e/test_blog_site.py -q` and run `make docs-test` before delivery.
+Preparing content does not by itself authorize a production deployment.
 
 ## Deliverables
 

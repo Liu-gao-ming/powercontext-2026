@@ -12,7 +12,7 @@ An administrator provisions that key through PowerContext's supported Scope bind
 
 Credential validation uses the same resolution followed by protected `get_scope`. It does not write data or use an unauthenticated health endpoint as evidence of access. Save-time read validation cannot promise write permission; handle actual Server 403 responses.
 
-The resolved Scope is injected into every selected operation. Top-level `scope_id`, URL, token, binding, expected Memory revision, context assembly and byte budget are not model parameters. Nested citations and prepared Handoff objects keep their original identities. The Server owns reference and cross-Scope access checks; a matching top-level Scope is not an authorization proof.
+The resolved Scope is injected into every selected operation. Top-level `scope_id`, URL, token, binding, expected Memory revision, context assembly, byte budget and host-owned bootstrap receipt are not model parameters. Nested citations and prepared Handoff objects keep their original identities. The Server owns reference and cross-Scope access checks; a matching top-level Scope is not an authorization proof.
 
 Dify user/session identifiers are not used for automatic routing. One credential shares its Scope among its authorized applications/users. A shared administrator token represents one trust domain, even when Scope A/B searches are separate. Production resource isolation requires appropriately restricted Server credentials/policies or separate instances. Dynamic trusted identity routing needs a separate design and host/Server acceptance.
 

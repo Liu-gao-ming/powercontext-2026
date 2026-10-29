@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections import defaultdict
 from hashlib import sha256
 
-from sqlalchemy import delete, false, insert, select, update
+from sqlalchemy import delete, false, insert, literal, null, select, union_all, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.persistence.tables import (
@@ -61,6 +61,17 @@ class ScopeRepository:
             connection,
             select(SCOPES_TABLE).where(SCOPES_TABLE.c.scope_id.in_(scope_ids)).order_by(SCOPES_TABLE.c.scope_id),
         )
+
+    async def navigation(self, connection, scope_ids):
+        """Read only the names and parent links needed for Scope navigation."""
+        rows = (
+            await connection.execute(
+                select(SCOPES_TABLE.c.scope_id, SCOPES_TABLE.c.title, SCOPES_TABLE.c.parent_scope_id).where(
+                    SCOPES_TABLE.c.scope_id.in_(scope_ids)
+                )
+            )
+        ).mappings()
+        return tuple(dict(row) for row in rows)
 
     async def list(self, connection: AsyncConnection, /) -> tuple[ScopeDescriptor, ...]:
         return await self._load(connection, select(SCOPES_TABLE).order_by(SCOPES_TABLE.c.scope_id))
@@ -106,12 +117,8 @@ class ScopeRepository:
         if len(binding_conditions) > 1:
             statement = statement.where(select(1).where(*binding_conditions).correlate(SCOPES_TABLE).exists())
 
-        rows = tuple(
-            (
-                await connection.execute(statement.order_by(SCOPES_TABLE.c.scope_id).limit(discovery.limit + 1))
-            ).mappings()
-        )
-        return await self._load_rows(connection, rows[: discovery.limit]), len(rows) > discovery.limit
+        scopes = await self._load(connection, statement.order_by(SCOPES_TABLE.c.scope_id).limit(discovery.limit + 1))
+        return scopes[: discovery.limit], len(scopes) > discovery.limit
 
     async def lock_write_transaction(self, connection: AsyncConnection, /) -> None:
         """Acquire SQLite's writer boundary before reading state that will change."""
@@ -129,47 +136,54 @@ class ScopeRepository:
         await connection.execute(update(SCOPES_TABLE).values(version=SCOPES_TABLE.c.version))
 
     async def _load(self, connection: AsyncConnection, statement, /) -> tuple[ScopeDescriptor, ...]:
-        rows = tuple((await connection.execute(statement)).mappings())
-        return await self._load_rows(connection, rows)
+        # Send metadata once and stack relation rows. Neither evidence counts
+        # nor long summaries multiply each other's transfer size.
+        metadata = ("scope_id", "title", "summary", "parent_scope_id", "version")
+        selected = statement.with_only_columns(*(SCOPES_TABLE.c[name] for name in metadata)).cte("selected_scopes")
+        scope_ids = select(selected.c.scope_id)
+        context = SCOPE_CONTEXT_REFERENCES_TABLE.c
+        external = SCOPE_EXTERNAL_REFERENCES_TABLE.c
+        columns = (*metadata, "relation", "value", "kind", "ordinal")
 
-    async def _load_rows(
-        self,
-        connection: AsyncConnection,
-        rows,
-        /,
-    ) -> tuple[ScopeDescriptor, ...]:
-        scope_ids = tuple(str(row["scope_id"]) for row in rows)
-        if not scope_ids:
-            return ()
+        def project(**values):
+            return select(*(values.get(name, null()).label(name) for name in columns))
+
+        relations = union_all(
+            project(**dict(selected.c.items()), relation=literal(-1), ordinal=literal(0)),
+            project(
+                scope_id=context.scope_id,
+                relation=literal(0),
+                value=context.referenced_scope_id,
+                ordinal=literal(0),
+            ).where(context.scope_id.in_(scope_ids)),
+            project(
+                scope_id=external.scope_id,
+                relation=literal(1),
+                value=external.value,
+                kind=external.kind,
+                ordinal=external.ordinal,
+            ).where(external.scope_id.in_(scope_ids)),
+        ).subquery("scope_relations")
+        rows = (
+            await connection.execute(
+                select(relations).order_by(
+                    relations.c.scope_id, relations.c.relation, relations.c.ordinal, relations.c.value
+                )
+            )
+        ).mappings()
+        descriptors = {}
         context_references: dict[str, list[str]] = defaultdict(list)
-        for row in await connection.execute(
-            select(
-                SCOPE_CONTEXT_REFERENCES_TABLE.c.scope_id,
-                SCOPE_CONTEXT_REFERENCES_TABLE.c.referenced_scope_id,
-            )
-            .where(SCOPE_CONTEXT_REFERENCES_TABLE.c.scope_id.in_(scope_ids))
-            .order_by(
-                SCOPE_CONTEXT_REFERENCES_TABLE.c.scope_id,
-                SCOPE_CONTEXT_REFERENCES_TABLE.c.referenced_scope_id,
-            )
-        ):
-            context_references[str(row.scope_id)].append(str(row.referenced_scope_id))
         external_references: dict[str, list[ScopeExternalReference]] = defaultdict(list)
-        for row in await connection.execute(
-            select(
-                SCOPE_EXTERNAL_REFERENCES_TABLE.c.scope_id,
-                SCOPE_EXTERNAL_REFERENCES_TABLE.c.kind,
-                SCOPE_EXTERNAL_REFERENCES_TABLE.c.value,
-            )
-            .where(SCOPE_EXTERNAL_REFERENCES_TABLE.c.scope_id.in_(scope_ids))
-            .order_by(
-                SCOPE_EXTERNAL_REFERENCES_TABLE.c.scope_id,
-                SCOPE_EXTERNAL_REFERENCES_TABLE.c.ordinal,
-            )
-        ):
-            external_references[str(row.scope_id)].append(
-                ScopeExternalReference(kind=str(row.kind), value=str(row.value))
-            )
+        for row in rows:
+            scope_id = str(row["scope_id"])
+            if row["relation"] == -1:
+                descriptors[scope_id] = row
+            elif row["relation"] == 0:
+                context_references[scope_id].append(str(row["value"]))
+            elif row["relation"] == 1:
+                external_references[scope_id].append(
+                    ScopeExternalReference(kind=str(row["kind"]), value=str(row["value"]))
+                )
         return tuple(
             ScopeDescriptor(
                 scope_id=scope_id,
@@ -180,7 +194,7 @@ class ScopeRepository:
                 external_references=tuple(external_references[scope_id]),
                 version=int(row["version"]),
             )
-            for row, scope_id in zip(rows, scope_ids, strict=True)
+            for scope_id, row in descriptors.items()
         )
 
     async def creation(self, connection: AsyncConnection, idempotency_key: str, /) -> tuple[str, str] | None:

@@ -20,12 +20,14 @@ Memory 保存持久的决策、约束和事实。每条新记忆使用独立的 
 各宿主工具名称不同，见[接入 Agent](../integrations/index.md)。完整请求结构和并发要求见 [HTTP API](../develop/http-api.md)。
 
 FTS 的候选检索和准入使用相同的查询词。查询归一化会排除较长查询中的常见英语虚词，并识别问题前后独立的执行指令，
-例如“Use only supplied context”和“Do not call tools, read files, inspect old sessions, or delegate”。
+例如“Use only supplied context”、“Do not call tools, read files, inspect old sessions, or delegate”，以及
+“Answer briefly and cite the artifact reference from the provided context. If no reliable context is present, say so.”。
 这些指令不能为无关事实提供匹配依据。显式加引号的词始终参与检索，包括 `"AND" "OR" precedence` 中作为标识符的虚词。
 包含领域信息的指令和未识别的措辞仍参与检索；这是一项保守的词项规则，
 并非通用意图分类器。默认准入要求匹配剩余全部不同查询词的 25%，至少两个；只有一两个词的查询要求匹配一个词。
 直接搜索和上下文准备使用相同规则，可选的 recall gate 放宽门槛时也如此。存储文本和向量查询保持不变，
 词语重合本身不能证明语义相关。
+如果整个查询只有执行指令，仍保留其查询词，以便搜索这条策略本身。
 
 ## 自动上下文与提取
 

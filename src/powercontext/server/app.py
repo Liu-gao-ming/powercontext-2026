@@ -22,11 +22,11 @@ import binascii
 import ipaddress
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import UTC, datetime
-from functools import wraps
+from functools import partial, wraps
 from hashlib import sha256
 from time import perf_counter
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypeVar, cast
@@ -47,8 +47,8 @@ from starlette.routing import Match
 from starlette.types import Lifespan, Scope
 from typing_extensions import override
 
-from powercontext._logging import log_safely
-from powercontext.artifacts import ArtifactAddress, ArtifactRef
+from powercontext._logging import error_category, log_safely
+from powercontext.artifacts import ArtifactAddress, ArtifactRef, StableHandle
 from powercontext.artifacts.search import (
     ArtifactSearchExecutionContext,
     ArtifactSearchFamilyNotFound,
@@ -131,6 +131,18 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemoryCurrentItem,
     TopicMemorySearchResult,
 )
+from powercontext.builtin.artifacts.topic_memory.processing import (
+    TopicMemoryBlockConflictError,
+    TopicMemoryBlockNotFoundError,
+)
+from powercontext.builtin.artifacts.topic_memory.processing import (
+    TopicMemoryProcessingStatus as RuntimeTopicMemoryProcessingStatus,
+)
+from powercontext.builtin.artifacts.topic_memory.processing import (
+    TopicMemoryRetryResult as RuntimeTopicMemoryRetryResult,
+)
+from powercontext.builtin.artifacts.topic_memory.processing import TopicMemoryWorkBlock as RuntimeTopicMemoryWorkBlock
+from powercontext.builtin.catalog_changes.models import CatalogChangeCandidate as RuntimeTagCandidate
 from powercontext.builtin.code.application import CodeApplication
 from powercontext.builtin.code.errors import CodeError
 from powercontext.builtin.code.models import CodeQueryRequest as RuntimeCodeQueryRequest
@@ -171,6 +183,7 @@ from powercontext.builtin.publication import (
 )
 from powercontext.builtin.records import (
     ArtifactAlreadyExistsError,
+    ArtifactRevisionActor,
     ArtifactRevisionPreconditionError,
     BaseAccessError,
     BaseOperationNotSupportedError,
@@ -179,7 +192,6 @@ from powercontext.builtin.records import (
     CursorExpiredError,
     InvalidBaseAccessRequestError,
     InvalidCursorError,
-    LogicalArtifactRecord,
 )
 from powercontext.builtin.records import (
     ArtifactCollectionItem as RuntimeArtifactCollectionItem,
@@ -205,7 +217,6 @@ from powercontext.builtin.records import (
 from powercontext.builtin.records import (
     SourceRecordPage as RuntimeSourceRecordPage,
 )
-from powercontext.builtin.review import ArtifactCandidate as RuntimeArtifactCandidate
 from powercontext.builtin.review import (
     ArtifactTargetConflictError,
     CandidateConflictError,
@@ -217,6 +228,7 @@ from powercontext.builtin.review.generation import (
     GeneratedCandidateResult as RuntimeGeneratedCandidateResult,
 )
 from powercontext.builtin.review.generation import GenerationCapabilityUnavailableError
+from powercontext.builtin.review.models import Candidate as RuntimeCandidate
 from powercontext.builtin.runtime import (
     ActivateHandoff,
     CaptureSource,
@@ -238,7 +250,13 @@ from powercontext.builtin.runtime import (
     TopicMemoryProcessingUnavailableError,
 )
 from powercontext.builtin.runtime import (
-    ApproveArtifactCandidateRequest as RuntimeApproveArtifactCandidateRequest,
+    ApproveCandidateRequest as RuntimeApproveCandidateRequest,
+)
+from powercontext.builtin.runtime import BootstrapContext as RuntimeBootstrapContext
+from powercontext.builtin.runtime import BootstrapContextRequest as RuntimeBootstrapContextRequest
+from powercontext.builtin.runtime import BootstrapDeliveryReceipt as RuntimeBootstrapDeliveryReceipt
+from powercontext.builtin.runtime import (
+    CaptureWorkingNote as RuntimeCaptureWorkingNote,
 )
 from powercontext.builtin.runtime import (
     CommitConnectorCheckpoint as RuntimeCommitConnectorCheckpoint,
@@ -253,7 +271,7 @@ from powercontext.builtin.runtime import (
     GenerateSkillRequest as RuntimeGenerateSkillRequest,
 )
 from powercontext.builtin.runtime import (
-    GetArtifactCandidateRequest as RuntimeGetArtifactCandidateRequest,
+    GetCandidateRequest as RuntimeGetCandidateRequest,
 )
 from powercontext.builtin.runtime import (
     GetExperienceRequest as RuntimeGetExperienceRequest,
@@ -264,7 +282,7 @@ from powercontext.builtin.runtime import (
     ImportExternalSkillRequest as RuntimeImportExternalSkillRequest,
 )
 from powercontext.builtin.runtime import (
-    ListArtifactCandidatesRequest as RuntimeListArtifactCandidatesRequest,
+    ListCandidatesRequest as RuntimeListCandidatesRequest,
 )
 from powercontext.builtin.runtime import ListExternalSkillsRequest as RuntimeListExternalSkillsRequest
 from powercontext.builtin.runtime import (
@@ -277,12 +295,13 @@ from powercontext.builtin.runtime import (
     ProposeExperienceRequest as RuntimeProposeExperienceRequest,
 )
 from powercontext.builtin.runtime import ProposeSkillRequest as RuntimeProposeSkillRequest
+from powercontext.builtin.runtime import RecordBootstrapDeliveryRequest as RuntimeRecordBootstrapDeliveryRequest
 from powercontext.builtin.runtime import (
-    RejectArtifactCandidateRequest as RuntimeRejectArtifactCandidateRequest,
+    RejectCandidateRequest as RuntimeRejectCandidateRequest,
 )
 from powercontext.builtin.runtime import ResolveExternalSkillRequest as RuntimeResolveExternalSkillRequest
 from powercontext.builtin.runtime import (
-    ReviseArtifactCandidateRequest as RuntimeReviseArtifactCandidateRequest,
+    ReviseCandidateRequest as RuntimeReviseCandidateRequest,
 )
 from powercontext.builtin.runtime import SearchTopicMemoryRequest as RuntimeSearchTopicMemoryRequest
 from powercontext.builtin.runtime import (
@@ -390,22 +409,30 @@ from powercontext.http import (
     AccessRolePage,
     AcknowledgeHandoffRequest,
     ActivateHandoffRequest,
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     ArtifactAccessResource,
-    ArtifactCandidate,
-    ArtifactCandidatePage,
     ArtifactCollectionItem,
     ArtifactCreated,
     ArtifactFamilyAccessCapability,
+    ArtifactHandleBinding,
     ArtifactPage,
     ArtifactReadFamily,
+    ArtifactReference,
     ArtifactRevision,
     ArtifactRevisionPage,
     BaseArtifactFamily,
+    BindArtifactHandleRequest,
+    BootstrapContext,
+    BootstrapContextRequest,
+    BootstrapDeliveryReceipt,
+    Candidate,
+    CandidateHistory,
+    CandidatePage,
     CandidatePermissions,
     Capabilities,
     CaptureContentSourceRequest,
     CaptureContentSourceResponse,
+    CaptureWorkingNoteRequest,
     ClearScopeBindingRequest,
     ClearScopeBindingResponse,
     CodeQueryRequest,
@@ -444,7 +471,7 @@ from powercontext.http import (
     GenerateExperienceRequest,
     GeneratePromptDemonstrationsRequest,
     GenerateSkillRequest,
-    GetArtifactCandidateRequest,
+    GetCandidateRequest,
     GetConnectorCheckpointRequest,
     GetExperienceRequest,
     GetHandoffReportRequest,
@@ -465,9 +492,9 @@ from powercontext.http import (
     ListAccessBindingsRequest,
     ListAccessResourcesRequest,
     ListAccessRolesRequest,
-    ListArtifactCandidatesRequest,
     ListArtifactRevisionsRequest,
     ListArtifactsRequest,
+    ListCandidatesRequest,
     ListDreamRunsRequest,
     ListExternalSkillsRequest,
     ListExternalSkillsResponse,
@@ -503,11 +530,12 @@ from powercontext.http import (
     ReadinessStatus,
     ReconcileRemoteSkillsRequest,
     ReconcileRemoteSkillsResponse,
+    RecordBootstrapDeliveryRequest,
     RecordRemoteSkillReceiptRequest,
     RecordSkillUsageRequest,
     RecordTaskOutcomeRequest,
     RegisterSourceDefinitionRequest,
-    RejectArtifactCandidateRequest,
+    RejectCandidateRequest,
     RememberMemoryRequest,
     RemoteSkillAction,
     RemoteSkillPublication,
@@ -523,7 +551,7 @@ from powercontext.http import (
     ResolveScopeBindingRequest,
     ResolveScopeSelectionRequest,
     RetireMemoryEntryRequest,
-    ReviseArtifactCandidateRequest,
+    ReviseCandidateRequest,
     ReviseMemoryEntryRequest,
     RevokeAccessBindingRequest,
     RevokeRemoteSkillTargetRequest,
@@ -630,11 +658,17 @@ from powercontext.http._generated.models import (
 from powercontext.http._generated.models import (
     ArtifactTagPage,
     ArtifactTagSet,
+    GetTopicMemoryProcessingBlockRequest,
     QueryArtifactTagsRequest,
     ReplaceArtifactTagsRequest,
+    RetryTopicMemoryProcessingRequest,
+    RetryTopicMemoryProcessingResponse,
     TaggableArtifactFamily,
     TagMatch,
     TagTargetType,
+    TopicMemoryProcessingBlock,
+    TopicMemoryProcessingStatus,
+    TopicMemoryProcessingStatusRequest,
 )
 from powercontext.http._generated.models import (
     ShareUnit as TransportShareUnit,
@@ -646,8 +680,10 @@ from powercontext.http._generated.operations import (
     API_DESCRIPTION,
     API_TITLE,
     API_VERSION,
-    APPROVE_ARTIFACT_CANDIDATE,
+    APPROVE_CANDIDATE,
+    BIND_ARTIFACT_HANDLE,
     CAPTURE_CONTENT_SOURCE,
+    CAPTURE_WORKING_NOTE,
     CHECK_ACCESS,
     CLEAR_SCOPE_BINDING,
     COMMIT_CONNECTOR_CHECKPOINT,
@@ -673,9 +709,10 @@ from powercontext.http._generated.operations import (
     GENERATE_SKILL,
     GET_ACCESS_PRINCIPAL,
     GET_ARTIFACT,
-    GET_ARTIFACT_CANDIDATE,
     GET_ARTIFACT_REVISION,
     GET_ARTIFACT_TAGS,
+    GET_CANDIDATE,
+    GET_CANDIDATE_HISTORY,
     GET_CAPABILITIES,
     GET_CONNECTOR_CHECKPOINT,
     GET_DEFAULT_SCOPE,
@@ -696,15 +733,17 @@ from powercontext.http._generated.operations import (
     GET_SOURCE,
     GET_STATS,
     GET_TOPIC_MEMORY,
+    GET_TOPIC_MEMORY_PROCESSING_BLOCK,
+    GET_TOPIC_MEMORY_PROCESSING_STATUS,
     HANDOFF_CURRENT_WORK,
     IMPORT_EXTERNAL_SKILL,
     LIST_ACCESS_AUDIT,
     LIST_ACCESS_BINDINGS,
     LIST_ACCESS_RESOURCES,
     LIST_ACCESS_ROLES,
-    LIST_ARTIFACT_CANDIDATES,
     LIST_ARTIFACT_REVISIONS,
     LIST_ARTIFACTS,
+    LIST_CANDIDATES,
     LIST_DREAM_RUNS,
     LIST_EXTERNAL_SKILLS,
     LIST_MANAGED_SKILLS,
@@ -714,6 +753,7 @@ from powercontext.http._generated.operations import (
     LIST_SCOPES,
     LIST_SOURCES,
     OPENAPI_VERSION,
+    PREPARE_BOOTSTRAP_CONTEXT,
     PREPARE_CONTEXT,
     PREPARE_HANDOFF,
     PREPARE_HANDOFF_HINT,
@@ -726,22 +766,25 @@ from powercontext.http._generated.operations import (
     QUERY_ARTIFACT_TAGS,
     QUERY_CODE,
     RECONCILE_REMOTE_SKILLS,
+    RECORD_BOOTSTRAP_DELIVERY,
     RECORD_REMOTE_SKILL_RECEIPT,
     RECORD_SKILL_USAGE,
     RECORD_TASK_OUTCOME,
     REGISTER_SOURCE_DEFINITION,
-    REJECT_ARTIFACT_CANDIDATE,
+    REJECT_CANDIDATE,
     REMEMBER_MEMORY,
     RENAME_REMOTE_SKILL_TARGET,
     REPLACE_ACCESS_BINDING,
     REPLACE_ARTIFACT,
     REPLACE_ARTIFACT_TAGS,
     REPLACE_MEMORY_ENTRY_TAGS,
+    RESOLVE_ARTIFACT_HANDLE,
     RESOLVE_EXTERNAL_SKILL,
     RESOLVE_SCOPE_BINDING,
     RESOLVE_SCOPE_SELECTION,
     RETIRE_MEMORY_ENTRY,
-    REVISE_ARTIFACT_CANDIDATE,
+    RETRY_TOPIC_MEMORY_PROCESSING,
+    REVISE_CANDIDATE,
     REVISE_MEMORY_ENTRY,
     REVOKE_ACCESS_BINDING,
     REVOKE_REMOTE_SKILL_TARGET,
@@ -799,7 +842,14 @@ from powercontext.server.authz.models import (
     ROLE_SUBJECT_TYPES,
     HandoffReceiptIdentity,
 )
+from powercontext.server.authz.owner_recovery import (
+    flush_owner_writes,
+    owner_recovery_available,
+    owner_recovery_session,
+    owner_write_access,
+)
 from powercontext.server.authz.profiles import ARTIFACT_FAMILY_PROFILES, artifact_family_profile
+from powercontext.server.authz.service import _require_allowed
 from powercontext.server.context import (
     bind_request_id,
     current_authentication,
@@ -809,6 +859,12 @@ from powercontext.server.context import (
     reset_request_id,
 )
 from powercontext.server.dream_access import DreamAccess, principal_identity
+from powercontext.server.dream_compatibility import (
+    LEGACY_DREAM_OPERATIONS,
+    negotiate_dream_contract,
+    require_extended_dream,
+)
+from powercontext.server.request_id import REQUEST_ID_HEADER
 from powercontext.server.tracing import request_id_from_span
 from powercontext.sources import ConnectorBinding as RuntimeConnectorBinding
 from powercontext.sources import SourceDefinitionManifest as RuntimeSourceDefinitionManifest
@@ -818,7 +874,6 @@ if TYPE_CHECKING:
     from powercontext.server.tracing import ServerTracing
 
 _SCALAR_JS_URL = "https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.66.1"
-REQUEST_ID_HEADER = "X-PowerContext-Request-ID"
 REPORT_SELECTION_DIGEST_HEADER = "X-PowerContext-Selection-Digest"
 REPORT_DIGEST_HEADER = "X-PowerContext-Report-Digest"
 MAX_HANDOFF_REPORT_BYTES = 10 * 1024 * 1024
@@ -833,6 +888,8 @@ _ScopePathId = Annotated[str, PathParameter(min_length=1, max_length=256, patter
 
 class _ScopedSourceApplication(Protocol):
     async def capture(self, value: CaptureSource, /) -> SourceReceipt: ...
+
+    async def capture_working_note(self, value: RuntimeCaptureWorkingNote, /) -> SourceReceipt: ...
 
 
 class _SourceApplication(Protocol):
@@ -876,7 +933,13 @@ class _ScopedRecordApplication(Protocol):
         /,
     ) -> RuntimeArtifactCreated: ...
 
-    async def get_artifact(self, family: str, artifact_id: str, /) -> RuntimeArtifactRecord: ...
+    async def bind_artifact_handle(self, handle: StableHandle, target: ArtifactRef, /) -> ArtifactRef: ...
+
+    async def resolve_artifact_handle(self, handle: StableHandle, /) -> ArtifactRef: ...
+
+    async def get_artifact(
+        self, family: str, artifact_id: str, /, *, execution_context: Any = None
+    ) -> RuntimeArtifactRecord: ...
 
     async def get_artifact_revision(
         self,
@@ -884,9 +947,10 @@ class _ScopedRecordApplication(Protocol):
         artifact_id: str,
         revision: int,
         /,
+        *,
+        execution_context: Any = None,
     ) -> RuntimeArtifactRecord: ...
 
-    async def logical_artifacts(self) -> tuple[LogicalArtifactRecord, ...]: ...
     async def query_artifacts(
         self,
         family: str,
@@ -904,6 +968,9 @@ class _ScopedRecordApplication(Protocol):
         expected_etag: str,
         write: RuntimeArtifactWrite,
         /,
+        *,
+        actor_type: str | None = None,
+        actor_id: str | None = None,
     ) -> RuntimeArtifactRecord: ...
 
 
@@ -934,6 +1001,26 @@ class _ScopedContextApplication(Protocol):
 
 class _ContextApplication(Protocol):
     def for_scope(self, scope_id: str, /) -> _ScopedContextApplication: ...
+
+
+class _ScopedBootstrapApplication(Protocol):
+    async def prepare(
+        self,
+        request: RuntimeBootstrapContextRequest,
+        /,
+        *,
+        authorize_scopes: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
+    ) -> RuntimeBootstrapContext: ...
+
+    async def record_delivery(
+        self,
+        request: RuntimeRecordBootstrapDeliveryRequest,
+        /,
+    ) -> RuntimeBootstrapDeliveryReceipt: ...
+
+
+class _BootstrapApplication(Protocol):
+    def for_scope(self, scope_id: str, /) -> _ScopedBootstrapApplication: ...
 
 
 class _ScopedExperienceApplication(Protocol):
@@ -1103,15 +1190,17 @@ class _ExternalSkillApplication(Protocol):
 
 
 class _ScopedReviewApplication(Protocol):
-    async def list(self, request: RuntimeListArtifactCandidatesRequest, /) -> ReviewedCandidatePage: ...
+    async def history(self, request: RuntimeGetCandidateRequest, /) -> tuple[ReviewedCandidate, ...]: ...
 
-    async def get(self, request: RuntimeGetArtifactCandidateRequest, /) -> ReviewedCandidate: ...
+    async def list(self, request: RuntimeListCandidatesRequest, /) -> ReviewedCandidatePage: ...
 
-    async def approve(self, request: RuntimeApproveArtifactCandidateRequest, /) -> ReviewedCandidate: ...
+    async def get(self, request: RuntimeGetCandidateRequest, /) -> ReviewedCandidate: ...
 
-    async def reject(self, request: RuntimeRejectArtifactCandidateRequest, /) -> ReviewedCandidate: ...
+    async def approve(self, request: RuntimeApproveCandidateRequest, /) -> ReviewedCandidate: ...
 
-    async def revise(self, request: RuntimeReviseArtifactCandidateRequest, /) -> ReviewedCandidate: ...
+    async def reject(self, request: RuntimeRejectCandidateRequest, /) -> ReviewedCandidate: ...
+
+    async def revise(self, request: RuntimeReviseCandidateRequest, /) -> ReviewedCandidate: ...
 
 
 class _ReviewApplication(Protocol):
@@ -1167,6 +1256,12 @@ class _WorkApplication(Protocol):
 
 
 class _ScopedTopicMemoryApplication(Protocol):
+    async def processing_status(self) -> RuntimeTopicMemoryProcessingStatus: ...
+
+    async def get_block(self, block_id: str) -> RuntimeTopicMemoryWorkBlock: ...
+
+    async def retry(self, block_id: str) -> RuntimeTopicMemoryRetryResult: ...
+
     async def search(
         self,
         request: RuntimeSearchTopicMemoryRequest,
@@ -1212,6 +1307,7 @@ class ServerApplication(Protocol):
     profiles: Any
     subject_sources: Any
 
+    catalog_changes: Any
     dream: DreamApplication
     scopes: ScopeApplication | None
     publications: ArtifactPublicationApplication | None
@@ -1220,6 +1316,7 @@ class ServerApplication(Protocol):
     ingestion: _RemoteIngestionApplication
     code: CodeApplication
     context: _ContextApplication
+    bootstrap: _BootstrapApplication
     experience: _ExperienceApplication
     external_skills: _ExternalSkillApplication
     handoff: _HandoffApplication
@@ -1243,6 +1340,7 @@ class _PreconditionRequiredError(RuntimeError):
 def create_app(
     *,
     application: ServerApplication | None = None,
+    infrastructure_only: bool = False,
     capability_provider: CapabilityProvider | None = None,
     readiness_probe: ReadinessProbe | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
@@ -1261,6 +1359,7 @@ def create_app(
         title=API_TITLE,
         version=API_VERSION,
         description=API_DESCRIPTION,
+        openapi_url=None if infrastructure_only else "/openapi.json",
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
@@ -1272,6 +1371,7 @@ def create_app(
     app.state.readiness_probe = readiness_probe
     app.state.access_control = access_control
     app.state.authentication_provider = authentication_provider
+    app.state.owner_recovery = None
     app.state.access_mode = (
         ("disabled" if access_control is None else access_control.mode) if access_mode is None else access_mode
     )
@@ -1292,9 +1392,11 @@ def create_app(
     )
     app.state.server_info = None
 
+    app.middleware("http")(negotiate_dream_contract)
+
     @app.middleware("http")
     async def attach_request_id(request: Request, call_next: RequestResponseEndpoint) -> Response:
-        request_id = request_id_from_span()
+        request_id = current_request_id() or request_id_from_span()
         request.state.request_id = request_id
         token = bind_request_id(request_id)
         try:
@@ -1351,6 +1453,10 @@ def create_app(
         response.headers[REQUEST_ID_HEADER] = request_id
         return response
 
+    if infrastructure_only:
+        _add_route(app, GET_LIVENESS, get_liveness)
+        return app
+
     _add_route(app, CREATE_DREAM_RUN, create_dream_run)
     _add_route(app, GET_DREAM_RUN, get_dream_run)
     _add_route(app, LIST_DREAM_RUNS, list_dream_runs)
@@ -1389,6 +1495,8 @@ def create_app(
     _add_route(app, FLUSH_PROFILE, flush_profile)
     _add_route(app, GET_SOURCE, get_source)
     _add_route(app, CREATE_ARTIFACT, create_artifact)
+    _add_route(app, BIND_ARTIFACT_HANDLE, bind_artifact_handle)
+    _add_route(app, RESOLVE_ARTIFACT_HANDLE, resolve_artifact_handle)
     _add_route(app, GET_MEMORY_ENTRY_TAGS, get_memory_entry_tags)
     _add_route(app, REPLACE_MEMORY_ENTRY_TAGS, replace_memory_entry_tags)
     _add_route(app, GET_ARTIFACT_TAGS, get_artifact_tags)
@@ -1402,6 +1510,7 @@ def create_app(
     _add_route(app, GET_PROMPT_CONFIGURATION, get_prompt_configuration)
     _add_route(app, REPLACE_ARTIFACT, replace_artifact)
     _add_route(app, CAPTURE_CONTENT_SOURCE, capture_content_source)
+    _add_route(app, CAPTURE_WORKING_NOTE, capture_working_note)
     add_atomic_memory_routes(
         app,
         application_dependency=_require_application,
@@ -1409,6 +1518,9 @@ def create_app(
         execution_context=_atomic_execution_context,
     )
     _add_route(app, FLUSH_TOPIC_MEMORY, flush_topic_memory)
+    _add_route(app, GET_TOPIC_MEMORY_PROCESSING_STATUS, get_topic_memory_processing_status)
+    _add_route(app, GET_TOPIC_MEMORY_PROCESSING_BLOCK, get_topic_memory_processing_block)
+    _add_route(app, RETRY_TOPIC_MEMORY_PROCESSING, retry_topic_memory_processing)
     _add_route(app, SEARCH_TOPIC_MEMORY, search_topic_memory)
     _add_route(app, SEARCH_ARTIFACTS, search_artifacts)
     _add_route(app, GET_TOPIC_MEMORY, get_topic_memory)
@@ -1419,7 +1531,12 @@ def create_app(
     _add_route(app, FLUSH_MEMORY, flush_memory)
     _add_route(app, REMEMBER_MEMORY, remember_memory)
     _add_route(app, SEARCH_MEMORY, search_memory)
-    _add_route(app, PREPARE_CONTEXT, prepare_context)
+    _add_route(app, PREPARE_BOOTSTRAP_CONTEXT, prepare_bootstrap_context)
+    _add_route(app, RECORD_BOOTSTRAP_DELIVERY, record_bootstrap_delivery)
+    # This response publishes exactly the fields it built: ``reason`` exists only when the request asked
+    # with ``explain``, and serializing the model's defaults would add a null that every Host's
+    # four-field validator rejects on an ordinary injection.
+    _add_route(app, PREPARE_CONTEXT, prepare_context, response_model_exclude_unset=True)
     _add_route(app, QUERY_CODE, query_code)
     _add_route(app, CREATE_WORK_CONTRACT, create_work_contract)
     _add_route(app, HANDOFF_CURRENT_WORK, handoff_current_work)
@@ -1430,7 +1547,8 @@ def create_app(
     _add_route(app, FINALIZE_HANDOFF, finalize_handoff)
     _add_route(app, COMMIT_HANDOFF, commit_handoff)
     _add_route(app, CONTINUE_HANDOFF, continue_handoff)
-    _add_route(app, PREPARE_HANDOFF_HINT, prepare_handoff_hint)
+    # A hint carries no retrieval, so ``reason`` stays unset and the envelope keeps its four fields.
+    _add_route(app, PREPARE_HANDOFF_HINT, prepare_handoff_hint, response_model_exclude_unset=True)
     _add_route(app, LIST_MEMORY_ENTRIES, list_memory_entries)
     _add_route(app, GET_MEMORY_CAPACITY, get_memory_capacity)
     _add_route(app, GET_MEMORY_ENTRY, get_memory_entry)
@@ -1463,11 +1581,12 @@ def create_app(
     _add_route(app, LIST_EXTERNAL_SKILLS, list_external_skills)
     _add_route(app, RESOLVE_EXTERNAL_SKILL, resolve_external_skill)
     _add_route(app, IMPORT_EXTERNAL_SKILL, import_external_skill)
-    _add_route(app, LIST_ARTIFACT_CANDIDATES, list_artifact_candidates)
-    _add_route(app, GET_ARTIFACT_CANDIDATE, get_artifact_candidate)
-    _add_route(app, APPROVE_ARTIFACT_CANDIDATE, approve_artifact_candidate)
-    _add_route(app, REJECT_ARTIFACT_CANDIDATE, reject_artifact_candidate)
-    _add_route(app, REVISE_ARTIFACT_CANDIDATE, revise_artifact_candidate)
+    _add_route(app, LIST_CANDIDATES, list_candidates)
+    _add_route(app, GET_CANDIDATE, get_candidate)
+    _add_route(app, GET_CANDIDATE_HISTORY, get_candidate_history)
+    _add_route(app, APPROVE_CANDIDATE, approve_candidate)
+    _add_route(app, REJECT_CANDIDATE, reject_candidate)
+    _add_route(app, REVISE_CANDIDATE, revise_candidate)
     app.add_api_route(
         "/docs",
         scalar_api_reference,
@@ -1526,14 +1645,20 @@ async def get_readiness(request: Request) -> JSONResponse:
 
 
 async def _access_readiness_checks(request: Request) -> dict[str, str]:
-    mode: str = request.app.state.access_mode
-    access: AccessControlService | None = request.app.state.access_control
+    return await access_readiness_checks(request.app.state)
+
+
+async def access_readiness_checks(state: Any) -> dict[str, str]:
+    """Access and authentication readiness installed on Server application state."""
+
+    mode: str = state.access_mode
+    access: AccessControlService | None = state.access_control
     provider = (
         ("ready" if await access.readiness() else "not_ready")
         if access is not None
         else ("not_ready" if mode == "enforced" else "disabled")
     )
-    authentication: AuthenticationProvider | None = request.app.state.authentication_provider
+    authentication: AuthenticationProvider | None = state.authentication_provider
     if mode == "disabled":
         authentication_status = "disabled"
     elif authentication is None:
@@ -1981,6 +2106,7 @@ async def list_scopes(
 async def create_scope(
     request: CreateScopeRequest,
     scopes: Annotated[ScopeApplication, Depends(_require_scope_application)],
+    http_request: Request,
 ) -> ScopeDescriptor:
     created = await scopes.create(
         ScopeDraft(
@@ -1995,6 +2121,11 @@ async def create_scope(
             idempotency_key=request.idempotency_key,
         )
     )
+    access = access_control_for_mode(http_request.app.state.access_control, mode=http_request.app.state.access_mode)
+    if access is not None:
+        await access.bootstrap_static_scope(
+            current_principal(), created.scope_id, context=_access_audit_context(CREATE_SCOPE.operation_id)
+        )
     return _scope_descriptor_response(created)
 
 
@@ -2086,6 +2217,29 @@ async def publish_artifact(
     publications: Annotated[ArtifactPublicationApplication, Depends(_require_publication_application)],
     http_request: Request,
 ) -> TransportArtifactPublication:
+    access = _transactional_owner_access(http_request)
+    principal = _require_principal() if access is not None else None
+    context = _access_audit_context(PUBLISH_ARTIFACT.operation_id)
+    owner_committed = False
+
+    async def on_commit(connection, publication):
+        nonlocal owner_committed
+        if access is None:
+            return
+        if principal is None:
+            raise AccessIdentityRequiredError
+        target = publication.target
+        if target.artifact.family != "topic-memory":
+            await owner_write_access(access, connection).establish_artifact_owner(
+                ResourceRef.artifact(
+                    target.scope_id, family=target.artifact.family, artifact_id=target.artifact.artifact_id
+                ),
+                principal,
+                idempotency_key=f"artifact-publication-owner:{target.artifact.artifact_id}",
+                context=context,
+            )
+            owner_committed = True
+
     result = await publications.publish(
         DomainArtifactPublicationRequest(
             source=ArtifactAddress(
@@ -2094,9 +2248,11 @@ async def publish_artifact(
             ),
             target_scope_id=request.target_scope_id,
             idempotency_key=request.idempotency_key,
-        )
+        ),
+        **({"on_commit": on_commit} if access is not None else {}),
     )
-    if result.target.artifact.family != "topic-memory":
+    await flush_owner_writes()
+    if access is None and result.target.artifact.family != "topic-memory":
         await _establish_created_owner(
             http_request,
             ResourceRef.artifact(
@@ -2107,6 +2263,16 @@ async def publish_artifact(
             idempotency_key=f"artifact-publication-owner:{result.target.artifact.artifact_id}",
             operation=PUBLISH_ARTIFACT.operation_id,
         )
+    elif access is not None and not owner_committed and result.target.artifact.family != "topic-memory":
+        target = result.target
+        resource = ResourceRef.artifact(
+            target.scope_id,
+            family=target.artifact.family,
+            artifact_id=target.artifact.artifact_id,
+        )
+        await flush_owner_writes(artifact=resource)
+        if await access.artifact_owner(resource) is None:
+            raise AccessUnavailableError("artifact_owner_pending")
     return TransportArtifactPublication.model_validate(result.model_dump(mode="json"))
 
 
@@ -2117,7 +2283,6 @@ async def get_stats(
     http_request: Request,
 ) -> ScopedStats:
     response.headers["Cache-Control"] = "no-store"
-    await _require_selection_content_ready(http_request, request.selection)
     result = await application.statistics.overview(
         _domain_scope_selection(request.selection), period=RuntimeStatisticsPeriod(request.period.value)
     )
@@ -2130,7 +2295,6 @@ async def get_handoff_report(
     report: Annotated[HandoffReportApplication, Depends(_require_handoff_report_application)],
     http_request: Request,
 ) -> HandoffReportResponse | Response:
-    await _require_selection_content_ready(http_request, request.selection)
     result = await report.get_report(_domain_scope_selection(request.selection))
     selection_digest = cast(str, result.selection_digest)
     report_digest = cast(str, result.report_digest)
@@ -2254,14 +2418,17 @@ async def create_subject_source(
             )
         if new_scope:
             await access.bootstrap_subject_scope(connection, principal, target, context=context)
-        elif access.uses_static_preset(principal):
+        if access.uses_static_preset(principal):
             # The subject Scope is resolved inside the atomic dual-write transaction,
             # so materialize the fixed static preset through the same connection.
             bound = access.with_connection(connection)
             await bound.bootstrap_static_scope(principal, target, context=context)
             # Bootstrap is idempotent and must not bypass a previously revoked grant.
-            await bound.require(principal, AccessAction.SCOPE_CONTRIBUTE, ResourceRef.scope(target), context=context)
-        else:
+            if not new_scope:
+                await bound.require(
+                    principal, AccessAction.SCOPE_CONTRIBUTE, ResourceRef.scope(target), context=context
+                )
+        elif not new_scope:
             await access.require(principal, AccessAction.SCOPE_CONTRIBUTE, ResourceRef.scope(target), context=context)
 
     target, sources = await application.subject_sources.create(
@@ -2326,8 +2493,10 @@ async def flush_profile(
     async def on_commit(connection, artifact, candidate):
         if access is None:
             return
-        bound = access.with_connection(connection)
-        if artifact is not None and await bound.artifact_owner(resource) is None:
+        if principal is None:
+            raise AccessIdentityRequiredError
+        bound = owner_write_access(access, connection)
+        if artifact is not None and await access.for_read(connection).artifact_owner(resource) is None:
             await bound.establish_artifact_owner(
                 resource,
                 principal,
@@ -2347,13 +2516,17 @@ async def flush_profile(
     result = await application.profiles.flush(
         request.scope_id, authorize_snapshot=authorize_snapshot, on_commit=on_commit
     )
+    await flush_owner_writes(
+        artifact=resource,
+        candidate=None if result.candidate_id is None else (request.scope_id, result.candidate_id),
+    )
     return FlushProfileResponse.model_validate(result.model_dump(mode="json"))
 
 
 async def get_source(
     scope_id: Annotated[str, Path(min_length=1, max_length=256, pattern=r".*\S.*")],
     source_type: Annotated[Literal["content"], Path()],
-    source_id: Annotated[str, Path(min_length=1, max_length=256, pattern=r"^[\x21-\x7E]+$")],
+    source_id: Annotated[str, Path(min_length=1, max_length=256, pattern=r".*\S.*")],
     http_request: Request,
     application: Annotated[ServerApplication, Depends(_require_application)],
 ) -> SourceRecord:
@@ -2386,6 +2559,7 @@ async def create_artifact(
             if request.root.family == "atomic-memory"
             else {}
         ),
+        **_artifact_owner_commit(http_request, scope_id, request.root.family),
     )
     await _establish_base_artifact_owners(
         http_request,
@@ -2397,12 +2571,63 @@ async def create_artifact(
     return _artifact_created_response(result)
 
 
+async def bind_artifact_handle(
+    scope_id: Annotated[str, Path(min_length=1, max_length=256, pattern=r".*\S.*")],
+    family: Annotated[str, Path(min_length=1, max_length=128, pattern=r"^[\x21-\x7E]+$")],
+    key: Annotated[str, Path(min_length=1, max_length=128, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")],
+    request: BindArtifactHandleRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+) -> ArtifactHandleBinding:
+    handle = StableHandle(family=family, key=key)
+    target = ArtifactRef(family=family, artifact_id=request.artifact_id, revision=request.revision)
+    result = await application.records.for_scope(scope_id).bind_artifact_handle(handle, target)
+    return _artifact_handle_binding(handle, result)
+
+
+async def resolve_artifact_handle(
+    scope_id: Annotated[str, Path(min_length=1, max_length=256, pattern=r".*\S.*")],
+    family: Annotated[str, Path(min_length=1, max_length=128, pattern=r"^[\x21-\x7E]+$")],
+    key: Annotated[str, Path(min_length=1, max_length=128, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")],
+    application: Annotated[ServerApplication, Depends(_require_application)],
+) -> ArtifactHandleBinding:
+    handle = StableHandle(family=family, key=key)
+    result = await application.records.for_scope(scope_id).resolve_artifact_handle(handle)
+    return _artifact_handle_binding(handle, result)
+
+
+def _artifact_handle_binding(handle: StableHandle, target: ArtifactRef) -> ArtifactHandleBinding:
+    return ArtifactHandleBinding(
+        family=handle.family,
+        key=handle.key,
+        artifact=ArtifactReference(
+            family=target.family,
+            artifact_id=target.artifact_id,
+            revision=target.revision,
+        ),
+    )
+
+
+def _require_strict_query(
+    http_request: Request,
+    parameter_names: set[str],
+    *,
+    repeatable: set[str] | None = None,
+) -> None:
+    if set(http_request.query_params) - parameter_names:
+        raise InvalidBaseAccessRequestError("query", "contains unknown parameters")
+    singleton_names = parameter_names - (repeatable or set())
+    if any(len(http_request.query_params.getlist(name)) > 1 for name in singleton_names):
+        raise InvalidBaseAccessRequestError("query", "parameters must be provided at most once")
+
+
 def _list_artifacts_query(
+    http_request: Request,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     cursor: Annotated[str | None, Query(min_length=1, max_length=4096)] = None,
     tag: Annotated[list[str] | None, Query(min_length=1, max_length=16)] = None,
     tag_match: Annotated[TagMatch | None, Query()] = None,
 ) -> ListArtifactsRequest:
+    _require_strict_query(http_request, {"limit", "cursor", "tag", "tag_match"}, repeatable={"tag"})
     if tag is None and tag_match is not None:
         raise InvalidBaseAccessRequestError("tag_match", "requires at least one tag")
     return ListArtifactsRequest.model_validate({"limit": limit, "cursor": cursor, "tag": tag, "tag_match": tag_match})
@@ -2433,6 +2658,30 @@ async def list_artifacts(
         items=[_artifact_collection_item_response(item) for item in result.items],
         next_cursor=result.next_cursor,
     )
+
+
+async def get_topic_memory_processing_status(
+    request: TopicMemoryProcessingStatusRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+) -> TopicMemoryProcessingStatus:
+    result = await application.topic_memory.for_scope(request.scope_id).processing_status()
+    return TopicMemoryProcessingStatus.model_validate(result.model_dump())
+
+
+async def get_topic_memory_processing_block(
+    request: GetTopicMemoryProcessingBlockRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+) -> TopicMemoryProcessingBlock:
+    result = await application.topic_memory.for_scope(request.scope_id).get_block(request.block_id)
+    return TopicMemoryProcessingBlock.model_validate(result.model_dump())
+
+
+async def retry_topic_memory_processing(
+    request: RetryTopicMemoryProcessingRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+) -> RetryTopicMemoryProcessingResponse:
+    result = await application.topic_memory.for_scope(request.scope_id).retry(request.block_id)
+    return RetryTopicMemoryProcessingResponse.model_validate(result.model_dump())
 
 
 async def flush_topic_memory(
@@ -2497,9 +2746,11 @@ async def get_topic_memory(
 
 
 def _list_artifact_revisions_query(
+    http_request: Request,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     cursor: Annotated[str | None, Query(min_length=1, max_length=4096)] = None,
 ) -> ListArtifactRevisionsRequest:
+    _require_strict_query(http_request, {"limit", "cursor"})
     return ListArtifactRevisionsRequest(limit=limit, cursor=cursor)
 
 
@@ -2668,6 +2919,7 @@ async def get_artifact(
     scope_id: Annotated[str, Path(min_length=1, max_length=256, pattern=r".*\S.*")],
     family: Annotated[ArtifactReadFamily, Path()],
     artifact_id: Annotated[str, Path(min_length=1, max_length=128, pattern=r"^[\x21-\x7E]+$")],
+    http_request: Request,
     response: Response,
     application: Annotated[ServerApplication, Depends(_require_application)],
     if_none_match: Annotated[
@@ -2675,7 +2927,15 @@ async def get_artifact(
         Header(alias="If-None-Match", min_length=1),
     ] = None,
 ) -> ArtifactRevision | Response:
-    result = await application.records.for_scope(scope_id).get_artifact(family.value, artifact_id)
+    result = await application.records.for_scope(scope_id).get_artifact(
+        family.value,
+        artifact_id,
+        **(
+            {"execution_context": _atomic_execution_context(http_request, GET_ARTIFACT.operation_id)}
+            if family.value == "atomic-memory"
+            else {}
+        ),
+    )
     etag = _artifact_etag(result.revision)
     if _if_none_match_matches(if_none_match, etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
@@ -2696,11 +2956,14 @@ async def replace_artifact(
     if family.value == "memory":
         raise BaseOperationNotSupportedError("artifact_family", "memory", "collection writes")
     expected_etag = _require_artifact_etag(if_match)
+    principal = current_principal()
     result = await application.records.for_scope(scope_id).replace_artifact(
         family.value,
         artifact_id,
         expected_etag,
         _artifact_write(request),
+        actor_type=None if principal is None else principal.type,
+        actor_id=None if principal is None else principal.id,
         **(
             {"execution_context": _atomic_execution_context(http_request, REPLACE_ARTIFACT.operation_id)}
             if family.value == "atomic-memory"
@@ -2722,12 +2985,18 @@ async def get_artifact_revision(
     family: Annotated[ArtifactReadFamily, Path()],
     artifact_id: Annotated[str, Path(min_length=1, max_length=128, pattern=r"^[\x21-\x7E]+$")],
     revision: Annotated[int, Path(ge=1)],
+    http_request: Request,
     application: Annotated[ServerApplication, Depends(_require_application)],
 ) -> ArtifactRevision:
     result = await application.records.for_scope(scope_id).get_artifact_revision(
         family.value,
         artifact_id,
         revision,
+        **(
+            {"execution_context": _atomic_execution_context(http_request, GET_ARTIFACT_REVISION.operation_id)}
+            if family.value == "atomic-memory"
+            else {}
+        ),
     )
     return _artifact_revision_response(result)
 
@@ -2743,6 +3012,12 @@ def _source_record_response(value: RuntimeSourceRecord) -> SourceRecord:
     )
 
 
+def _transport_actor(actor: ArtifactRevisionActor | None) -> TransportAccessPrincipal | None:
+    if actor is None:
+        return None
+    return TransportAccessPrincipal(type=actor.type, id=actor.id)
+
+
 def _artifact_revision_response(value: RuntimeArtifactRecord) -> ArtifactRevision:
     return ArtifactRevision(
         scope_id=value.scope_id,
@@ -2753,6 +3028,10 @@ def _artifact_revision_response(value: RuntimeArtifactRecord) -> ArtifactRevisio
         sources=[mapping.source_type_reference(ref) for ref in value.sources],
         artifacts=[mapping.artifact_reference(ref) for ref in value.artifacts],
         content_digest=value.content_digest,
+        created_at=value.created_at,
+        created_by=_transport_actor(value.created_by),
+        restored_from_revision=value.restored_from_revision,
+        reason=value.reason,
     )
 
 
@@ -2780,6 +3059,10 @@ def _artifact_collection_item_response(value: RuntimeArtifactCollectionItem) -> 
         summary=value.summary,
         published_at=value.published_at,
         source_count=value.source_count,
+        created_at=value.created_at,
+        created_by=_transport_actor(value.created_by),
+        restored_from_revision=value.restored_from_revision,
+        reason=value.reason,
     )
 
 
@@ -2789,6 +3072,8 @@ def _artifact_write(value: CreateArtifactRequest | ReplaceArtifactRequest) -> Ru
         content = mapping.runtime_handoff_content(content)
     return RuntimeArtifactWrite(
         prompt_key=value.root.prompt_key.value if isinstance(value.root, CreatePromptArtifactRequest) else None,
+        restored_from_revision=getattr(value.root, "restored_from_revision", None),
+        reason=getattr(value.root, "reason", None),
         content=cast(
             dict[str, JsonValue],
             content.model_dump(
@@ -2837,6 +3122,16 @@ async def capture_content_source(
 ) -> CaptureContentSourceResponse:
     _reject_reserved_handoff_receipt_content(request.content)
     result = await application.sources.for_scope(request.scope_id).capture(mapping.capture_request(request))
+    return mapping.capture_response(result)
+
+
+async def capture_working_note(
+    request: CaptureWorkingNoteRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+) -> CaptureContentSourceResponse:
+    result = await application.sources.for_scope(request.scope_id).capture_working_note(
+        mapping.working_note_capture_request(request)
+    )
     return mapping.capture_response(result)
 
 
@@ -2948,8 +3243,6 @@ async def prepare_context(
                 tuple((AccessAction.SCOPE_READ, ResourceRef.scope(scope_id)) for scope_id in scope_ids),
                 context=_access_audit_context(PREPARE_CONTEXT.operation_id),
             )
-            for scope_id in scope_ids[1:]:
-                await require_scope_content_ready(http_request, scope_id)
 
         result = await scoped.prepare(
             prepared_request,
@@ -2957,6 +3250,42 @@ async def prepare_context(
             atomic_context=_atomic_execution_context(http_request, PREPARE_CONTEXT.operation_id),
         )
     return mapping.prepared_context_response(result)
+
+
+async def prepare_bootstrap_context(
+    request: BootstrapContextRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+    http_request: Request,
+) -> BootstrapContext:
+    prepared_request = mapping.bootstrap_context_request(request)
+    scoped = application.bootstrap.for_scope(request.scope_id)
+    access = access_control_for_mode(
+        http_request.app.state.access_control,
+        mode=http_request.app.state.access_mode,
+    )
+    if access is None:
+        result = await scoped.prepare(prepared_request)
+    else:
+
+        async def authorize_scopes(scope_ids: tuple[str, ...]) -> None:
+            await access.require_all(
+                _require_principal(),
+                tuple((AccessAction.SCOPE_READ, ResourceRef.scope(scope_id)) for scope_id in scope_ids),
+                context=_access_audit_context(PREPARE_BOOTSTRAP_CONTEXT.operation_id),
+            )
+
+        result = await scoped.prepare(prepared_request, authorize_scopes=authorize_scopes)
+    return mapping.bootstrap_context_response(result)
+
+
+async def record_bootstrap_delivery(
+    request: RecordBootstrapDeliveryRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+) -> BootstrapDeliveryReceipt:
+    result = await application.bootstrap.for_scope(request.scope_id).record_delivery(
+        mapping.record_bootstrap_delivery_request(request)
+    )
+    return mapping.bootstrap_delivery_response(result)
 
 
 async def create_work_contract(
@@ -3077,10 +3406,32 @@ async def commit_handoff(
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
 ) -> CommittedHandoff:
+    access = _transactional_owner_access(http_request)
+    principal = _require_principal() if access is not None else None
+    context = _access_audit_context(COMMIT_HANDOFF.operation_id)
+    committed = False
+
+    async def on_commit(connection, artifact):
+        nonlocal committed
+        if access is None:
+            return
+        if principal is None:
+            raise AccessIdentityRequiredError
+        if artifact.revision == 1:
+            await owner_write_access(access, connection).establish_artifact_owner(
+                ResourceRef.artifact(request.scope_id, family="handoff", artifact_id=artifact.artifact_id),
+                principal,
+                idempotency_key=f"handoff-owner:{request.scope_id}:{artifact.artifact_id}",
+                context=context,
+            )
+        committed = True
+
     result = await application.handoff.for_scope(request.scope_id).commit(
-        mapping.runtime_prepared_handoff(request.handoff)
+        mapping.runtime_prepared_handoff(request.handoff),
+        **({"on_commit": on_commit} if access is not None else {}),
     )
-    if result.revision == 1:
+    await flush_owner_writes()
+    if access is None and result.revision == 1:
         await _establish_created_owner(
             http_request,
             ResourceRef.artifact(
@@ -3091,6 +3442,11 @@ async def commit_handoff(
             idempotency_key=f"handoff-owner:{request.scope_id}:{result.artifact_id}",
             operation=COMMIT_HANDOFF.operation_id,
         )
+    elif access is not None and not committed:
+        resource = ResourceRef.artifact(request.scope_id, family="handoff", artifact_id=result.artifact_id)
+        await flush_owner_writes(artifact=resource)
+        if await access.artifact_owner(resource) is None:
+            raise AccessUnavailableError("artifact_owner_pending")
     return mapping.committed_handoff_response(result)
 
 
@@ -3255,6 +3611,8 @@ async def create_dream_run(
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
 ) -> DreamRun:
+    if request.operation.value not in LEGACY_DREAM_OPERATIONS:
+        require_extended_dream(http_request)
     result = await application.dream.for_scope(scope_id, principal_id=_dream_principal(http_request)).create(
         RuntimeCreateDreamRunRequest.model_validate_json(request.model_dump_json(exclude_unset=True)),
     )
@@ -3275,11 +3633,13 @@ async def get_dream_run(
 
 
 def _list_dreams_query(
+    http_request: Request,
     status: str | None = None,
     operation: str | None = None,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> ListDreamRunsRequest:
+    _require_strict_query(http_request, {"status", "operation", "cursor", "limit"})
     return ListDreamRunsRequest.model_validate({
         "status": status,
         "operation": operation,
@@ -3304,9 +3664,10 @@ async def propose_experience(
     request: ProposeExperienceRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidate:
+) -> Candidate:
     result = await application.experience.for_scope(request.scope_id).propose(
-        mapping.propose_experience_request(request)
+        mapping.propose_experience_request(request),
+        **_candidate_owner_commit(http_request, request.scope_id),
     )
     await _attest_candidate_owner(
         http_request,
@@ -3324,7 +3685,8 @@ async def generate_experience(
     http_request: Request,
 ) -> GeneratedCandidateResponse:
     result = await application.experience.for_scope(request.scope_id).generate(
-        mapping.generate_experience_request(request)
+        mapping.generate_experience_request(request),
+        **_candidate_owner_commit(http_request, request.scope_id),
     )
     if result.candidate is not None:
         await _attest_candidate_owner(
@@ -3352,8 +3714,10 @@ async def propose_skill(
     request: ProposeSkillRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidate:
-    result = await application.skill.for_scope(request.scope_id).propose(mapping.propose_skill_request(request))
+) -> Candidate:
+    result = await application.skill.for_scope(request.scope_id).propose(
+        mapping.propose_skill_request(request), **_candidate_owner_commit(http_request, request.scope_id)
+    )
     await _attest_candidate_owner(
         http_request,
         scope_id=request.scope_id,
@@ -3369,7 +3733,9 @@ async def generate_skill(
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
 ) -> GeneratedCandidateResponse:
-    result = await application.skill.for_scope(request.scope_id).generate(mapping.generate_skill_request(request))
+    result = await application.skill.for_scope(request.scope_id).generate(
+        mapping.generate_skill_request(request), **_candidate_owner_commit(http_request, request.scope_id)
+    )
     if result.candidate is not None:
         await _attest_candidate_owner(
             http_request,
@@ -3397,8 +3763,8 @@ async def list_managed_skills(
     application: Annotated[ServerApplication, Depends(_require_application)],
 ) -> ListManagedSkillsResponse:
     scoped = application.skill.for_scope(request.scope_id)
-    values = await search_skill_library(
-        scoped,
+    search = getattr(scoped, "search_library", partial(search_skill_library, scoped))
+    values = await search(
         "" if request.query is None else request.query,
         request.limit,
         include_deprecated=request.include_deprecated,
@@ -3448,7 +3814,7 @@ async def propose_skill_package(
     request: ProposeSkillPackageRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidate:
+) -> Candidate:
     try:
         archive_bytes = base64.b64decode(request.archive_base64, validate=True)
     except (binascii.Error, ValueError) as error:
@@ -3458,6 +3824,7 @@ async def propose_skill_package(
             archive_bytes,
             request.reason,
             None if request.target is None else mapping.runtime_artifact_reference(request.target),
+            **_candidate_owner_commit(http_request, request.scope_id),
         )
     except ValueError as error:
         raise InvalidRuntimeRequestError("skill-package") from error
@@ -3833,6 +4200,9 @@ async def _establish_base_artifact_owners(
     application: ServerApplication,
     result: RuntimeArtifactCreated,
 ) -> None:
+    if _transactional_owner_access(request) is not None:
+        await flush_owner_writes()
+        return
     if result.family in {"topic-memory", "atomic-memory"}:
         return
     if access_control_for_mode(request.app.state.access_control, mode=request.app.state.access_mode) is None:
@@ -3905,6 +4275,9 @@ async def _attest_candidate_owner(
     family: str,
     target: ArtifactRef | None,
 ) -> None:
+    if _transactional_owner_access(request) is not None:
+        await flush_owner_writes()
+        return
     access = access_control_for_mode(
         request.app.state.access_control,
         mode=request.app.state.access_mode,
@@ -3928,6 +4301,64 @@ async def _attest_candidate_owner(
         target=logical_target,
         idempotency_key=f"candidate-owner:{scope_id}:{candidate_id}",
     )
+
+
+def _transactional_owner_access(request: Request) -> AccessControlService | None:
+    access = access_control_for_mode(request.app.state.access_control, mode=request.app.state.access_mode)
+    runtime = request.app.state.application
+    if (
+        access is not None
+        and isinstance(runtime, BuiltinRuntime)
+        and runtime.owner_write_database is not None
+        and (
+            access.supports_write_transaction(runtime.owner_write_database.engine)
+            or owner_recovery_available(access, runtime.owner_write_database)
+        )
+    ):
+        return access
+    return None
+
+
+def _artifact_owner_commit(request: Request, scope_id: str, family: str) -> dict[str, Any]:
+    access = _transactional_owner_access(request)
+    if access is None or family in {"atomic-memory", "topic-memory"}:
+        return {}
+    principal = _require_principal()
+    context = _access_audit_context(CREATE_ARTIFACT.operation_id)
+
+    async def on_commit(connection, artifact):
+        resource = ResourceRef.artifact(scope_id, family=family, artifact_id=artifact.artifact_id)
+        await owner_write_access(access, connection).establish_artifact_owner(
+            resource, principal, idempotency_key=_base_owner_idempotency_key(resource), context=context
+        )
+
+    return {"on_commit": on_commit}
+
+
+def _candidate_owner_commit(request: Request, scope_id: str) -> dict[str, Any]:
+    access = _transactional_owner_access(request)
+    if access is None:
+        return {}
+    principal = _require_principal()
+
+    async def on_commit(connection, candidate):
+        target = candidate.target
+        await owner_write_access(access, connection).attest_candidate_owner(
+            scope_id=scope_id,
+            candidate_id=candidate.candidate_id,
+            family=candidate.family,
+            proposed_owner=principal,
+            target=None
+            if target is None
+            else ResourceRef.artifact(
+                scope_id,
+                family=target.family,
+                artifact_id=target.artifact_id,
+            ),
+            idempotency_key=f"candidate-owner:{scope_id}:{candidate.candidate_id}",
+        )
+
+    return {"on_commit": on_commit}
 
 
 async def scan_external_skills(
@@ -3964,7 +4395,8 @@ async def import_external_skill(
     http_request: Request,
 ) -> GeneratedCandidateResponse:
     result = await application.external_skills.for_scope(request.scope_id).import_managed(
-        mapping.import_external_skill_request(request)
+        mapping.import_external_skill_request(request),
+        **_candidate_owner_commit(http_request, request.scope_id),
     )
     if result.candidate is not None:
         await _attest_candidate_owner(
@@ -3981,64 +4413,98 @@ async def import_external_skill(
 
 
 async def _candidate_response(
-    request: Request, scope_id: str, candidate: RuntimeArtifactCandidate[Any]
-) -> ArtifactCandidate:
-    response = mapping.candidate_response(candidate)
+    request: Request, scope_id: str, candidate: RuntimeCandidate[Any] | RuntimeTagCandidate
+) -> Candidate:
+    return (await _candidate_responses(request, scope_id, (candidate,)))[0]
+
+
+async def _candidate_responses(request, scope_id, candidates):
+    responses = [mapping.candidate_response(candidate) for candidate in candidates]
     access = access_control_for_mode(request.app.state.access_control, mode=request.app.state.access_mode)
-    if access is None:
-        return response
+    artifact_candidates = [candidate for candidate in candidates if candidate.candidate_kind == "artifact"]
+    if access is None or not artifact_candidates:
+        return responses
+    principal = _require_principal()
     decision = await access.check(
-        _require_principal(),
+        principal,
         AccessAction.SCOPE_REVIEW,
         ResourceRef.scope(scope_id),
         context=_access_audit_context("candidate_permissions"),
     )
-    pending = candidate.status.value == "pending"
-    attestation = (
-        await access.candidate_owner(scope_id, candidate.candidate_id)
+    owners = (
+        await access.candidate_owners(scope_id, tuple(candidate.candidate_id for candidate in artifact_candidates))
         if decision.allowed and access.provider_capabilities.relationship_management
-        else None
+        else {}
     )
-    response.permissions = CandidatePermissions(
-        can_revise=pending
-        and decision.allowed
-        and attestation is not None
-        and attestation.proposed_owner == _require_principal(),
-        can_approve=pending and decision.allowed and attestation is not None,
-        can_reject=pending and decision.allowed,
-    )
-    return response
+    for candidate, response in zip(candidates, responses, strict=True):
+        if candidate.candidate_kind == "tag":
+            continue
+        pending = candidate.status.value == "pending"
+        owner = owners.get(candidate.candidate_id)
+        response.permissions = CandidatePermissions(
+            can_revise=pending and decision.allowed and owner is not None and owner.proposed_owner == principal,
+            can_approve=pending and decision.allowed and owner is not None,
+            can_reject=pending and decision.allowed,
+        )
+    return responses
 
 
-async def list_artifact_candidates(
-    request: ListArtifactCandidatesRequest,
+async def _require_catalog_target_write(request: Request, scope_id: str, candidate: Any) -> None:
+    access = access_control_for_mode(request.app.state.access_control, mode=request.app.state.access_mode)
+    if access is None:
+        return
+    target = candidate.proposal.target
+    payload = {"scope_id": scope_id, **target.model_dump(mode="json")}
+    checks = (
+        _path_memory_entry_write_access(payload, access.deployment_id)
+        if target.type == "memory_entry"
+        else _path_artifact_tags_write_access(payload, access.deployment_id)
+    )
+    await access.require_all(_require_principal(), checks, context=_access_audit_context("review_catalog_change"))
+
+
+async def list_candidates(
+    request: ListCandidatesRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidatePage:
+) -> CandidatePage:
     result = await application.review.for_scope(request.scope_id).list(mapping.list_candidates_request(request))
-    response = mapping.candidate_page_response(result)
-    response.candidates = [
-        await _candidate_response(http_request, request.scope_id, value) for value in result.candidates
-    ]
+    response = CandidatePage(candidates=[], next_cursor=result.next_cursor)
+    response.candidates = await _candidate_responses(http_request, request.scope_id, result.candidates)
     return response
 
 
-async def get_artifact_candidate(
-    request: GetArtifactCandidateRequest,
+async def get_candidate(
+    request: GetCandidateRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidate:
+) -> Candidate:
     result = await application.review.for_scope(request.scope_id).get(mapping.get_candidate_request(request))
-    await _require_candidate_artifact_owner(http_request, request.scope_id, result)
     return await _candidate_response(http_request, request.scope_id, result)
 
 
-async def approve_artifact_candidate(
-    request: ApproveArtifactCandidateRequest,
+async def get_candidate_history(
+    request: GetCandidateRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidate:
+) -> CandidateHistory:
+    service = application.review.for_scope(request.scope_id)
+    versions = await service.history(mapping.get_candidate_request(request))
+    return CandidateHistory(versions=[mapping.candidate_response(item) for item in versions])
+
+
+async def approve_candidate(
+    request: ApproveCandidateRequest,
+    application: Annotated[ServerApplication, Depends(_require_application)],
+    http_request: Request,
+) -> Candidate:
     review = application.review.for_scope(request.scope_id)
+    current = await review.get(RuntimeGetCandidateRequest(candidate_id=request.candidate_id))
+    if current.candidate_kind == "tag":
+        await _require_catalog_target_write(http_request, request.scope_id, current)
+        result = await review.approve(mapping.approve_candidate_request(request))
+        return mapping.candidate_response(result)
+    await _require_candidate_target_write(http_request, request.scope_id, current)
     access = access_control_for_mode(
         http_request.app.state.access_control,
         mode=http_request.app.state.access_mode,
@@ -4049,7 +4515,7 @@ async def approve_artifact_candidate(
     try:
         result = await review.approve(mapping.approve_candidate_request(request))
     except CandidateTerminalError:
-        current = await review.get(RuntimeGetArtifactCandidateRequest(candidate_id=request.candidate_id))
+        current = await review.get(RuntimeGetCandidateRequest(candidate_id=request.candidate_id))
         if current.status.value != "approved" or current.version != request.expected_version:
             raise
         result = current
@@ -4065,25 +4531,33 @@ async def approve_artifact_candidate(
             ),
             attestation.proposed_owner,
             idempotency_key=f"candidate-artifact-owner:{request.scope_id}:{request.candidate_id}",
-            context=_access_audit_context(APPROVE_ARTIFACT_CANDIDATE.operation_id),
+            context=_access_audit_context(APPROVE_CANDIDATE.operation_id),
         )
     return await _candidate_response(http_request, request.scope_id, result)
 
 
-async def reject_artifact_candidate(
-    request: RejectArtifactCandidateRequest,
+async def reject_candidate(
+    request: RejectCandidateRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidate:
+) -> Candidate:
     result = await application.review.for_scope(request.scope_id).reject(mapping.reject_candidate_request(request))
     return await _candidate_response(http_request, request.scope_id, result)
 
 
-async def revise_artifact_candidate(
-    request: ReviseArtifactCandidateRequest,
+async def revise_candidate(
+    request: ReviseCandidateRequest,
     application: Annotated[ServerApplication, Depends(_require_application)],
     http_request: Request,
-) -> ArtifactCandidate:
+) -> Candidate:
+    current = await application.review.for_scope(request.scope_id).get(
+        RuntimeGetCandidateRequest(candidate_id=request.candidate_id)
+    )
+    if current.candidate_kind == "tag":
+        await _require_catalog_target_write(http_request, request.scope_id, current)
+        result = await application.review.for_scope(request.scope_id).revise(mapping.revise_candidate_request(request))
+        return mapping.candidate_response(result)
+    await _require_candidate_target_write(http_request, request.scope_id, current)
     access = access_control_for_mode(
         http_request.app.state.access_control,
         mode=http_request.app.state.access_mode,
@@ -4098,22 +4572,21 @@ async def revise_artifact_candidate(
     return await _candidate_response(http_request, request.scope_id, result)
 
 
-async def _require_candidate_artifact_owner(
-    request: Request,
-    scope_id: str,
-    candidate: ReviewedCandidate,
-) -> None:
-    if candidate.status.value != "approved" or candidate.result_artifact is None:
-        return
+async def _require_candidate_target_write(request: Request, scope_id: str, candidate: RuntimeCandidate[Any]) -> None:
     access = access_control_for_mode(request.app.state.access_control, mode=request.app.state.access_mode)
-    if access is None:
+    if access is None or candidate.target is None:
         return
-    artifact = candidate.result_artifact
-    owner = await access.artifact_owner(
-        ResourceRef.artifact(scope_id, family=artifact.family, artifact_id=artifact.artifact_id)
-    )
-    if owner is None:
-        raise AccessUnavailableError("artifact_owner_pending")
+    if candidate.family in {"prompt", "topic-memory"}:
+        checks = ((AccessAction.SCOPE_ADMIN, ResourceRef.scope(scope_id)),)
+    elif candidate.family == "memory":
+        checks = _base_memory_write_access({
+            "scope_id": scope_id,
+            "artifact_id": candidate.target.artifact_id,
+            "content": {"entries": [{"entry_id": item.entry_id} for item in candidate.proposal.changes]},
+        })
+    else:
+        return
+    await access.require_all(_require_principal(), checks, context=_access_audit_context("review_candidate_target"))
 
 
 def _require_handoff_selection(
@@ -4393,6 +4866,8 @@ def _add_route(
     app: FastAPI,
     operation: Operation[_RequestT, _ResponseT],
     endpoint: Callable[..., Awaitable[_ResponseT | Response]],
+    *,
+    response_model_exclude_unset: bool = False,
 ) -> None:
     observed = _observe_application_operation(app, operation, endpoint)
     app.router.add_api_route(
@@ -4407,101 +4882,8 @@ def _add_route(
         tags=list(operation.tags),
         dependencies=[] if operation.access is None else [Depends(_authorization_dependency(operation))],
         route_class_override=_EncodedPathAPIRoute if operation.path.startswith("/v1/scopes/") else None,
+        response_model_exclude_unset=response_model_exclude_unset,
     )
-
-
-# Collection permission allows identity discovery, but content remains unavailable
-# until every committed identity has its immutable owner relation.
-_COLLECTION_CONTENT_OPERATIONS = frozenset({
-    "list_atomic_memories",
-    "search_atomic_memory",
-    "search_artifacts",
-    "search_memory",
-    "list_memory_entries",
-    "get_memory_capacity",
-    "list_memory_changes",
-    "prepare_context",
-    "list_managed_skills",
-    "list_artifact_candidates",
-    "get_artifact_candidate",
-    "list_artifacts",
-    "get_artifact",
-    "get_artifact_revision",
-    "list_artifact_revisions",
-    "get_artifact_tags",
-    "query_artifact_tags",
-    "prepare_handoff",
-    "activate_handoff",
-    "finalize_handoff",
-    "handoff_current_work",
-    "generate_experience",
-    "generate_skill",
-})
-
-
-async def _require_selection_content_ready(request: Request, selection: ScopeSelection) -> None:
-    if access_control_for_mode(request.app.state.access_control, mode=request.app.state.access_mode) is None:
-        return
-    scopes = _require_scope_application(request)
-    for scope in await scopes.resolve_selection(_domain_scope_selection(selection)):
-        await require_scope_content_ready(request, scope.scope_id)
-
-
-async def require_scope_content_ready(request: Request, scope_id: str) -> None:
-    """Check an already-authorized collection using content-free catalog identities."""
-
-    access = access_control_for_mode(request.app.state.access_control, mode=request.app.state.access_mode)
-    if access is None:
-        return
-    application = _require_application(request)
-    for identity in await application.records.for_scope(scope_id).logical_artifacts():
-        # Topic Memory is Scope-owned, including manual writes and publication copies.
-        # Its reads use Scope permission, never a pending artifact-owner relation.
-        if identity.family == "topic-memory":
-            continue
-        resource = ResourceRef.artifact(
-            scope_id,
-            family=identity.family,
-            artifact_id=identity.artifact_id,
-            selector=None if identity.entry_id is None else MemoryEntrySelector(entry_id=identity.entry_id),
-        )
-        if await access.artifact_owner(resource) is None:
-            raise AccessUnavailableError("artifact_owner_pending")
-
-
-async def _check_missing_memory_reads(
-    request: Request,
-    access: AccessControlService,
-    checks: Sequence[tuple[AccessAction, ResourceRef]],
-    context: AccessAuditContext,
-) -> None:
-    # A missing owner alone cannot distinguish an absent entry from a pending
-    # owner write. Inspect identities only after authorizing the parent Scope.
-    for action, resource in checks:
-        if (
-            action is not AccessAction.ARTIFACT_READ
-            or resource.scope_id is None
-            or not (
-                (resource.family == "memory" and isinstance(resource.selector, MemoryEntrySelector))
-                or (resource.family == "atomic-memory" and resource.selector is None)
-            )
-        ):
-            continue
-        decision = await access.check(
-            current_principal(), AccessAction.SCOPE_READ, ResourceRef.scope(resource.scope_id), context=context
-        )
-        if not decision.allowed:
-            continue
-        identities = await _require_application(request).records.for_scope(resource.scope_id).logical_artifacts()
-        if not any(
-            identity.family == resource.family
-            and identity.artifact_id == resource.artifact_id
-            and identity.entry_id == (None if resource.selector is None else resource.selector.entry_id)
-            for identity in identities
-        ):
-            if resource.family == "atomic-memory":
-                raise BaseValueNotFoundError("artifact", resource.artifact_id)
-            raise MemoryEntryNotFoundError(cast(MemoryEntrySelector, resource.selector).entry_id)
 
 
 def _authorization_dependency(
@@ -4519,28 +4901,43 @@ def _authorization_dependency(
         if access is not None:
             payload = await _authorization_payload(request, operation)
             checks = _resolve_access_requirements(requirement, payload, deployment_id=access.deployment_id)
-            context = _access_audit_context(operation.operation_id)
-            for scope_id in sorted({resource.scope_id for _, resource in checks if resource.scope_id is not None}):
-                await access.bootstrap_static_scope(current_principal(), scope_id, context=context)
-            try:
-                if len(checks) == 1:
-                    action, resource = checks[0]
-                    await access.require(current_principal(), action, resource, context=context)
-                else:
-                    await access.require_all(current_principal(), checks, context=context)
-            except AccessUnavailableError as error:
-                if error.code == "artifact_owner_pending":
-                    await _check_missing_memory_reads(request, access, checks, context)
-                raise
-            if operation.operation_id in _COLLECTION_CONTENT_OPERATIONS:
-                for scope_id in sorted({
-                    resource.scope_id
-                    for _, resource in checks
-                    if resource.type is AccessResourceType.SCOPE and resource.scope_id is not None
-                }):
-                    await require_scope_content_ready(request, scope_id)
+            await _authorize_checks(request, access, checks, operation=operation.operation_id)
 
     return authorize
+
+
+async def _authorize_checks(
+    request: Request,
+    access: AccessControlService,
+    checks: Sequence[tuple[AccessAction, ResourceRef]],
+    *,
+    operation: str,
+) -> None:
+    context = _access_audit_context(operation)
+    principal = current_principal()
+    decisions = (
+        (await access.check(principal, *checks[0], context=context),)
+        if len(checks) == 1
+        else await access.check_batch(principal, checks, context=context)
+    )
+    scopes = set()
+    for (action, resource), decision in zip(checks, decisions, strict=True):
+        if decision.allowed:
+            continue
+        if decision.reason_code not in {
+            "no-matching-binding",
+            "no-matching-policy",
+        } or not access.can_bootstrap_static_scope(principal, action, resource):
+            _require_allowed(decision)
+        scopes.add(cast(str, resource.scope_id))
+    if not scopes:
+        return
+    for scope_id in sorted(scopes):
+        await access.bootstrap_static_scope(principal, scope_id, context=context)
+    if len(checks) == 1:
+        await access.require(principal, *checks[0], context=context)
+    else:
+        await access.require_all(principal, checks, context=context)
 
 
 async def _authorization_payload(request: Request, operation: Operation[Any, Any]) -> Mapping[str, Any]:
@@ -4548,7 +4945,7 @@ async def _authorization_payload(request: Request, operation: Operation[Any, Any
     if operation.request_type is None:
         return path_values
     if operation.request_location == "query":
-        return {**path_values, **request.query_params}
+        return {**request.query_params, **path_values}
     try:
         value = await request.json()
     except (UnicodeDecodeError, ValueError) as error:
@@ -5077,8 +5474,11 @@ def _observe_application_operation(
         started_at = perf_counter()
         span = _start_application_span(app, operation)
         try:
-            await _validate_current_scope(app, operation, args, kwargs)
-            result = await endpoint(*args, **kwargs)
+            async with (
+                owner_recovery_session(app.state.owner_recovery),
+                _current_scope(app, operation, args, kwargs),
+            ):
+                result = await endpoint(*args, **kwargs)
         except asyncio.CancelledError:
             _observe_application(app, operation, "cancelled", started_at)
             _log_operation(
@@ -5102,8 +5502,9 @@ def _observe_application_operation(
                 started_at=started_at,
                 error=diagnostic_error,
                 error_code=error_code,
+                status_code=response_status,
             )
-            _finish_span(span, "failure", error=diagnostic_error)
+            _finish_span(span, "failure", error=diagnostic_error, error_code=error_code, status_code=response_status)
             raise
         outcome = _application_outcome(result)
         _observe_application(app, operation, outcome, started_at)
@@ -5123,24 +5524,27 @@ def _sensitive_operation_error(error: Exception) -> bool:
     )
 
 
-async def _validate_current_scope(
+@asynccontextmanager
+async def _current_scope(
     app: FastAPI,
     operation: Operation[Any, Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-) -> None:
-    if operation.scope_mode != "current" or operation.request_type is None:
-        return
+) -> AsyncIterator[None]:
     scopes = getattr(app.state.application, "scopes", None)
-    if scopes is None:
-        return
-    request = next(
-        (value for value in (*args, *kwargs.values()) if isinstance(value, operation.request_type)),
-        None,
-    )
-    scope_id = getattr(request, "scope_id", None)
-    if isinstance(scope_id, str):
-        await scopes.get(scope_id)
+    if operation.scope_mode == "current" and operation.request_type is not None and scopes is not None:
+        request = next(
+            (value for value in (*args, *kwargs.values()) if isinstance(value, operation.request_type)),
+            None,
+        )
+        scope_id = getattr(request, "scope_id", None)
+        if isinstance(scope_id, str):
+            if isinstance(app.state.application, BuiltinRuntime):
+                async with app.state.application._scope_operation(scope_id):
+                    yield
+                return
+            await scopes.get(scope_id)
+    yield
 
 
 def _start_application_span(app: FastAPI, operation: Operation[Any, Any]) -> Any | None:
@@ -5160,10 +5564,24 @@ def _start_application_span(app: FastAPI, operation: Operation[Any, Any]) -> Any
     )
 
 
-def _finish_span(span: Any | None, outcome: str, *, error: BaseException | None = None) -> None:
+def _finish_span(
+    span: Any | None,
+    outcome: str,
+    *,
+    error: BaseException | None = None,
+    error_code: str | None = None,
+    status_code: int | None = None,
+) -> None:
     if span is not None:
         with suppress(Exception):
-            span.finish(outcome, error=error)
+            attributes: dict[str, Any] = {}
+            if status_code is not None:
+                attributes["http.response.status_code"] = status_code
+            if error_code is not None:
+                category = error_category(error_code, status_code=status_code, outcome=outcome)
+                if category is not None:
+                    attributes["powercontext.error.category"] = category
+            span.finish(outcome, error=error, attributes=attributes or None)
 
 
 def _observe_application(
@@ -5208,6 +5626,7 @@ def _log_operation(
     started_at: float,
     error: Exception | None = None,
     error_code: str | None = None,
+    status_code: int | None = None,
 ) -> None:
     extra = {
         "event": "application.operation.completed",
@@ -5219,6 +5638,8 @@ def _log_operation(
     }
     if error_code is not None:
         extra["error_code"] = error_code
+    if status_code is not None:
+        extra["status_code"] = status_code
     log_safely(logger, level, message, exc_info=error, extra=extra)
 
 
@@ -5252,6 +5673,8 @@ def _set_error_headers(response: Response, error: Exception) -> None:
 
 
 def _map_error(error: Exception) -> tuple[int, str, str, dict[str, Any] | None]:
+    if isinstance(error, DreamError) and error.code == "client_upgrade_required":
+        return 426, error.code, "Upgrade to a client supporting Dream contract 2.", {"required_dream_contract": 2}
     if isinstance(error, ArtifactSearchFamilyNotFound):
         return status.HTTP_404_NOT_FOUND, "artifact_family_not_found", "The Artifact Family was not found.", None
     if isinstance(error, ArtifactSearchUnsupported):
@@ -5268,6 +5691,7 @@ def _map_error(error: Exception) -> tuple[int, str, str, dict[str, Any] | None]:
         return access_error
     if isinstance(error, (DreamError, EvidenceResolutionError)):
         statuses = {
+            "client_upgrade_required": 426,
             "idempotency_conflict": 409,
             "artifact_conflict": 409,
             "dream_not_found": 404,
@@ -5585,6 +6009,24 @@ def _map_scope_error(error: Exception) -> tuple[int, str, str, dict[str, Any] | 
     return None
 
 
+_CANDIDATE_ERROR_REASONS = {
+    ("artifacts", "must include the exact target"): ("artifact_refs", "target_not_in_artifact_refs"),
+    ("artifacts", "new managed Skill lineage"): ("artifact_refs", "skill_lineage_not_permitted"),
+    ("artifacts", "managed Skill lineage"): ("artifact_refs", "target_not_in_artifact_refs"),
+    ("target", "must identify a"): ("target", "target_family_mismatch"),
+    ("target", "Artifact is not available in this scope"): ("target", "target_unavailable"),
+}
+
+
+def _candidate_error_details(error: InvalidCandidateError) -> dict[str, Any] | None:
+    for (field, prefix), (public_field, reason) in _CANDIDATE_ERROR_REASONS.items():
+        if error.field == field and error.detail.startswith(prefix):
+            return {"field": public_field, "reason": reason}
+    # Internal-only fields (audit, basis, family) and reasons shared by several
+    # public fields (evidence) have no stable name a caller can act on.
+    return None
+
+
 def _map_candidate_error(error: Exception) -> tuple[int, str, str, dict[str, Any] | None] | None:
     if isinstance(error, CandidateNotFoundError):
         return status.HTTP_404_NOT_FOUND, "candidate_not_found", "The requested Candidate was not found.", None
@@ -5610,7 +6052,12 @@ def _map_candidate_error(error: Exception) -> tuple[int, str, str, dict[str, Any
             {"status": error.status},
         )
     if isinstance(error, InvalidCandidateError):
-        return status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_request", "The request is invalid.", None
+        return (
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "invalid_request",
+            "The request is invalid.",
+            _candidate_error_details(error),
+        )
     return None
 
 
@@ -5638,6 +6085,20 @@ def _map_report_error(error: Exception) -> tuple[int, str, str, dict[str, Any] |
 
 
 def _map_domain_error(error: Exception) -> tuple[int, str, str, dict[str, Any] | None]:
+    if isinstance(error, TopicMemoryBlockNotFoundError):
+        return (
+            status.HTTP_404_NOT_FOUND,
+            "topic_memory_block_not_found",
+            "The Topic Memory block was not found in this Scope.",
+            None,
+        )
+    if isinstance(error, TopicMemoryBlockConflictError):
+        return (
+            status.HTTP_409_CONFLICT,
+            "topic_memory_block_conflict",
+            "The Topic Memory block no longer owns this frontier.",
+            None,
+        )
     if isinstance(error, AtomicMemoryIndexError):
         return 503, error.code, str(error), None
     if isinstance(error, AtomicMemoryError):
@@ -5730,7 +6191,17 @@ def _invalid_request_details(error: Exception) -> dict[str, Any] | None:
         and error.canonical_code is not None
     ):
         return {"code": error.canonical_code, "message": str(error.detail)}
+    if isinstance(error, InvalidRuntimeRequestError):
+        reason = _WORKING_NOTE_EXPIRY_REASONS.get(error.code)
+        if reason is not None:
+            return {"field": "expires_at", "reason": reason}
     return None
+
+
+_WORKING_NOTE_EXPIRY_REASONS = {
+    "working-note-expiry-timezone": "missing_time_zone",
+    "working-note-expiry-past": "not_in_future",
+}
 
 
 def _map_source_ingestion_error(error: Exception) -> tuple[int, str, str, dict[str, Any] | None] | None:

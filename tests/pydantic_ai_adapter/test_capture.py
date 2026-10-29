@@ -32,7 +32,7 @@ from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, ToolCall
 from pydantic_ai.models.function import FunctionModel
 
 from powercontext.client import TransportError
-from powercontext.client.capture import render_capture_event
+from powercontext.client.capture import redact_known_secrets, render_capture_event
 from tests.pydantic_ai_adapter.fakes import RecordingClient, prepared_response
 
 
@@ -51,6 +51,19 @@ class UnsupportedCredentialResult:
 
     def __str__(self) -> str:
         return f"UnsupportedCredentialResult(secret={self.secret!r})"
+
+
+def test_capture_redaction_keeps_provider_prefix_handling_out_of_the_shared_path() -> None:
+    value = "my key is sk-abcdefghij1234567890 and AKIAIOSFODNN7EXAMPLE"
+
+    assert redact_known_secrets(value) == value
+
+
+def test_known_secret_redaction_sorts_explicit_tuple_by_descending_length() -> None:
+    short_secret = "synthetic-secret"  # noqa: S105 - synthetic redaction sentinel.
+    long_secret = "synthetic-secret-with-suffix"  # noqa: S105 - synthetic redaction sentinel.
+
+    assert redact_known_secrets(long_secret, secrets=(short_secret, long_secret)) == "[REDACTED]"
 
 
 def test_capture_disabled_makes_no_source_or_flush_requests(monkeypatch: pytest.MonkeyPatch) -> None:

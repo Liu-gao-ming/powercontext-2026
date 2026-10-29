@@ -212,6 +212,17 @@ const OPERATIONS = {
 		successStatuses: [200],
 		emptyStatuses: []
 	},
+	get_server_info: {
+		method: "GET",
+		path: "/v1/server-info",
+		location: null,
+		scopeMode: "none",
+		pathParameters: [],
+		queryParams: [],
+		headerParams: [],
+		successStatuses: [200],
+		emptyStatuses: []
+	},
 	get_capabilities: {
 		method: "GET",
 		path: "/v1/capabilities",
@@ -364,6 +375,17 @@ const OPERATIONS = {
 		successStatuses: [202],
 		emptyStatuses: []
 	},
+	capture_working_note: {
+		method: "POST",
+		path: "/v1/sources/working-notes",
+		location: "body",
+		scopeMode: "current",
+		pathParameters: [],
+		queryParams: [],
+		headerParams: [],
+		successStatuses: [202],
+		emptyStatuses: []
+	},
 	register_source_definition: {
 		method: "POST",
 		path: "/v1/source-definitions/register",
@@ -422,6 +444,28 @@ const OPERATIONS = {
 	prepare_context: {
 		method: "POST",
 		path: "/v1/context/prepare",
+		location: "body",
+		scopeMode: "current",
+		pathParameters: [],
+		queryParams: [],
+		headerParams: [],
+		successStatuses: [200],
+		emptyStatuses: []
+	},
+	prepare_bootstrap_context: {
+		method: "POST",
+		path: "/v1/context/bootstrap",
+		location: "body",
+		scopeMode: "current",
+		pathParameters: [],
+		queryParams: [],
+		headerParams: [],
+		successStatuses: [200],
+		emptyStatuses: []
+	},
+	record_bootstrap_delivery: {
+		method: "POST",
+		path: "/v1/context/bootstrap/receipts",
 		location: "body",
 		scopeMode: "current",
 		pathParameters: [],
@@ -1007,9 +1051,9 @@ const OPERATIONS = {
 		successStatuses: [200],
 		emptyStatuses: []
 	},
-	list_artifact_candidates: {
+	list_candidates: {
 		method: "POST",
-		path: "/v1/artifact-candidates/list",
+		path: "/v1/candidates/list",
 		location: "body",
 		scopeMode: "current",
 		pathParameters: [],
@@ -1018,9 +1062,9 @@ const OPERATIONS = {
 		successStatuses: [200],
 		emptyStatuses: []
 	},
-	get_artifact_candidate: {
+	get_candidate: {
 		method: "POST",
-		path: "/v1/artifact-candidates/get",
+		path: "/v1/candidates/get",
 		location: "body",
 		scopeMode: "current",
 		pathParameters: [],
@@ -1029,9 +1073,9 @@ const OPERATIONS = {
 		successStatuses: [200],
 		emptyStatuses: []
 	},
-	approve_artifact_candidate: {
+	approve_candidate: {
 		method: "POST",
-		path: "/v1/artifact-candidates/approve",
+		path: "/v1/candidates/approve",
 		location: "body",
 		scopeMode: "current",
 		pathParameters: [],
@@ -1040,9 +1084,9 @@ const OPERATIONS = {
 		successStatuses: [200],
 		emptyStatuses: []
 	},
-	reject_artifact_candidate: {
+	reject_candidate: {
 		method: "POST",
-		path: "/v1/artifact-candidates/reject",
+		path: "/v1/candidates/reject",
 		location: "body",
 		scopeMode: "current",
 		pathParameters: [],
@@ -1051,9 +1095,20 @@ const OPERATIONS = {
 		successStatuses: [200],
 		emptyStatuses: []
 	},
-	revise_artifact_candidate: {
+	revise_candidate: {
 		method: "POST",
-		path: "/v1/artifact-candidates/revise",
+		path: "/v1/candidates/revise",
+		location: "body",
+		scopeMode: "current",
+		pathParameters: [],
+		queryParams: [],
+		headerParams: [],
+		successStatuses: [200],
+		emptyStatuses: []
+	},
+	get_candidate_history: {
+		method: "POST",
+		path: "/v1/candidates/history",
 		location: "body",
 		scopeMode: "current",
 		pathParameters: [],
@@ -1144,6 +1199,36 @@ const OPERATIONS = {
 			"limit",
 			"cursor"
 		],
+		headerParams: [],
+		successStatuses: [200],
+		emptyStatuses: []
+	},
+	resolve_artifact_handle: {
+		method: "GET",
+		path: "/v1/scopes/{scope_id}/artifact-handles/{family}/{key}",
+		location: null,
+		scopeMode: "none",
+		pathParameters: [
+			"scope_id",
+			"family",
+			"key"
+		],
+		queryParams: [],
+		headerParams: [],
+		successStatuses: [200],
+		emptyStatuses: []
+	},
+	bind_artifact_handle: {
+		method: "PUT",
+		path: "/v1/scopes/{scope_id}/artifact-handles/{family}/{key}",
+		location: "body",
+		scopeMode: "none",
+		pathParameters: [
+			"scope_id",
+			"family",
+			"key"
+		],
+		queryParams: [],
 		headerParams: [],
 		successStatuses: [200],
 		emptyStatuses: []
@@ -1672,6 +1757,7 @@ var PowerContextClient = class {
 	}
 	init(spec, request, signal) {
 		const headers = {
+			"X-PowerContext-Dream-Contract": "2",
 			Accept: "application/json",
 			"User-Agent": PLUGIN_USER_AGENT,
 			...request.headers
@@ -1773,15 +1859,18 @@ async function requestMemoryOperation(client, operationId, payload, scopeId, sig
 //#region src/secrets.ts
 const SECRET_PATTERNS = [
 	/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/giu,
-	/(?<![\w-])["']?\b(?:api[_ -]?key|access[_ -]?key|client[_ -]?secret|secret(?:[_ -]?key)?|password|passwd|passphrase|token|authorization|cookie)\b["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s,;}\]]+)/giu,
+	/(?<![\w-])["']?\b(?:authorization|proxy-authorization|cookie|set-cookie)\b["']?[ \t]*[:=][ \t]*[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*/giu,
+	/(?<![\w-])["']?\b(?:api[_ -]?key|access[_ -]?(?:key|token)|client[_ -]?secret|secret(?:[_ -]?key)?|private[_ -]?key|password|passwd|passphrase|token|authorization|cookie)\b["']?\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s,;}\]]+)/giu,
 	/(?<![\w-])bearer\s+[A-Za-z0-9._~+/=-]{8,}(?![\w-])/giu,
 	/(?<![\w-])(?:sk-[A-Za-z0-9][A-Za-z0-9_-]{7,}|github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})(?![\w-])/giu
 ];
-function scrubSecrets(text) {
+function scrubSecrets(text, authorization) {
+	const credential = authorization?.replace(/^Bearer\s+/iu, "");
+	if (credential) text = text.replaceAll(credential, "[REDACTED]");
 	return SECRET_PATTERNS.reduce((value, pattern) => value.replace(pattern, "[REDACTED]"), text);
 }
-function containsSecret(text) {
-	return scrubSecrets(text) !== text;
+function containsSecret(text, authorization) {
+	return scrubSecrets(text, authorization) !== text;
 }
 
 //#endregion
@@ -1789,6 +1878,7 @@ function containsSecret(text) {
 const WRITE_OPERATIONS = new Set([
 	"remember_memory",
 	"capture_content_source",
+	"capture_working_note",
 	"revise_memory_entry",
 	"retire_memory_entry",
 	"replace_artifact",
@@ -1898,7 +1988,7 @@ async function call(runtime, scopeId, operationId, payload, signal) {
 }
 async function handleReview(tokens, runtime, scopeId, signal) {
 	const action = tokens[1];
-	if (!action) return call(runtime, scopeId, "list_artifact_candidates", { status: "pending" }, signal);
+	if (!action) return call(runtime, scopeId, "list_candidates", { status: "pending" }, signal);
 	if (action === "approve") {
 		const candidateId = tokens[2];
 		const version = Number(tokens[3]);
@@ -1906,7 +1996,7 @@ async function handleReview(tokens, runtime, scopeId, signal) {
 			kind: "error",
 			text: "Usage: /pc review approve <candidate_id> <expected_version>"
 		};
-		return call(runtime, scopeId, "approve_artifact_candidate", {
+		return call(runtime, scopeId, "approve_candidate", {
 			candidate_id: candidateId,
 			expected_version: version
 		}, signal);
@@ -1919,7 +2009,7 @@ async function handleReview(tokens, runtime, scopeId, signal) {
 			kind: "error",
 			text: "Usage: /pc review reject <candidate_id> <expected_version> <reason>"
 		};
-		return call(runtime, scopeId, "reject_artifact_candidate", {
+		return call(runtime, scopeId, "reject_candidate", {
 			candidate_id: candidateId,
 			expected_version: version,
 			reason

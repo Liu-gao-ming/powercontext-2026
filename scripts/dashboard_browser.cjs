@@ -122,6 +122,7 @@ async function changePreference(page, key, value) {
   const before = await toggle.boundingBox();
   await toggle.click();
   assert.deepEqual(await toggle.boundingBox(), before, 'Opening display settings moved its button');
+  await menu.locator('.dropdown-menu').waitFor({ state: 'visible' });
   const bounds = await menu.locator('.dropdown-menu').boundingBox();
   assert(bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= page.viewportSize().width + 1 && bounds.y + bounds.height <= page.viewportSize().height + 1, 'Display settings exceed the viewport');
   assert(await menu.locator('.dropdown-item').evaluateAll(items => items.every(element => {
@@ -130,6 +131,7 @@ async function changePreference(page, key, value) {
   })), 'Display options are clipped by navigation scrolling');
   await menu.locator(`.dropdown-item[href*="${key}=${value}"]`).click();
   await page.waitForURL(url => url.searchParams.get(key) === value);
+  await page.waitForLoadState('networkidle');
   const selectedTheme = page.locator('.display-preferences [data-theme-value][aria-current="true"]');
   assert.equal(await selectedTheme.getAttribute('data-theme-value'), await page.evaluate(() => document.documentElement.dataset.bsTheme || 'light'));
 }
@@ -725,21 +727,25 @@ async function main() {
       });
     }
   }
-  const entries = (await api('/v1/memory/entries/list', { scope_id: readingScope })).entries;
+  const entries = (await api('/v1/atomic-memory/list', { scope_id: readingScope, states: ['active'], limit: 1 })).items;
   if (entries.length) {
     const query = entries[0].text.match(/[A-Za-z][A-Za-z-]{3,}/)?.[0] || entries[0].text.slice(0, 12);
     const hits = (await api('/v1/memory/search', { scope_id: readingScope, query, mode: 'fts', limit: 50 })).hits;
+    await page.locator('#memory-search-mode').selectOption('fts');
     await page.getByRole('searchbox').fill(query);
     await page.getByRole('button', { name: 'Search', exact: true }).click();
     await page.waitForURL(url => url.searchParams.get('q') === query && !url.searchParams.has('notes_page'));
-    const expected = new Set(hits.map(hit => hit.citation.entry_id));
+    const expected = new Set(hits.map(hit => `${hit.memory.artifact.artifact_id}@${hit.memory.artifact.revision}`));
     const seen = new Set();
     let resultPage = 1;
     while (true) {
       const pagination = page.getByRole('navigation', { name: 'Pagination', exact: true });
       assert(await pagination.isVisible(), 'Search pagination is hidden');
       assert(await pagination.getByText(`Page ${resultPage}`, { exact: true }).isVisible());
-      for (const id of await page.locator('.note-selector').evaluateAll(links => links.map(link => new URL(link.href).searchParams.get('entry')))) {
+      for (const id of await page.locator('.note-selector').evaluateAll(links => links.map(link => {
+        const query = new URL(link.href).searchParams;
+        return `${query.get('artifact')}@${query.get('revision')}`;
+      }))) {
         assert(expected.has(id));
         assert(!seen.has(id));
         seen.add(id);
@@ -776,14 +782,16 @@ async function main() {
   await page.waitForURL(url => url.searchParams.get('kind') === 'skill');
   const skills = (await api('/v1/skill/library', { scope_id: readingScope })).skills;
   if (skills.length) {
-    await page.getByRole('searchbox').fill(skills[0].content.name);
+    const skillName = skills[0].content.name;
+    await page.getByRole('searchbox').fill(skillName);
     await page.getByRole('button', { name: 'Search', exact: true }).click();
-    await page.waitForURL(url => url.searchParams.get('q') === skills[0].content.name);
+    await page.waitForURL(url => url.searchParams.get('q') === skillName);
     assert(await page.getByRole('navigation', { name: 'Pagination', exact: true }).isVisible());
-    await page.getByRole('link', { name: skills[0].content.name, exact: true }).click();
+    await page.getByRole('link', { name: skillName, exact: true }).click();
     await page.waitForURL(url => url.pathname.endsWith('/skill'));
     await page.locator('.back-link').click();
-    await page.waitForURL(url => url.pathname.endsWith('/methods') && url.searchParams.get('kind') === 'skill');
+    await page.waitForURL(url =>
+      url.pathname.endsWith('/methods') && url.searchParams.get('kind') === 'skill' && url.searchParams.get('q') === skillName);
   }
   await page.goto(base + '/dashboard/home');
   await context.setOffline(true);

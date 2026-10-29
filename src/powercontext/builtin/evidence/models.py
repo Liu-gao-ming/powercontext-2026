@@ -52,11 +52,23 @@ class EvidenceNode(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     evidence_id: str
-    kind: Literal["source", "experience", "memory", "unresolved"]
+    kind: Literal[
+        "source",
+        "experience",
+        "memory",
+        "profile",
+        "topic_memory",
+        "handoff",
+        "skill",
+        "prompt",
+        "catalog_target",
+        "unresolved",
+    ]
     digest: str
     source: SourceRef | None = None
     artifact: ArtifactRef | None = None
-    role: Literal["root", "derived", "lineage_only", "unresolved"]
+
+    role: Literal["root", "derived", "target", "lineage_only", "unresolved"]
     historical: bool = False
 
 
@@ -93,7 +105,9 @@ class ProjectedEvidence(BaseModel):
     """Untrusted content visible to the model for this operation only."""
 
     evidence_id: str
-    kind: Literal["source", "experience", "memory"]
+    kind: Literal[
+        "source", "experience", "memory", "profile", "topic_memory", "handoff", "skill", "prompt", "catalog_target"
+    ]
     text: str
     historical: bool = False
     root_group_ids: tuple[str, ...] = ()

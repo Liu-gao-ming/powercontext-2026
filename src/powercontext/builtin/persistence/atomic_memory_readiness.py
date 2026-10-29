@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from powercontext.builtin.persistence.errors import PersistenceError
 
 LEGACY_CITATION_COLUMN = "memory_citations"
-_LEGACY_CITATION_TABLES = ("pc_artifacts", "pc_artifact_candidate_versions")
+_LEGACY_CITATION_TABLES = ("pc_artifacts", "pc_artifact_candidate_versions", "pc_candidate_versions")
 LEGACY_ENTRY_FOREIGN_KEYS = {
     "pc_memory_entry_versions": ("scope_id", "family", "memory_artifact_id", "created_in_revision"),
     "pc_memory_entry_heads": ("scope_id", "family", "memory_artifact_id", "head_revision"),

@@ -1,0 +1,11 @@
+{
+  "resources": [
+    "SKILL.md",
+    "references/examples.json",
+    "references/http-boundaries.md",
+    "references/review-publication.md",
+    "references/scope-memory.md",
+    "references/work-handoff.md"
+  ],
+  "schema_version": 1
+}

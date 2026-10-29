@@ -79,12 +79,22 @@ class SupportProfile(StrEnum):
     FULL = "full"
 
 
+class PreCompactionMode(StrEnum):
+    UNSUPPORTED = "unsupported"
+    BEST_EFFORT = "best_effort"
+    REQUIRED_CAPABLE = "required_capable"
+
+
 class ToolSurfaceProbe(StrEnum):
     SERVER_MCP = "server_mcp"
     JSON_PROMPT_HOOK = "json_prompt_hook"
     ZCODE_PROMPT_HOOK = "zcode_prompt_hook"
-    DSH_TOOLS = "dsh_tools"
+    KIMI_CODE_MCP = "kimi_code_mcp"
+    KIMI_CODE_PROMPT_HOOK = "kimi_code_prompt_hook"
+    KIMI_CODE_SCOPE = "kimi_code_scope"
     DIFY_TOOLS = "dify_tools"
+    DSH_MCP = "dsh_mcp"
+    DSH_LIFECYCLE = "dsh_lifecycle"
     DSH_COMMANDS = "dsh_commands"
     HERMES_OPERATIONS = "hermes_operations"
     HERMES_COMMANDS = "hermes_commands"
@@ -139,6 +149,8 @@ class IntegrationEvidence(BaseModel):
         if len(paths) != len(set(paths)):
             raise ValueError("evidence paths must be unique")
         for value in paths:
+            if not value.strip():
+                raise ValueError("evidence paths must not be empty")
             path = Path(value)
             if path.is_absolute() or ".." in path.parts:
                 raise ValueError("evidence paths must be repository-relative")
@@ -151,6 +163,40 @@ class IntegrationEvidence(BaseModel):
     @property
     def has_any(self) -> bool:
         return bool(self.implementation or self.documentation or self.tests)
+
+
+class PreCompactionLifecycle(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: PreCompactionMode
+    surface: str | None = Field(default=None, min_length=1, pattern=r"^[A-Za-z0-9_.:-]+$")
+    required_mode_opt_in: str | None = Field(default=None, min_length=1, pattern=r"^[A-Za-z0-9_.:-]+$")
+    evidence: IntegrationEvidence = Field(default_factory=IntegrationEvidence)
+
+    @model_validator(mode="after")
+    def validate_surface_and_evidence(self) -> PreCompactionLifecycle:
+        if self.mode is PreCompactionMode.UNSUPPORTED:
+            if self.surface is not None or self.required_mode_opt_in is not None or self.evidence.has_any:
+                raise ValueError("unsupported pre-compaction lifecycle cannot declare a surface, opt-in, or evidence")
+            return self
+        if self.surface is None:
+            raise ValueError(f"{self.mode.value} pre-compaction lifecycle requires a public surface")
+        if self.mode is PreCompactionMode.REQUIRED_CAPABLE:
+            if self.required_mode_opt_in is None:
+                raise ValueError("required_capable pre-compaction lifecycle requires an explicit opt-in surface")
+            if not self.evidence.is_complete:
+                raise ValueError(
+                    "required_capable pre-compaction lifecycle requires focused implementation, docs, and tests"
+                )
+        elif self.required_mode_opt_in is not None:
+            raise ValueError("only required_capable pre-compaction lifecycle may declare a required-mode opt-in")
+        return self
+
+
+class IntegrationLifecycle(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    pre_compaction: PreCompactionLifecycle
 
 
 class AvailabilityDefinition(BaseModel):
@@ -211,6 +257,7 @@ class IntegrationDeclaration(BaseModel):
     capabilities: tuple[IntegrationCapability, ...] = ()
     profiles: tuple[SupportProfile, ...] = ()
     toolsets: tuple[str, ...] = ()
+    lifecycle: IntegrationLifecycle | None = None
     evidence: IntegrationEvidence = Field(default_factory=IntegrationEvidence)
     release_tag: str | None = None
     proposal: str | None = None
@@ -236,7 +283,7 @@ class IntegrationManifest(BaseModel):
 
     @model_validator(mode="after")
     def validate_declarations(self) -> IntegrationManifest:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError(f"unsupported integration manifest schema version: {self.schema_version}")
         if set(self.availability_definitions) != set(IntegrationAvailability):
             raise ValueError("availability definitions must cover every availability state")
@@ -298,9 +345,51 @@ class IntegrationManifest(BaseModel):
                     raise ValueError(f"{integration.id}: unsupported integrations need only rationale evidence")
             if integration.kind is not IntegrationKind.AGENT_HOST and integration.profiles:
                 raise ValueError("only agent_host integrations may declare support profiles")
+            if integration.kind is not IntegrationKind.AGENT_HOST and integration.lifecycle is not None:
+                raise ValueError("only agent_host integrations may declare lifecycle conformance")
             if integration.kind is IntegrationKind.AGENT_HOST and integration.availability in IMPLEMENTED_AVAILABILITY:
                 if frozenset(integration.profiles) != derived_profiles(integration.capabilities):
                     raise ValueError(f"agent_host {integration.id!r} profiles must equal its derived profiles")
+            if integration.kind is IntegrationKind.AGENT_HOST:
+                if integration.lifecycle is None:
+                    if integration.availability in IMPLEMENTED_AVAILABILITY:
+                        raise ValueError(
+                            f"implemented agent_host {integration.id!r} must declare pre-compaction lifecycle conformance"
+                        )
+                    continue
+                pre_compaction = integration.lifecycle.pre_compaction
+                if pre_compaction.mode is PreCompactionMode.UNSUPPORTED:
+                    if IntegrationCapability.PRE_COMPACTION_CAPTURE in integration.capabilities:
+                        raise ValueError(
+                            f"{integration.id}: unsupported pre-compaction lifecycle cannot claim "
+                            "pre_compaction_capture"
+                        )
+                else:
+                    required = {
+                        IntegrationCapability.PRE_COMPACTION_CAPTURE,
+                        IntegrationCapability.SOURCE_CAPTURE,
+                        IntegrationCapability.FLUSH_OR_CHECKPOINT,
+                    }
+                    missing = required - set(integration.capabilities)
+                    if missing:
+                        values = sorted(capability.value for capability in missing)
+                        raise ValueError(
+                            f"{integration.id}: pre-compaction lifecycle is missing capabilities: {values!r}"
+                        )
+                    surfaces = {
+                        tool.id
+                        for toolset_id in integration.toolsets
+                        for tool in toolsets[toolset_id].tools
+                        if IntegrationCapability.PRE_COMPACTION_CAPTURE in tool.capabilities
+                    }
+                    if not any(
+                        tool_id == pre_compaction.surface or tool_id.startswith(f"{pre_compaction.surface}:")
+                        for tool_id in surfaces
+                    ):
+                        raise ValueError(
+                            f"{integration.id}: pre-compaction surface {pre_compaction.surface!r} "
+                            "is not exposed by its toolsets"
+                        )
         unused = set(toolsets) - used_toolsets
         if unused:
             raise ValueError(f"toolsets must be referenced by an integration: {sorted(unused)!r}")
@@ -389,6 +478,19 @@ def evidence_path_errors(manifest: IntegrationManifest, repository_root: Path = 
                         errors.append(f"{integration.id}: {category} escapes the repository: {pointer}")
                     elif not resolved.is_file():
                         errors.append(f"{integration.id}: missing {category} evidence: {pointer}")
+            if integration.lifecycle is not None:
+                lifecycle_evidence = integration.lifecycle.pre_compaction.evidence
+                for category, paths in (
+                    ("implementation", lifecycle_evidence.implementation),
+                    ("documentation", lifecycle_evidence.documentation),
+                    ("tests", lifecycle_evidence.tests),
+                ):
+                    for pointer in paths:
+                        resolved = (repository_root / pointer).resolve()
+                        if not resolved.is_relative_to(repository_root.resolve()):
+                            errors.append(f"{integration.id}: lifecycle {category} escapes the repository: {pointer}")
+                        elif not resolved.is_file():
+                            errors.append(f"{integration.id}: missing lifecycle {category} evidence: {pointer}")
         if integration.availability is IntegrationAvailability.PROPOSED:
             errors.extend(_proposal_pointer_errors(integration.id, integration.proposal, repository_root))
         elif integration.availability is IntegrationAvailability.UNSUPPORTED:
@@ -466,17 +568,65 @@ def tool_surface_errors(manifest: IntegrationManifest, repository_root: Path = R
 
 def _probe_toolset(probe: ToolSurfaceProbe, root: Path) -> set[str]:
     if probe is ToolSurfaceProbe.SERVER_MCP:
-        from powercontext.server.mcp import _MCP_OPERATION_IDS
+        from mcp_catalog import server_mcp_tools
 
-        return set(_MCP_OPERATION_IDS)
+        return {tool.name for tool in server_mcp_tools()}
     if probe is ToolSurfaceProbe.JSON_PROMPT_HOOK:
         return _prompt_hook_ids(root)
+    if probe is ToolSurfaceProbe.KIMI_CODE_SCOPE:
+        script = _read(root, "integrations/kimi-code/plugins/powercontext/scripts/scope.mjs")
+        if not all(
+            marker in script
+            for marker in ("['resolve', 'bind', 'unbind'].includes(action)", "/v1/scope-bindings/clear", "resolveScope")
+        ):
+            raise ValueError("missing Kimi workspace binding commands")
+        return {"kimi-code:scope:resolve", "kimi-code:scope:bind", "kimi-code:scope:unbind"}
+    if probe in {ToolSurfaceProbe.KIMI_CODE_MCP, ToolSurfaceProbe.KIMI_CODE_PROMPT_HOOK}:
+        plugin = root / "integrations/kimi-code/plugins/powercontext"
+        manifest = json.loads((plugin / "kimi.plugin.json").read_text(encoding="utf-8"))
+        if probe is ToolSurfaceProbe.KIMI_CODE_MCP:
+            entry = manifest["mcpServers"]["powercontext"]
+            if entry.get("url") != "http://127.0.0.1:8000/mcp":
+                raise ValueError("missing Kimi HTTP MCP endpoint")
+            profiles = json.loads((plugin / "profiles.json").read_text(encoding="utf-8"))["profiles"]
+            if entry["enabledTools"] != profiles["minimal"]:
+                raise ValueError("Kimi default tools do not match its minimal profile")
+            return set(profiles["full"])
+        script = (plugin / "hooks/user_prompt_submit.mjs").read_text(encoding="utf-8")
+        expected = {"event": "UserPromptSubmit", "command": "node ./hooks/user_prompt_submit.mjs", "timeout": 5}
+        if manifest.get("hooks") != [expected] or not all(
+            marker in script for marker in ("/v1/context/prepare", "/v1/sources/content", "message")
+        ):
+            raise ValueError("missing Kimi prompt capture or context output")
+        return {"kimi-code:UserPromptSubmit"}
     if probe is ToolSurfaceProbe.ZCODE_PROMPT_HOOK:
         return _zcode_prompt_hook_ids(root)
-    if probe is ToolSurfaceProbe.DSH_TOOLS:
-        return _typescript_operation_tools(root / "integrations/dsh/plugins/powercontext/src/tools.ts", "pcTool")
     if probe is ToolSurfaceProbe.DIFY_TOOLS:
         return _dify_operation_tools(root)
+    if probe is ToolSurfaceProbe.DSH_MCP:
+        source = _read(root, "integrations/dsh/plugins/powercontext/src/mcp.ts")
+        if "@deepseek-ai/dsh-mcp-client" not in source or "mcpEndpoint" not in source:
+            raise ValueError("DSH MCP bridge is incomplete")
+        catalog = _read(root, "integrations/dsh/plugins/powercontext/src/mcp-operations.generated.ts")
+        match = re.search(r"export const MCP_OPERATIONS = (\{[\s\S]*?\}) as const", catalog)
+        if match is None:
+            raise ValueError("DSH MCP catalog is missing")
+        operations = json.loads(match[1])
+        if not isinstance(operations, dict) or not operations:
+            raise ValueError("DSH MCP catalog is empty")
+        return {f"mcp__powercontext__{operation}" for operation in operations}
+    if probe is ToolSurfaceProbe.DSH_LIFECYCLE:
+        index = _read(root, "integrations/dsh/plugins/powercontext/src/index.ts")
+        recall = _read(root, "integrations/dsh/plugins/powercontext/src/recall.ts")
+        capture = _read(root, "integrations/dsh/plugins/powercontext/src/capture.ts")
+        required = ("agent/pre-step", "runRecallPreStep", "prepare_context")
+        capture_required = ("captureUserPrompt", "flushThrough", "flush_memory")
+        return (
+            {"agent:pre-step"}
+            if all(marker in index or marker in recall for marker in required)
+            and all(marker in capture for marker in capture_required)
+            else set()
+        )
     if probe is ToolSurfaceProbe.OPENCODE_TOOLS:
         return _typescript_operation_tools(
             root / "integrations/opencode/plugins/powercontext/src/index.ts", "operationTool"
@@ -692,6 +842,7 @@ def _is_complete_hook(integration_id: str, event: str, scripts: set[Path]) -> bo
         ("codex", "SessionStart"): "session_binding.py",
         ("codex", "PreToolUse"): "bind_tools.py",
         ("codex", "Stop"): "token_savings.py",
+        ("claude-code", "SessionStart"): "session_start.py",
     }.get((integration_id, event))
     return expected_script is not None and any(
         script.is_file() and script.name == expected_script for script in scripts
@@ -921,6 +1072,12 @@ def render_integration_capability_reference(manifest: IntegrationManifest, local
             "- **Recommended**: Minimal plus Work Contract, Handoff, acknowledgement, and Task Outcome.\n"
             "- **Full**: Recommended plus Experience, Skill, Candidate review, and External Skill.\n\n"
         )
+        lifecycle_heading = "## Pre-compaction lifecycle\n\n"
+        lifecycle_lines = (
+            "- `unsupported`: no maintained public host pre-compaction boundary is available.\n"
+            "- `best_effort`: the public boundary runs bounded checkpoint work, but failure does not stop compaction.\n"
+            "- `required_capable`: an explicit required mode can stop host compaction until the captured Source position is acknowledged.\n\n"
+        )
         matrix_heading = "## Current matrix\n\n"
     else:
         front_matter = (
@@ -936,19 +1093,32 @@ def render_integration_capability_reference(manifest: IntegrationManifest, local
             "- **Recommended**：Minimal 加上 Work Contract、Handoff、acknowledgement 和 Task Outcome。\n"
             "- **Full**：Recommended 加上 Experience、Skill、Candidate review 和 External Skill。\n\n"
         )
+        lifecycle_heading = "## 压缩前生命周期\n\n"
+        lifecycle_lines = (
+            "- `unsupported`：没有受维护的公开宿主压缩前边界。\n"
+            "- `best_effort`：公开边界会执行有界 checkpoint 工作，但失败不会阻止压缩。\n"
+            "- `required_capable`：显式启用 required 模式后，宿主可在捕获的 Source position 获得确认前停止压缩。\n\n"
+        )
         matrix_heading = "## 当前矩阵\n\n"
     availability_lines = [
         f"- **{_AVAILABILITY_LABELS[locale][availability]}**: "
         f"{getattr(manifest.availability_definitions[availability], locale)}"
         for availability in IntegrationAvailability
     ]
-    rows = ["| ID | Kind | Availability | Profiles | Capabilities |", "| --- | --- | --- | --- | --- |"]
+    rows = [
+        "| ID | Kind | Availability | Profiles | Pre-compaction mode | Public surface | Capabilities |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
     for integration in manifest.integrations:
         profiles = ", ".join(profile.value for profile in integration.profiles) or "—"
         capabilities = "<br>".join(capability.value for capability in integration.capabilities) or "—"
+        pre_compaction = integration.lifecycle.pre_compaction if integration.lifecycle is not None else None
+        lifecycle_mode = pre_compaction.mode.value if pre_compaction is not None else "—"
+        lifecycle_surface = pre_compaction.surface if pre_compaction is not None and pre_compaction.surface else "—"
         rows.append(
             f"| {integration.id} | {_KIND_LABELS[locale][integration.kind]} | "
-            f"{_AVAILABILITY_LABELS[locale][integration.availability]} | {profiles} | {capabilities} |"
+            f"{_AVAILABILITY_LABELS[locale][integration.availability]} | {profiles} | {lifecycle_mode} | "
+            f"{lifecycle_surface} | {capabilities} |"
         )
     return (
         front_matter
@@ -956,6 +1126,8 @@ def render_integration_capability_reference(manifest: IntegrationManifest, local
         + "\n\n"
         + profile_heading
         + profile_lines
+        + lifecycle_heading
+        + lifecycle_lines
         + matrix_heading
         + "\n".join(rows)
         + "\n"
@@ -975,8 +1147,11 @@ __all__ = [
     "IntegrationDeclaration",
     "IntegrationEvidence",
     "IntegrationKind",
+    "IntegrationLifecycle",
     "IntegrationManifest",
     "IntegrationToolset",
+    "PreCompactionLifecycle",
+    "PreCompactionMode",
     "SupportProfile",
     "ToolExposure",
     "ToolSurfaceProbe",

@@ -22,7 +22,7 @@ PowerContext Server over HTTP.
 
 ## Install with the PowerContext CLI
 
-WorkBuddy is not listed by `setup select` or `doctor integrations`; use the dedicated setup and diagnostic commands on this page.
+WorkBuddy supports `setup workbuddy`, `config agent workbuddy`, and `doctor workbuddy`, including multi-agent commands.
 
 The CLI installs the hooks, MCP server, and Skill from a local checkout or a
 GitHub source in one step:
@@ -72,7 +72,9 @@ WORKBUDDY_HOOKS_DIR="${WORKBUDDY_HOOKS_DIR:-$HOME/.workbuddy/hooks}"
 mkdir -p "$WORKBUDDY_HOOKS_DIR"
 cp "$PLUGIN"/hooks/workbuddy_powercontext_hook.py \
    "$PLUGIN"/hooks/workbuddy_settings.py \
+   "$PLUGIN"/hooks/powercontext_client_config.py \
    "$PLUGIN"/hooks/prepared_context.py \
+   "$PLUGIN"/hooks/prompt_privacy.py \
    "$WORKBUDDY_HOOKS_DIR"/
 cp "$PLUGIN/scripts/workspace_scope.py" \
    "$WORKBUDDY_HOOKS_DIR/powercontext_scope_binding.py"
@@ -167,12 +169,14 @@ The integration has two paths to the same Server:
 - MCP gives WorkBuddy explicit tools to read and maintain Memory, plus an
   explicit Handoff workflow.
 
-The `powercontext-project-context` Skill binds the two paths together. An imperative such as
-`交接`, `交接当前工作`, or `handoff this work` is treated as explicit
-authorization to create one durable Handoff milestone. The Skill inspects the
-current conversation and repository, calls `handoff_current_work`, then
-immediately commits the returned `handoff` member through `commit_handoff`.
-Preview or design requests remain read-only.
+The `powercontext-project-context` Skill guides explicit work transfers. Ordinary `交接`, `交接当前工作`, or
+`handoff this work` requests inspect the conversation and repository, call `handoff_current_work`, and return the
+complete `handoff` member as a temporary carrier. This records the boundary Source, not a durable Handoff Revision.
+The receiver can continue with `selection: "prepared"` and that exact carrier.
+
+Only an explicit durable request such as `commit a durable handoff` or `保存持久交接里程碑` authorizes passing the
+returned carrier unchanged to `commit_handoff`. A committed milestone requires a successful result with an exact
+Revision. Preview or design requests remain read-only; ordinary transfer does not authorize a commit.
 
 The Hook calls `POST /v1/context/prepare` once per prompt, requests an
 8000-byte total budget, strictly validates `powercontext.prepared-context.v1`,
@@ -309,3 +313,7 @@ message. Verify the whole installation with `powercontext doctor`.
 3. Remove the hook files and the scope resolver from `<WORKBUDDY_HOOKS_DIR>`.
 4. Remove `~/.workbuddy/skills/powercontext-project-context`.
 5. Optionally stop the Server and delete its local data directory.
+
+## Automatic input privacy
+
+See [Automatic prompt privacy](index.md#automatic-prompt-privacy) for this host's capture default, disable control, credential recognition limits and independent read-only query handling. Recognized inputs are skipped for capture; accepted Source content and event identity are not rewritten.

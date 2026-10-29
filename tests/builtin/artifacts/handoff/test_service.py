@@ -29,6 +29,7 @@ from powercontext.builtin.artifacts.handoff import (
     HandoffEvidenceUnavailableError,
     HandoffGenerationUnavailableError,
     HandoffOmission,
+    HandoffRolloverReason,
     HandoffService,
     HandoffSourceCitation,
     HandoffSourceEvidence,
@@ -71,8 +72,10 @@ class _EvidenceResolver:
 class _GenerationPipeline:
     def __init__(self, draft: object) -> None:
         self.draft = draft
+        self.requests = []
 
     async def generate(self, request, /):
+        self.requests.append(request)
         return self.draft
 
 
@@ -278,6 +281,7 @@ def test_prepare_generates_a_draft_from_exact_bounded_evidence() -> None:
         service, _, _ = _service(pipeline)
         action = PrepareHandoff(
             objective=generated.objective,
+            rollover_reasons=("user_requested", "context_quality"),
             evidence=(_citation(),),
             max_bytes=4096,
         )
@@ -285,6 +289,7 @@ def test_prepare_generates_a_draft_from_exact_bounded_evidence() -> None:
         draft = await service.prepare(action)
 
         assert draft == generated
+        assert pipeline.requests[0].rollover_reasons == ("user_requested", "context_quality")
         assert await service.latest() is None
 
     asyncio.run(scenario())
@@ -306,7 +311,7 @@ def test_prepare_requires_a_configured_generation_pipeline() -> None:
 
 
 @pytest.mark.parametrize(
-    ("draft", "max_bytes", "code"),
+    ("draft", "max_bytes", "code", "rollover_reasons"),
     [
         (
             HandoffDraft(
@@ -316,6 +321,7 @@ def test_prepare_requires_a_configured_generation_pipeline() -> None:
             ),
             4096,
             "objective",
+            (),
         ),
         (
             HandoffDraft(
@@ -325,14 +331,40 @@ def test_prepare_requires_a_configured_generation_pipeline() -> None:
             ),
             4096,
             "evidence",
+            (),
         ),
-        (_draft("x" * 1000), 512, "budget"),
+        (_draft("x" * 1000), 512, "budget", ()),
+        (
+            _draft("Blocked on review.", next_action=None),
+            4096,
+            "rollover_next_action",
+            ("user_requested",),
+        ),
+        (
+            _draft("Let us continue the previous work."),
+            4096,
+            "rollover_quality",
+            ("host_compaction",),
+        ),
+        (
+            _draft("Error mapping changed.", next_action="Continue above."),
+            4096,
+            "rollover_quality",
+            ("user_requested",),
+        ),
+        (
+            _draft("Error mapping changed.", next_action="Run tests, then continue above."),
+            4096,
+            "rollover_quality",
+            ("user_requested",),
+        ),
     ],
 )
 def test_prepare_rejects_pipeline_contract_violations(
     draft: HandoffDraft,
     max_bytes: int,
     code: str,
+    rollover_reasons: tuple[HandoffRolloverReason, ...],
 ) -> None:
     async def scenario() -> None:
         service, _, _ = _service(_GenerationPipeline(draft))
@@ -341,12 +373,118 @@ def test_prepare_rejects_pipeline_contract_violations(
             await service.prepare(
                 PrepareHandoff(
                     objective="Complete parser error handling.",
+                    rollover_reasons=rollover_reasons,
                     evidence=(_citation(),),
                     max_bytes=max_bytes,
                 )
             )
 
         assert caught.value.code == code
+
+    asyncio.run(scenario())
+
+
+def test_prepare_allows_transcript_free_rollover_and_unaffected_plain_drafts() -> None:
+    async def scenario() -> None:
+        rollover = _draft("Error mapping changed.")
+        plain = _draft("Blocked on review.", disposition="blocked", next_action=None)
+        checkpoint = _draft("Error mapping changed.", disposition="complete", next_action=None)
+        blocked_rollover = _draft(
+            "Repository access must be granted before work can continue.", disposition="blocked", next_action=None
+        )
+        quoted_objective = 'Reject "continue above" wording in rollover handoffs.'
+        quoted_rollover = _draft("The rollover validator needs a quoted-phrase regression.").model_copy(
+            update={"objective": quoted_objective}
+        )
+        descriptive_state_rollover = _draft(
+            'The validator now rejects "continue above" wording; focused tests passed.', next_action="Run tests."
+        )
+        quoted_next_action_rollover = _draft(
+            "The rollover validator needs a descriptive-action regression.",
+            next_action='Document why "continue above" wording is invalid, then run tests.',
+        )
+
+        prepared = await _service(_GenerationPipeline(rollover))[0].prepare(
+            PrepareHandoff(
+                objective=rollover.objective,
+                rollover_reasons=("user_requested",),
+                evidence=(_citation(),),
+                max_bytes=4096,
+            )
+        )
+        plain_draft = await _service(_GenerationPipeline(plain))[0].prepare(
+            PrepareHandoff(objective=plain.objective, evidence=(_citation(),), max_bytes=4096)
+        )
+        checkpoint_draft = await _service(_GenerationPipeline(checkpoint))[0].prepare(
+            PrepareHandoff(
+                objective=checkpoint.objective,
+                rollover_reasons=("manual_checkpoint",),
+                evidence=(_citation(),),
+                max_bytes=4096,
+            )
+        )
+        blocked_rollover_draft = await _service(_GenerationPipeline(blocked_rollover))[0].prepare(
+            PrepareHandoff(
+                objective=blocked_rollover.objective,
+                rollover_reasons=("user_requested",),
+                evidence=(_citation(),),
+                max_bytes=4096,
+            )
+        )
+        quoted_rollover_draft = await _service(_GenerationPipeline(quoted_rollover))[0].prepare(
+            PrepareHandoff(
+                objective=quoted_objective,
+                rollover_reasons=("user_requested",),
+                evidence=(_citation(),),
+                max_bytes=4096,
+            )
+        )
+        descriptive_state_rollover_draft = await _service(_GenerationPipeline(descriptive_state_rollover))[0].prepare(
+            PrepareHandoff(
+                objective=descriptive_state_rollover.objective,
+                rollover_reasons=("user_requested",),
+                evidence=(_citation(),),
+                max_bytes=4096,
+            )
+        )
+        quoted_next_action_rollover_draft = await _service(_GenerationPipeline(quoted_next_action_rollover))[0].prepare(
+            PrepareHandoff(
+                objective=quoted_next_action_rollover.objective,
+                rollover_reasons=("user_requested",),
+                evidence=(_citation(),),
+                max_bytes=4096,
+            )
+        )
+
+        assert prepared == rollover
+        assert plain_draft == plain
+        assert checkpoint_draft == checkpoint
+        assert blocked_rollover_draft == blocked_rollover
+        assert quoted_rollover_draft == quoted_rollover
+        assert descriptive_state_rollover_draft == descriptive_state_rollover
+        assert quoted_next_action_rollover_draft == quoted_next_action_rollover
+
+    asyncio.run(scenario())
+
+
+def test_rollover_reasons_do_not_change_content_identity() -> None:
+    async def scenario() -> None:
+        pipeline = _GenerationPipeline(_draft("Error mapping changed."))
+        service, _, _ = _service(pipeline)
+
+        manual = await service.prepare(
+            PrepareHandoff(objective="Complete parser error handling.", evidence=(_citation(),), max_bytes=4096)
+        )
+        rollover = await service.prepare(
+            PrepareHandoff(
+                objective="Complete parser error handling.",
+                rollover_reasons=("user_requested", "delegation"),
+                evidence=(_citation(),),
+                max_bytes=4096,
+            )
+        )
+
+        assert rollover.as_content() == manual.as_content()
 
     asyncio.run(scenario())
 

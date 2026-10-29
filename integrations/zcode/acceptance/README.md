@@ -3,10 +3,37 @@
 This suite runs an existing ZCode CLI bundle against a real PowerContext Server and a disposable SQLite database.
 It does not download a host, deploy a remote service, or operate the desktop UI.
 
+## Continuous integration
+
+[ZCode acceptance](../../../.github/workflows/zcode-acceptance.yml) runs on every pull request, every push to master,
+weekly on Sunday at 03:23 UTC, and by manual dispatch. It builds the actual open-source CLI on Windows from ZCode commit
+`29628c9acdb81b703bbd4080c207a0e7ce5e276e` (ZCode 3.14.3 / CLI 0.16.9), using Node 24.21.0, pnpm 10.33.2 and the
+host's frozen lockfile. Dependency install scripts are disabled; only the CLI and its required workspace builds run.
+
+Node 24.21.0 includes the [Windows shutdown fix](https://github.com/nodejs/node/pull/61999) for a delayed worker task
+posting to a closing libuv async handle, and the [file-watcher fix](https://github.com/nodejs/node/pull/65118) for a
+separate path assertion in Node 24.16.0–24.20.0. Both faults can abort with `0xC0000409`; the async-handle fault can occur
+after emitting a CLI result. The acceptance requires a zero process exit code for every invocation.
+
+The job runs all plugin Node tests, including the actual host test, then explicitly selects two independent
+controlled-model acceptances covering P3-01 through P3-09. Host build errors, missing prerequisites and failed scenarios
+fail the job. The controlled inference fixtures need no model keys or repository secrets. This is actual CLI + real
+Server acceptance with controlled inference; it does not establish live-model or official desktop acceptance.
+
+The artifact `zcode-controlled-<run-id>-<attempt>` retains build provenance, each run's `summary.json` and only selected
+`evidence/*.json` for 14 days, including completed evidence from failed runs. Private profiles, model configuration,
+databases, workspaces and raw transcripts are excluded. The Actions summary lists individual scenario results.
+P3-10 stays `not_run`; compact and reconnect limitations remain explicit in the evidence.
+
+To upgrade the supported host, change `ZCODE_REF` in the workflow to an exact reviewed commit, check its Node/pnpm and
+build requirements, and run the complete job. Keep the host pin and this guide consistent. Scheduled runs check the
+fixed host against current master and dependency availability; they do not silently adopt newer ZCode releases.
+
 ## Prerequisites
 
 - Install this checkout with its development dependencies and Server extras.
-- Build the open-source ZCode CLI separately; Node 24 or later must be on PATH.
+- Build the open-source ZCode CLI separately; Node 24 or later must be on PATH. On Windows, use the patched Node
+  24.21.0 runtime pinned by CI.
 - Use a directory writable by the same Windows user that runs Node and Python. An inaccessible plugin directory
   is an installation failure, even when its path appears in `plugins.dirs`.
 - Keep `.powercontext/` ignored by Git. A run's profile contains private model configuration and may contain
@@ -63,13 +90,17 @@ Each run writes `.powercontext/zcode-acceptance/<run-id>/summary.json` with sche
 Missing prerequisites, rejected model requests, timeouts and failed assertions exit nonzero. Daily pytest runs deselect
 these tests. Deselection and unsupported features are not acceptance success.
 
+For a nonzero prompt-process exit, `host_process_exit` in the summary retains the return code, the number of result
+complete result events already emitted, and the fixed `libuv_async_handle_closing` or `libuv_fs_event_path_mismatch`
+signature when present. Raw stderr is excluded. A truncated frame from a crashed process does not hide its exit code.
+
 | Scenario | Evidence |
 | --- | --- |
 | P3-01 | Managed installation, upgrade preservation and actual CLI discovery |
 | P3-02 | Missing/wrong Bearer rejection and successful native MCP reads |
 | P3-03 | Hook Source, scheduler Memory with Source citation, fresh session recall |
 | P3-04 | Explicit/session/workspace/default priority; separate workspace, profile and endpoint ownership |
-| P3-05 | Memory revision conflict; exact nullable Handoff, Receipt and Outcome association |
+| P3-05 | Atomic Memory content ETag conflict; exact nullable Handoff, Receipt and Outcome association |
 | P3-06 | Unchanged inspection, stale approval rejection and separately authorized current approval |
 | P3-07 | Delayed accepted response, concurrent CLI sessions, unavailable runtime directory |
 | P3-08 | Actual startup/resume/compact; default and opt-in Stop behavior |
@@ -87,6 +118,9 @@ No explicit `remember_memory` or manual `flush_memory` is allowed to substitute 
 Core success requires P3-01 through P3-09. Lifecycle subfeatures are reported separately: a successful `/compact` command
 does not imply `SessionStart(compact)` was emitted. The optional HTTPS scenario does not block local core acceptance;
 SSH forwarding must be described as forwarding, not direct remote-port HTTPS.
+
+The recorded live-model and desktop Memory checks used the legacy collection/entry contract. They do not establish
+current Atomic Memory behavior; repeat those Memory checks before claiming qualification for the current contract.
 
 On Windows with Node 24.15.0 and CLI 0.16.9, the local core suite passed two independent controlled-model runs and
 two independent live-model runs. Live runs used GLM-5.3 for the host and `openai-chat:glm-5.3-flash` for Generation.

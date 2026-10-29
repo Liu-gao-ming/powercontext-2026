@@ -224,6 +224,75 @@ def test_anthropic_custom_endpoint_uses_standard_environment_api_key(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "authorization",
+    ["Bearer gateway-token", "Basic Z2F0ZXdheTpnd2F5LXRva2Vu"],
+)
+def test_anthropic_custom_endpoint_with_authorization_header_omits_api_key_header(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authorization: str,
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    async def scenario() -> None:
+        with _model_server() as (server, base_url):
+            config = BuiltinConfig(
+                database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
+                inference=InferenceConfig(
+                    generation_model="anthropic:tiny-generator",
+                    generation_base_url=AnyHttpUrl(base_url.removesuffix("/v1")),
+                    generation_headers={
+                        "Authorization": SecretStr(authorization),
+                        "hll-appid": SecretStr("ios-lma-svc"),
+                    },
+                ),
+            )
+
+            async with open_builtin_runtime(config) as runtime:
+                readiness = await runtime.readiness()
+
+            assert readiness.checks["inference.generation"] == "ready"
+            assert server.requests
+            request = server.requests[0]
+            assert request["path"] == "/v1/messages"
+            assert "x-api-key" not in request["headers"]
+            assert request["headers"]["authorization"] == authorization
+            assert request["headers"]["hll-appid"] == "ios-lma-svc"
+
+    asyncio.run(scenario())
+
+
+def test_anthropic_custom_endpoint_with_bearer_header_keeps_environment_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-standard-key")
+
+    async def scenario() -> None:
+        with _model_server() as (server, base_url):
+            config = BuiltinConfig(
+                database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'runtime.db'}"),
+                inference=InferenceConfig(
+                    generation_model="anthropic:tiny-generator",
+                    generation_base_url=AnyHttpUrl(base_url.removesuffix("/v1")),
+                    generation_headers={"Authorization": SecretStr("Bearer gateway-token")},
+                ),
+            )
+
+            async with open_builtin_runtime(config) as runtime:
+                readiness = await runtime.readiness()
+
+            assert readiness.checks["inference.generation"] == "ready"
+            assert server.requests
+            request = server.requests[0]
+            assert request["path"] == "/v1/messages"
+            assert request["headers"]["x-api-key"] == "anthropic-standard-key"
+            assert request["headers"]["authorization"] == "Bearer gateway-token"
+
+    asyncio.run(scenario())
+
+
 def test_generation_embedding_and_llm_rerank_models_receive_their_own_settings(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

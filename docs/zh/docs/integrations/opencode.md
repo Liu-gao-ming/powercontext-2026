@@ -60,6 +60,17 @@ HTTPS 证书校验仍然启用。安装与持久化同意见[连接远程 Server
 
 ## 验证安装
 
+### 恢复失败的更新
+
+如果 setup 报告无法恢复某个目标，请保留报错中列出的备份，按报错路径还原对应目标后再重试。
+目标缺失且仍有备份时，setup 不会将其当成首次安装。
+
+如果已有当前 Skill 或多个备份，先比较并整理内容，再选择要保留的版本。请保留个人文件及管理区域外的笔记；
+仅为绕过检查而删除备份可能丢失这些内容。恢复后重新执行 setup，并运行下面的检查。
+恢复覆盖可捕获的文件操作失败，不保证进程崩溃或并发安装时的恢复。
+
+### 检查插件
+
 ```bash
 powercontext doctor
 powercontext doctor opencode
@@ -67,3 +78,7 @@ powercontext doctor opencode
 
 集成专用 doctor 会检查 OpenCode 版本、解析后的插件配置和 PowerContext 所有的 Skill。Server 状态由默认
 doctor 单独检查；Server 不可用不会阻止 OpenCode 正常工作。
+
+## 自动输入隐私
+
+本宿主的捕获默认值、关闭方式、凭据识别局限及独立只读查询行为见[自动 prompt 隐私策略](index.md#自动-prompt-隐私策略)。识别到凭据的输入会跳过捕获，已接受的 Source 正文和事件身份不被改写。

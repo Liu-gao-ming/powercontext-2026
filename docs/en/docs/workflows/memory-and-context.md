@@ -23,13 +23,15 @@ Host tool names differ; see [Connect Agents](../integrations/index.md). The
 
 FTS uses the same query terms for candidate retrieval and admission. Query normalization excludes common English
 function words in longer queries and recognizes standalone execution instructions accompanying a question, such as
-"Use only supplied context" and "Do not call tools, read files, inspect old sessions, or delegate." Those instructions
+"Use only supplied context", "Do not call tools, read files, inspect old sessions, or delegate", and "Answer briefly
+and cite the artifact reference from the provided context. If no reliable context is present, say so." Those instructions
 cannot supply evidence for an unrelated fact. Explicitly quoted terms remain searchable, including function words
 used as identifiers such as `"AND" "OR" precedence`. Domain-specific directives and unrecognized wording remain searchable;
 this is a conservative lexical rule, not a general intent classifier. The default threshold requires 25% of all
 remaining distinct terms, with a minimum of two matches; one- or two-term queries require one match. Direct search and
 prepared context share this rule, including when the optional recall gate relaxes the threshold. Stored text and
 vector queries are unchanged, and matching words alone do not establish semantic relevance.
+When the entire query consists of execution instructions, its terms remain searchable so a caller can find that policy.
 
 ## Automatic context and extraction
 

@@ -73,21 +73,22 @@ def _environment_url(*names: str) -> str | None:
 
 
 def _codex_url() -> str | None:
-    cache = _home("CODEX_HOME", ".codex") / "plugins" / "cache"
-    try:
-        paths = list(cache.glob("*/powercontext/*/.mcp.json"))
-    except OSError:
-        raise ValueError(_UNKNOWN) from None
-    urls = set()
-    for path in paths:
-        entry = _object_at(_read(path), "mcpServers", "powercontext")
-        raw = entry.get("url")
-        if not isinstance(raw, str) or not raw.rstrip("/").endswith("/mcp"):
-            raise ValueError(_UNKNOWN)
-        urls.add(_url(raw))
-    if len(urls) > 1:
-        raise ValueError("Cannot determine the active PowerContext endpoint from multiple Codex cache versions")  # noqa: TRY003
-    return next(iter(urls), None)
+    from powercontext.cli.system import _installed_codex_plugin
+
+    if not (_home("CODEX_HOME", ".codex") / "plugins/cache").is_dir():
+        return None
+    plugin = _installed_codex_plugin()
+    if plugin is None:
+        return None
+    path = (
+        _home("CODEX_HOME", ".codex")
+        / "plugins/cache"
+        / plugin["marketplaceName"]
+        / "powercontext"
+        / plugin["version"]
+        / ".mcp.json"
+    )
+    return _url(_object_at(_read(path), "mcpServers", "powercontext").get("url"))
 
 
 def _native_settings(host: str, dsh_target: DshTarget | None = None) -> tuple[dict[str, Any], str, str]:
@@ -101,6 +102,14 @@ def _native_settings(host: str, dsh_target: DshTarget | None = None) -> tuple[di
             ),
             "baseUrl",
             "allowInsecureHttp",
+        )
+    if host == "kimi-code":
+        from powercontext.cli.kimi_code import kimi_home
+
+        return (
+            _read(kimi_home() / "plugins/managed/powercontext/powercontext.json"),
+            "server_url",
+            "allow_insecure_http",
         )
     if host == "claude-code":
         settings = _object_at(
@@ -158,7 +167,7 @@ def _selected_url(host: str, prefix: str, native_url: str | None) -> str:
         return _environment_url(prefix + "_BASE_URL") or native_url or common_url or fallback
     if host == "workbuddy":
         return _environment_url(prefix + "_SERVER_URL") or common_url or fallback
-    if host == "zcode":
+    if host in {"zcode", "kimi-code"}:
         return native_url or _environment_url(prefix + "_SERVER_URL") or _DEFAULT_URL
     return environment_url or common_url or native_url or fallback
 

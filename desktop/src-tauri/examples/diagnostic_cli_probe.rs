@@ -17,11 +17,52 @@
 #[cfg(windows)]
 #[tokio::main]
 async fn main() {
-    use powercontext_desktop::diagnostics::{DiagnosticKind, LocalDiagnostics};
-    let path = std::env::args_os()
-        .nth(1)
-        .expect("isolated fixture registration");
-    let diagnostics = LocalDiagnostics::new(path.into());
+    use powercontext_desktop::{
+        diagnostics::{DiagnosticKind, LocalDiagnostics},
+        error::SafeError,
+    };
+    use sha2::{Digest, Sha256};
+    // A copied probe is a synthetic CLI whose diagnostic protocol works without --version.
+    let probe = std::env::current_exe().unwrap();
+    if probe.file_name().and_then(|name| name.to_str()) == Some("powercontext.exe") {
+        if std::env::args().skip(1).collect::<Vec<_>>() == ["service", "status", "--json"] {
+            println!(
+                "{}",
+                serde_json::json!({"support":"supported","registration":"not_installed",
+                "definition":"unknown","manager_ownership":"unknown","manager":"unknown",
+                "server_liveness":"unknown"})
+            );
+        } else {
+            std::process::exit(1);
+        }
+        return;
+    }
+    let path = std::path::PathBuf::from(
+        std::env::args_os()
+            .nth(1)
+            .expect("isolated fixture registration"),
+    );
+    let registration: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read isolated registration"))
+            .expect("parse isolated registration");
+    let invalid_directory = tempfile::tempdir().expect("isolated invalid registrations");
+    assert!(
+        registration.get("version").is_none(),
+        "registration must not require a version"
+    );
+    let mut invalid = registration.clone();
+    invalid["sha256"] = "0".repeat(64).into();
+    let invalid_path = invalid_directory.path().join("digest.json");
+    std::fs::write(&invalid_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert_eq!(
+        LocalDiagnostics::new(invalid_path)
+            .run(DiagnosticKind::Service)
+            .await
+            .unwrap_err(),
+        SafeError::CompatibilityUnverified,
+        "mismatched digest must remain rejected"
+    );
+    let diagnostics = LocalDiagnostics::new(path);
     let service = diagnostics
         .run(DiagnosticKind::Service)
         .await
@@ -36,10 +77,47 @@ async fn main() {
             .iter()
             .any(|v| v.field == "registration" && v.status == "not_installed")
     );
-    assert_eq!(integrations.hosts.len(), 8);
+    assert_eq!(integrations.hosts.len(), 10);
+    let mut legacy = registration.clone();
+    legacy["version"] = "0.0.0".into();
+    let legacy_path = invalid_directory.path().join("legacy.json");
+    std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let legacy_service = LocalDiagnostics::new(legacy_path)
+        .run(DiagnosticKind::Service)
+        .await
+        .unwrap();
+    assert_eq!(legacy_service.items, service.items);
+    assert_eq!(legacy_service.cli_version, service.cli_version);
+
+    let synthetic_executable = invalid_directory.path().join("powercontext.exe");
+    std::fs::copy(probe, &synthetic_executable).unwrap();
+    let synthetic_registration = invalid_directory.path().join("unavailable-version.json");
+    std::fs::write(
+        &synthetic_registration,
+        serde_json::to_vec(&serde_json::json!({
+            "executable":synthetic_executable,
+            "sha256":format!("{:x}", Sha256::digest(std::fs::read(&synthetic_executable).unwrap())),
+            "source":"explicit_local_installation"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let synthetic_report = LocalDiagnostics::new(synthetic_registration)
+        .run(DiagnosticKind::Service)
+        .await
+        .unwrap();
+    assert_eq!(synthetic_report.cli_version, None);
+    assert!(
+        synthetic_report
+            .items
+            .iter()
+            .any(|item| item.field == "registration" && item.status == "not_installed")
+    );
     println!(
         "{}",
-        serde_json::json!({"service":service,"integrations":integrations})
+        serde_json::json!({"service":service,"integrations":integrations,
+            "registrationChecks":{"versionlessRegistrationAccepted":true,"legacyVersionIgnored":true,
+                "digestMismatchRejected":true,"unavailableVersionDoesNotBlock":true}})
     );
 }
 #[cfg(not(windows))]

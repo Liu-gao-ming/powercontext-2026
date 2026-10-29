@@ -270,6 +270,7 @@ def test_code_tracing_exports_stale_query_as_error_without_source_text(repositor
         assert len(failed) == 1
         assert failed[0].attributes is not None
         assert failed[0].attributes["powercontext.code.reason"] == "code_changed"
+        assert failed[0].attributes["powercontext.error.category"] == "conflict"
         attributes = repr([dict(span.attributes or {}) for span in spans])
         assert "private" not in attributes
         assert str(root) not in attributes
@@ -758,7 +759,8 @@ def test_http_client_mcp_and_prepared_code_share_freshness(repository, tmp_path)
         settings=ServerSettings(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'http.db'}"),
             code=code,
-        )
+        ),
+        scheduler_path=tmp_path / "bootstrap-scheduler.db",
     )
 
     def http_client(headers=None, timeout=None, auth=None, **_):
@@ -773,6 +775,9 @@ def test_http_client_mcp_and_prepared_code_share_freshness(repository, tmp_path)
 
     async def exercise():
         nonlocal app
+        # Initialize Server-owned storage before seeding it through the SDK.
+        async with app.router.lifespan_context(app):
+            pass
         database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'http.db'}")
         async with open_builtin_runtime(
             BuiltinConfig(database=database), scheduler_path=tmp_path / "scheduler.db"

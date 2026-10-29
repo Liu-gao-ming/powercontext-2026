@@ -1,3 +1,5 @@
+
+<!-- POWERCONTEXT-GUIDANCE:START -->
 # Scope and memory
 
 ## Resolve and discover Scopes
@@ -44,3 +46,4 @@ Use restoration previews/restorations for an explicitly requested recovery; a me
 chain. Legacy `revise_memory_entry` and `retire_memory_entry` are not current MCP operations.
 
 See [examples.json](examples.json) for request examples. Replace placeholder Scope values with server-returned IDs.
+<!-- POWERCONTEXT-GUIDANCE:END -->

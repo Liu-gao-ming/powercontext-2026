@@ -30,7 +30,7 @@ import {
 } from './errors.ts'
 import { OPERATIONS, type OperationId } from './operations.generated.ts'
 import { MemoryOperationError, requestMemoryOperation } from './memory-operations.ts'
-import { containsSecret } from './secrets.ts'
+import { hasSecretContent } from './secrets.ts'
 
 export interface ToolResult extends BodyFailureDetails {
   ok: boolean
@@ -43,14 +43,6 @@ export interface ToolResult extends BodyFailureDetails {
   data?: unknown
   details?: Record<string, unknown>
 }
-
-const WRITE_OPS = new Set<OperationId>([
-  'remember_memory',
-  'capture_content_source',
-  'revise_memory_entry',
-  'replace_artifact',
-  'change_atomic_memory_lifecycle',
-])
 
 export function toolResultSchema(): Record<string, unknown> {
   return {
@@ -232,12 +224,6 @@ function encodeSuccess(result: Awaited<ReturnType<PowerContextClient['request']>
     ...(result.etag === undefined ? {} : { etag: result.etag }), data: result.value }
 }
 
-function hasSecret(value: unknown): boolean {
-  if (typeof value === 'string') return containsSecret(value)
-  if (Array.isArray(value)) return value.some(hasSecret)
-  return Boolean(value && typeof value === 'object' && Object.values(value).some(hasSecret))
-}
-
 export async function invokeOperation(
   client: PowerContextClient,
   operationId: string,
@@ -249,7 +235,7 @@ export async function invokeOperation(
   if (!(operationId in OPERATIONS)) return toToolResult(new UnknownOperationError(operationId))
   const id = operationId as OperationId
   const body = injectScope(id, payload, scopeId)
-  if (WRITE_OPS.has(id) && hasSecret(body)) {
+  if (hasSecretContent(id, body)) {
     return toToolResult(new SecretRejectedError())
   }
   try {

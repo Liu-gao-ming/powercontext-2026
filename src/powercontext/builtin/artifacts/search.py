@@ -16,80 +16,118 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass
-from itertools import pairwise
+from functools import lru_cache
+from hashlib import sha256
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from powercontext.artifacts.search import ChannelScore
 
+if TYPE_CHECKING:
+    import jieba
+
 _FTS_MIN_QUERY_COVERAGE = 0.25
 _FTS_MIN_MATCHED_TERMS = 2
 _FTS_SHORT_QUERY_MAX_TERMS = 2
 _MIN_SEMANTIC_SIMILARITY = 0.3
+# Reject subnormal normalized weights. This conservative boundary leaves
+# headroom for RRF division and prevents more extreme ratios from underflowing.
+_MIN_NORMALIZED_RECALL_CHANNEL_WEIGHT = sys.float_info.min
 
-# Query-only normalization: persisted Analyzer v1 projections remain unchanged. Negations
-# are deliberately absent; domain constraints such as "without a backup" remain evidence.
-_QUERY_FUNCTION_WORDS = frozenset([
-    "a",
-    "an",
-    "the",
-    "and",
-    "or",
-    "for",
-    "of",
-    "to",
-    "in",
-    "on",
-    "at",
-    "by",
-    "from",
-    "with",
-    "as",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "being",
-    "what",
-    "which",
-    "who",
-    "how",
-    "why",
-    "when",
-    "where",
-    "do",
-    "does",
-    "did",
-    "can",
-    "could",
-    "should",
-    "would",
-    "i",
-    "we",
-    "you",
-    "it",
-    "its",
-    "our",
-    "your",
-    "this",
-    "that",
-    "these",
-    "those",
-    "please",
+_NEGATIONS = frozenset([
+    "no",
+    "not",
+    "never",
+    "neither",
+    "nor",
+    "without",
+    "cannot",
+    "can't",
+    "don't",
+    "doesn't",
+    "didn't",
+    "won't",
+    "shan't",
+    "wouldn't",
+    "shouldn't",
+    "couldn't",
+    "mustn't",
+    "daren't",
+    "needn't",
+    "oughtn't",
+    "mightn't",
+    "isn't",
+    "aren't",
+    "wasn't",
+    "weren't",
+    "hasn't",
+    "haven't",
+    "hadn't",
+    "不",
+    "没",
+    "没有",
+    "未",
+    "无",
+    "非",
+    "别",
+    "莫",
+    "勿",
+    "不要",
+    "不能",
+    "不得",
+    "无需",
+    "不必",
+    "不是",
+    "并非",
 ])
-_QUOTED_QUERY_TEXT = re.compile(r"""(`[^`]*`|"[^"]*"|“[^”]*”|‘[^’]*’|(?<!\w)'[^']*'(?!\w))""")  # noqa: RUF001
+_HAN_RANGES = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f"
+_LEXICAL_RUN = re.compile(rf"([{_HAN_RANGES}]+)|[^{_HAN_RANGES}]+")
+_WORD = re.compile(r"\w+(?:['’]\w+)*")  # noqa: RUF001 - normalize typographic apostrophes within words.
+
+
+@lru_cache(maxsize=1)
+def _query_stopwords() -> frozenset[str]:
+    data = Path(__file__).with_name("lexical_data")
+    return (
+        frozenset(
+            unicodedata.normalize("NFC", word).casefold()
+            for name in ("en.txt", "zh.txt")
+            for word in (data / name).read_text(encoding="utf-8").split()
+        )
+        - _NEGATIONS
+    )
+
+
+@lru_cache(maxsize=1)
+def _tokenizer() -> jieba.Tokenizer:
+    import jieba
+
+    jieba.default_logger.setLevel(logging.WARNING)
+    return jieba.Tokenizer()
+
+
+_QUOTED_QUERY_TEXT = re.compile(
+    r"""(`[^`]*`|"[^"]*"|“[^”]*”|‘(?:[^‘’]|(?<=\w)’(?=\w))*’|"""  # noqa: RUF001
+    r"""(?<!\w)'(?:[^']|(?<=\w)'(?=\w))*'(?!\w))"""
+)
 _EXECUTION_SENTENCE = re.compile(
     r"(?:use only (?:the )?(?:(?:context|evidence|information) (?:already )?"
     r"(?:supplied|provided|available)(?: to you)?|(?:supplied|provided|available) (?:context|evidence|information))"
-    r"|answer (?:concisely|briefly)(?: using (?:the )?(?:available|supplied|provided) evidence)?"
+    r"|answer (?:concisely|briefly)(?: using (?:the )?(?:available|supplied|provided) evidence"
+    r"| and (?:cite|identify) (?:the )?(?:artifact|source|evidence) references?"
+    r" from (?:the )?(?:available|supplied|provided) context)?"
     r"|if (?:the )?(?:facts|evidence|information) (?:are|is) (?:absent|missing|unavailable), "
-    r"(?:say|answer|respond with) unknown)"
+    r"(?:say|answer|respond with) unknown"
+    r"|if no (?:reliable )?(?:context|evidence|information) is (?:present|available), "
+    r"(?:say so|(?:say|answer|respond with) unknown))"
 )
 _EXECUTION_ACTION = re.compile(
     r"(?:(?:call|invoke|use) (?:any |external |available )?tools"
@@ -187,15 +225,59 @@ def unit_l2_cosine_similarity(distance: float) -> float:
 
 
 @dataclass(frozen=True)
+class RecallChannelWeights:
+    """Normalized relative weights for lexical and semantic recall channels.
+
+    Inputs express a ratio. The stored weights have a mean of one, so scaling both
+    configured values by the same factor cannot change a public RRF score.
+    """
+
+    fts: float = 1.0
+    vector: float = 1.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.fts, bool) or isinstance(self.vector, bool):
+            raise TypeError("recall channel weights must be numbers")  # noqa: TRY003
+        if not math.isfinite(self.fts) or not math.isfinite(self.vector):
+            raise ValueError("recall channel weights must be finite")  # noqa: TRY003
+        if self.fts < 0.0 or self.vector < 0.0:
+            raise ValueError("recall channel weights must be non-negative")  # noqa: TRY003
+        total = self.fts + self.vector
+        if not math.isfinite(total):
+            raise ValueError("recall channel weight total must be finite")  # noqa: TRY003
+        if total <= 0.0:
+            raise ValueError("at least one recall channel weight must be positive")  # noqa: TRY003
+        # Divide each input before scaling so a finite, positive subnormal total
+        # cannot overflow through an intermediate ``2.0 / total`` value.
+        normalized_fts = 2.0 * (self.fts / total)
+        normalized_vector = 2.0 * (self.vector / total)
+        if not math.isfinite(normalized_fts) or not math.isfinite(normalized_vector):
+            raise ValueError("normalized recall channel weights must be finite")  # noqa: TRY003
+        if (self.fts > 0.0 and normalized_fts < _MIN_NORMALIZED_RECALL_CHANNEL_WEIGHT) or (
+            self.vector > 0.0 and normalized_vector < _MIN_NORMALIZED_RECALL_CHANNEL_WEIGHT
+        ):
+            raise ValueError(  # noqa: TRY003
+                "normalized non-zero recall channel weights must be at least "
+                "the smallest normal IEEE 754 binary64 value"
+            )
+        object.__setattr__(self, "fts", normalized_fts)
+        object.__setattr__(self, "vector", normalized_vector)
+
+
+DEFAULT_RECALL_CHANNEL_WEIGHTS = RecallChannelWeights()
+
+
+@dataclass(frozen=True)
 class AdmissionCounts:
     """Per-family, per-scope admission accounting for one search.
 
-    ``retrieved`` is what the backend returned *before* the admission floor was applied;
-    ``admitted`` is what survived it. A family may also provide ``rejected`` when those two
-    counts are not measured on a comparable basis, for example when the trace keeps an
-    unbounded pre-admission count but the delivered candidate pool is capped. ``rejected``
-    is the number of same-search candidates rejected by the admission floor, excluding
-    candidate-pool truncation.
+    ``retrieved`` counts candidates actually observed by this search, including
+    any bounded rejection evidence. ``admitted`` counts observed candidates that
+    pass the floor. These are not collection totals. A Family may provide
+    ``rejected`` when the two observations use different bounded pools; it counts
+    actual rejection evidence, excluding candidate-pool truncation. Topic FTS
+    observes at most one rejected Topic per channel; Experience observes at most
+    one rejected match in its ranked prefix. Both support recovery planning without collection counts.
 
     These are plain aggregate integers with no candidate identity, no query text and no
     per-entry attribution, so the value is safe to carry in a trace and safe to hand to the
@@ -215,35 +297,34 @@ class AdmissionCounts:
 
 
 def analyze_text(value: str) -> str:
-    """Apply Analyzer v1 and return space-delimited backend-safe terms."""
+    """Analyze document words without filtering stopwords or losing word frequency."""
 
     return " ".join(term for term, _start, _end in analyze_text_with_spans(value))
 
 
-def analyze_fts_query(value: str) -> str:
-    """Extract lexical evidence terms without changing stored text or semantic queries.
-
-    Recognize only standalone, generic English execution instructions accompanying other
-    query content. Preserve quoted text, domain-specific directives and unknown phrasing.
-    Unquoted function words cannot supply the sole overlap during a relaxed recall-gate round.
-    """
-
+def lexical_query_words(value: str) -> tuple[str, ...]:
+    """Filter unquoted stopwords while retaining quoted identifiers and negation."""
     content: list[str] = []
-    quoted_terms: set[str] = set()
     for index, part in enumerate(_QUOTED_QUERY_TEXT.split(unicodedata.normalize("NFC", value).casefold())):
         if index % 2:
-            content.append(part)
-            quoted_terms.update(analyze_text(part).split())
+            content.extend(word for word, _start, _end in lexical_terms_with_spans(part[1:-1]))
         else:
             sentences = re.split(r"(?<=[.!?])\s+|\n+", part)
-            content.extend(sentence for sentence in sentences if not _is_execution_sentence(sentence))
-    # A search consisting solely of a directive may be looking up that very policy.
-    terms = analyze_text(" ".join(content) if any(sentence.strip() for sentence in content) else value).split()
-    if len(set(terms)) > _FTS_SHORT_QUERY_MAX_TERMS:
-        meaningful = [term for term in terms if term in quoted_terms or term not in _QUERY_FUNCTION_WORDS]
-        if meaningful:
-            terms = meaningful
-    return " ".join(terms)
+            content.extend(
+                word
+                for sentence in sentences
+                if not _is_execution_sentence(sentence)
+                for word, _start, _end in lexical_terms_with_spans(sentence)
+                if word not in _query_stopwords()
+            )
+    if not content and _is_execution_sentence(" ".join(value.casefold().split())):
+        content = [word for word, _start, _end in lexical_terms_with_spans(value) if word not in _query_stopwords()]
+    return tuple(content)
+
+
+def analyze_fts_query(value: str) -> str:
+    """Analyze query evidence with the same word encoding as stored projections."""
+    return " ".join(_encode_term(word) for word in lexical_query_words(value))
 
 
 def _is_execution_sentence(value: str) -> bool:
@@ -257,48 +338,31 @@ def _is_execution_sentence(value: str) -> bool:
     return False
 
 
-def analyze_text_with_spans(value: str) -> tuple[tuple[str, int, int], ...]:
-    """Return Analyzer v1 terms with offsets in the NFC+casefold text."""
-
+def lexical_terms_with_spans(value: str) -> tuple[tuple[str, int, int], ...]:
+    """Segment Chinese with Jieba, retaining Latin identifiers and normalized offsets."""
     normalized = unicodedata.normalize("NFC", value).casefold()
     terms: list[tuple[str, int, int]] = []
-    word_start: int | None = None
-    cjk: list[tuple[str, int]] = []
-
-    def flush_word(end: int) -> None:
-        nonlocal word_start
-        if word_start is not None:
-            terms.append((normalized[word_start:end], word_start, end))
-            word_start = None
-
-    def flush_cjk() -> None:
-        if not cjk:
-            return
-        terms.extend((f"u_{ord(character):x}", position, position + 1) for character, position in cjk)
-        terms.extend(
-            (
-                f"b_{ord(left[0]):x}_{ord(right[0]):x}",
-                left[1],
-                right[1] + 1,
-            )
-            for left, right in pairwise(cjk)
-        )
-        cjk.clear()
-
-    for position, character in enumerate(normalized):
-        if _is_cjk(character):
-            flush_word(position)
-            cjk.append((character, position))
-        elif character.isalnum() or character == "_":
-            flush_cjk()
-            if word_start is None:
-                word_start = position
+    for run in _LEXICAL_RUN.finditer(normalized):
+        if run[1] is not None:
+            words = _tokenizer().tokenize(run[0], HMM=False)
         else:
-            flush_word(position)
-            flush_cjk()
-    flush_word(len(normalized))
-    flush_cjk()
+            words = ((word[0].replace("’", "'"), word.start(), word.end()) for word in _WORD.finditer(run[0]))  # noqa: RUF001
+        terms.extend((word, run.start() + start, run.start() + end) for word, start, end in words)
     return tuple(terms)
+
+
+def _encode_term(word: str) -> str:
+    # Keep ordinary Latin words compatible. Encode terms that unicode61/SPACE
+    # would split or discard, and escape literal identifiers using our prefixes.
+    if word.isascii() and word.isalnum() and 3 <= len(word) <= 80 and not word.startswith(("pcu", "pch")):
+        return word
+    raw = word.encode("utf-8")
+    return "pcu" + raw.hex() if len(raw) <= 40 else "pch" + sha256(raw).hexdigest()
+
+
+def analyze_text_with_spans(value: str) -> tuple[tuple[str, int, int], ...]:
+    """Return backend-safe words and offsets in NFC+casefold text."""
+    return tuple((_encode_term(word), start, end) for word, start, end in lexical_terms_with_spans(value))
 
 
 def fts_query_requirements(value: str, /, *, floor: AdmissionFloor | None = None) -> tuple[tuple[str, ...], int]:
@@ -343,20 +407,13 @@ def admits_fts_text(query: str, text: str, /, *, floor: AdmissionFloor | None = 
     shared admission requirement exactly as ``fts_query_requirements`` documents.
     """
 
+    return admits_fts_projection(query, analyze_text(text), floor=floor)
+
+
+def admits_fts_projection(query: str, projection: str, /, *, floor: AdmissionFloor | None = None) -> bool:
+    """Apply admission to already analyzed words without treating them as raw text."""
     query_terms, required_matches = fts_query_requirements(query, floor=floor)
-    if not query_terms:
-        return False
-    return len(set(query_terms).intersection(analyze_text(text).split())) >= required_matches
-
-
-def _is_cjk(character: str) -> bool:
-    point = ord(character)
-    return (
-        0x3400 <= point <= 0x4DBF
-        or 0x4E00 <= point <= 0x9FFF
-        or 0xF900 <= point <= 0xFAFF
-        or 0x20000 <= point <= 0x2FA1F
-    )
+    return bool(query_terms) and len(set(query_terms).intersection(projection.split())) >= required_matches
 
 
 __all__ = [

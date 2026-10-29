@@ -110,8 +110,8 @@ def test_docs_expose_a_non_loopback_bind_command() -> None:
 def test_documented_server_run_command_starts(command: _DocumentedServerRun, monkeypatch: pytest.MonkeyPatch) -> None:
     run_server = Mock()
     monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
-    monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
-    monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: Mock())
+    monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config, **_kwargs: None)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config, **_kwargs: Mock())
     # Reproduce only the env the doc block sets, with no ambient POWERCONTEXT_SERVER_* leaking in.
     for name in list(os.environ):
         if name.startswith("POWERCONTEXT_SERVER_"):

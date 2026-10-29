@@ -40,10 +40,21 @@ class SourceNotEligibleError(ValueError):
         super().__init__("source_not_eligible")
 
 
+class WorkingNoteUnavailableError(SourceNotEligibleError):
+    """Report a Working Note that is expired or has invalid expiry metadata."""
+
+
 def is_generation_eligible(source: Source, /) -> bool:
     """Return whether a hydrated Source may enter a model or Candidate."""
 
-    return not isinstance(source, ContentSource) or source.internal is None
+    if not isinstance(source, ContentSource):
+        return True
+    if source.internal is not None:
+        return False
+    # Working Notes are durable evidence, but must not be promoted by the
+    # ordinary Source-window processors. Explicit consumers (for example a
+    # Handoff citation) still resolve them through require_source_eligible.
+    return not source.is_working_note
 
 
 def require_source_eligible(
@@ -52,10 +63,19 @@ def require_source_eligible(
     /,
     *,
     target: ArtifactLineageTarget | None = None,
+    allow_working_notes: bool = False,
 ) -> None:
     """Allow ordinary evidence, or a lineage-only Source at its exact bound target."""
 
-    if not isinstance(source, ContentSource) or source.internal is None:
+    if not isinstance(source, ContentSource):
+        return
+    if source.is_working_note:
+        if allow_working_notes:
+            if source.is_working_note_active():
+                return
+            raise WorkingNoteUnavailableError(source_ref)
+        raise SourceNotEligibleError(source_ref)
+    if source.internal is None:
         return
     bound = source.internal.target
     if target is not None and (

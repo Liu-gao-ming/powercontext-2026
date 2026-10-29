@@ -143,7 +143,7 @@ messages = [
     {"role": "user", "content": question},
 ]
 
-# Send `messages` to your model provider here.
+# Send `messages` to your model provider; step 4 shows one with the OpenAI SDK.
 print(json.dumps({"prepared": prepared, "model_messages": messages}, indent=2))
 ```
 
@@ -160,6 +160,20 @@ PreparedContext 是临时、只读数据。当前用户指令、授权、实时�
 
 最小 Server 使用全文检索。本例用已保存决策中的词语查询；需要语义检索时，配置
 [向量搜索](../workflows/configure-vector-search.md)。
+
+## 4. 把上下文发送给模型
+
+[OpenAI Python SDK 示例](https://github.com/oceanbase/powercontext/tree/master/examples/openai_sdk)用
+`PowerContextClient` 和 `AsyncOpenAI` 完成这个闭环：调用 `prepare_context`，把 ready 内容原样加入 system 消息，
+再发送一次对话请求。结果为空时，照常发送不带历史的请求。保持第 1 步的 Server 运行，在本仓库的克隆目录中执行：
+
+```bash
+export OPENAI_API_KEY=replace-with-a-secret-store-value
+uv run python -m examples.openai_sdk.chat --seed
+```
+
+示例读取相同的 `POWERCONTEXT_URL`、`POWERCONTEXT_TOKEN` 和 `POWERCONTEXT_SCOPE` 变量。其 README 列出了模型配置、
+预期输出，以及无需凭据的离线测试。
 
 ## 后续工作流
 

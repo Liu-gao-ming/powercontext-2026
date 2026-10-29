@@ -19,9 +19,13 @@ pub mod connections;
 pub mod credentials;
 #[cfg(windows)]
 mod diagnostic_process;
+#[cfg(target_os = "macos")]
+#[path = "diagnostic_process_macos.rs"]
+mod diagnostic_process;
 pub mod diagnostics;
 pub mod error;
 pub mod ipc;
+pub mod session_observations;
 pub mod transport;
 
 use tauri::Manager;
@@ -52,7 +56,10 @@ pub fn run() {
             commands::list_scopes,
             commands::cancel_scope_reads,
             commands::default_scope,
-            commands::select_scope
+            commands::select_scope,
+            commands::session_summary,
+            commands::reset_session_observations,
+            commands::preview_session_diagnostics
         ])
         .setup(|app| {
             let manager = app
@@ -62,7 +69,7 @@ pub fn run() {
                 .and_then(|dir| {
                     connections::profiles::ProfileRepository::open(
                         dir.join("profiles.json"),
-                        std::sync::Arc::new(credentials::WindowsVault),
+                        std::sync::Arc::new(credentials::NativeVault),
                     )
                 })
                 .map(connections::session::ConnectionManager::new);
@@ -73,6 +80,11 @@ pub fn run() {
                     std::io::Error::other("Desktop profile storage is already in use").into(),
                 );
             }
+            let observations = manager
+                .as_ref()
+                .map(|manager| manager.observations().clone())
+                .unwrap_or_default();
+            app.manage(observations);
             app.manage(commands::HostState { manager });
             app.manage(diagnostics::DiagnosticHost::new(
                 app.path().app_data_dir().ok(),
@@ -83,6 +95,15 @@ pub fn run() {
                 .build()?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("desktop host failed");
+        .build(tauri::generate_context!())
+        .expect("desktop host failed")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit)
+                && let Some(host) = app.try_state::<diagnostics::DiagnosticHost>()
+            {
+                // Tauri exits directly after this callback; worker Drop alone
+                // cannot supervise child processes once the application exits.
+                host.shutdown();
+            }
+        });
 }

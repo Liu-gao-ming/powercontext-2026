@@ -88,8 +88,18 @@ Atomic Memory 将每条事实、偏好或决策保存为独立的 `atomic-memory
 
 `mode` 可选 `text`、`vector`、`hybrid`，默认 `text`。向量和混合模式要求可用且匹配的 Embedding profile。
 搜索只返回 active 记忆，`hits[].memory` 包含正文、精确 Artifact 引用和状态版本；还返回 `score`、
-`matched_by`。引用结果时保留 `memory.artifact`。普通向量搜索在资格过滤后计算精确 L2，再排序和限制条数；
-当前路径不使用 ANN，不能据此推断生产后端性能或验收结果。
+`matched_by`。引用结果时保留 `memory.artifact`。seekdb 和 OceanBase 的普通向量搜索使用原生近似最近邻检索，
+Scope、kind、tag 的资格条件位于候选查询内部，在限制条数前执行。ANN 可能遗漏精确最近邻，需要针对部署的
+Embedding 模型和过滤选择率测量召回与延迟。SQLite 的有界检索使用按 Scope 分区的 sqlite-vec 原生精确 KNN。
+正常启动时核查向量部署是否完整；普通 Top-K 选择可用向量并校验选中结果，不在每次请求中审计整个候选集合。
+生成使用的完整阈值枚举和精确恢复探测仍拒绝资格范围内不完整的向量；完整枚举在所有后端上保持精确。
+
+需要完整 Artifact 结果和高级检索参数时，使用 `POST /v1/scopes/S/artifacts/atomic-memory/search`。
+统一入口要求 `scope.read`，默认文本检索，支持 `filters`、准入、RRF 排名常数与权重、`min_score` 和可选评分元数据。
+默认返回上限为 10，最大为 100。响应 `results` 包含不可变的 `content`、`lineage`，与专用搜索返回当前状态的
+`hits[].memory` 不同。检索评分归一化到 `[0, 1]`；通道原分为实际 BM25/MATCH 相关性或 L2 距离。
+已配置的重排器仍会生效，但请求不开放 `rerank` 参数。详见[检索 Artifact](search-artifacts.md)和
+[融合算法与参数](search-fusion.md)。只有单个 Artifact 读取授权的调用者，仍可使用 Atomic 专用搜索入口。
 
 向 `POST /v1/atomic-memory/list` 提交：
 
@@ -195,7 +205,7 @@ outcome = await runtime.artifact_merge.for_scope("S", "atomic-memory").restorati
 | `entries/list` | 返回 Scope 下的 `entries: AtomicMemoryRecord[]` 与 `next_cursor`；`include_inactive=true` 包含四态 |
 | `search` | `fts` 按 `text` 模式执行，`auto/vector/hybrid` 与 tag_filter 保留；每个 hit 的 `memory` 是 AtomicMemoryRecord |
 | `remember` 不传或传 null `expected_revision` | 创建独立记忆；返回 `changed`、`records: AtomicMemoryRecord[]` |
-| `flush` | 运行 Atomic Source 处理，保留原消费进度、status 和计数；`memory` 为 null，held_count 为 0、hold_codes 为空 |
+| `flush` | 运行 Atomic Source 处理，`memory` 为 null。写入闸门返回 HOLD 时不写入 Memory，但仍消费 Source 窗口并推进游标。`held_count` 为 0 或 1，`hold_codes` 返回拒绝码；被拒绝的窗口不会自动重试。 |
 
 以下旧行为在执行前拒绝，不读取旧存储：
 

@@ -23,7 +23,7 @@ import shlex
 import subprocess
 import sys
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import StrEnum
 from importlib.metadata import version
 from pathlib import Path
@@ -33,16 +33,16 @@ from threading import Thread
 from time import monotonic
 from typing import Annotated, Any, cast
 from urllib.error import HTTPError
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-import click
 import typer
 from pydantic import ValidationError
 
 from powercontext.cli.dsh_runtime import DshProfile, resolve_dsh_target
-from powercontext.cli.hosts import setup_host, stdin_is_tty
-from powercontext.cli.transport import add_transport_diagnostic, is_remote_http
+from powercontext.cli.hosts import stdin_is_tty
+from powercontext.cli.installation import SetupError, setup
+from powercontext.cli.transport import is_remote_http
 from powercontext.client.settings import normalize_server_url
 from powercontext.client.transport_policy import resolve_client_transport
 from powercontext.http import HealthResponse, ReadinessResponse, ReadinessStatus
@@ -65,6 +65,7 @@ _CODEX_FULL_MCP_TOOLS = frozenset({
     "activate_handoff",
     "capture_content_source",
     "change_atomic_memory_lifecycle",
+    "capture_working_note",
     "clear_scope_binding",
     "commit_handoff",
     "continue_handoff",
@@ -75,7 +76,8 @@ _CODEX_FULL_MCP_TOOLS = frozenset({
     "generate_experience",
     "generate_skill",
     "get_artifact",
-    "get_artifact_candidate",
+    "get_candidate",
+    "get_candidate_history",
     "get_artifact_revision",
     "get_atomic_memory_state",
     "get_experience",
@@ -86,7 +88,7 @@ _CODEX_FULL_MCP_TOOLS = frozenset({
     "get_topic_memory",
     "handoff_current_work",
     "import_external_skill",
-    "list_artifact_candidates",
+    "list_candidates",
     "list_atomic_memories",
     "list_external_skills",
     "list_managed_skills",
@@ -115,7 +117,7 @@ setup_app = typer.Typer(
     name="setup",
     context_settings={"help_option_names": HELP_OPTION_NAMES},
     help="Install and configure PowerContext integrations.",
-    no_args_is_help=True,
+    invoke_without_command=True,
 )
 doctor_app = typer.Typer(
     name="doctor",
@@ -123,295 +125,6 @@ doctor_app = typer.Typer(
     help="Check an installed PowerContext environment.",
     invoke_without_command=True,
 )
-
-
-class SetupError(RuntimeError):
-    """Report a failed external setup command."""
-
-    @classmethod
-    def codex_unavailable(cls) -> SetupError:
-        return cls("Codex CLI is not installed or is not on PATH.")
-
-    @classmethod
-    def claude_unavailable(cls) -> SetupError:
-        return cls("Claude Code CLI is not installed or is not on PATH.")
-
-    @classmethod
-    def dsh_unavailable(cls) -> SetupError:
-        return cls("DeepSeek Harness CLI is not installed or is not on PATH.")
-
-    @classmethod
-    def openclaw_unavailable(cls) -> SetupError:
-        return cls("OpenClaw CLI is not installed or is not on PATH.")
-
-    @classmethod
-    def pnpm_unavailable(cls) -> SetupError:
-        return cls("pnpm is not installed or is not on PATH; it is required to build the OpenClaw plugin.")
-
-    @classmethod
-    def missing_openclaw_plugin(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext OpenClaw plugin was not found under {path}.")
-
-    @classmethod
-    def unbuilt_openclaw_plugin(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext OpenClaw plugin at {path} is missing dist/index.js after build.")
-
-    @classmethod
-    def invalid_openclaw_ref(cls, ref: str) -> SetupError:
-        return cls(f"invalid OpenClaw ref: {ref}")
-
-    @classmethod
-    def invalid_openclaw_source(cls, source: str) -> SetupError:
-        return cls(f"invalid OpenClaw source: {source}")
-
-    @classmethod
-    def unsupported_openclaw_version(cls, version_text: str) -> SetupError:
-        return cls(f"OpenClaw {version_text or 'version unknown'} is unsupported; upgrade to >= 2026.8.1-beta.2")
-
-    @classmethod
-    def openclaw_server_url_scheme(cls) -> SetupError:
-        return cls("OpenClaw PowerContext Server URL must use HTTP or HTTPS")
-
-    @classmethod
-    def openclaw_server_url_credentials(cls) -> SetupError:
-        return cls("OpenClaw PowerContext Server URL must not contain credentials")
-
-    @classmethod
-    def openclaw_server_url_suffix(cls) -> SetupError:
-        return cls("OpenClaw PowerContext Server URL must not contain a query or fragment")
-
-    @classmethod
-    def pi_unavailable(cls) -> SetupError:
-        return cls("Pi CLI is not installed or is not on PATH.")
-
-    @classmethod
-    def opencode_unavailable(cls) -> SetupError:
-        return cls("OpenCode CLI is not installed or is not on PATH.")
-
-    @classmethod
-    def hermes_unavailable(cls) -> SetupError:
-        return cls("Hermes CLI is not installed or is not on PATH.")
-
-    @classmethod
-    def missing_dsh_plugin(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext DSH plugin was not found under {path}.")
-
-    @classmethod
-    def unbuilt_dsh_plugin(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext DSH plugin at {path} is missing lib/index.js. Build the plugin before setup.")
-
-    @classmethod
-    def missing_pi_package(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext Pi package was not found under {path}.")
-
-    @classmethod
-    def incomplete_pi_package(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext Pi package at {path} is missing its extension or powercontext-project-context skill.")
-
-    @classmethod
-    def missing_opencode_plugin(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext OpenCode plugin was not found under {path}.")
-
-    @classmethod
-    def incomplete_opencode_plugin(cls, path: Path) -> SetupError:
-        return cls(
-            f"PowerContext OpenCode plugin at {path} is missing lib/index.js, lib/tui.js,"
-            " or powercontext-project-context Skill."
-        )
-
-    @classmethod
-    def invalid_opencode_ref(cls, ref: str) -> SetupError:
-        return cls(f"invalid OpenCode ref: {ref}")
-
-    @classmethod
-    def invalid_opencode_source(cls) -> SetupError:
-        return cls("invalid OpenCode source; use a local path or an HTTPS/SSH GitHub repository")
-
-    @classmethod
-    def unsupported_opencode_version(cls, actual: str) -> SetupError:
-        return cls(
-            f"OpenCode v{actual} is unsupported; PowerContext requires OpenCode v1.18.21 or newer in the 1.x line."
-        )
-
-    @classmethod
-    def opencode_skill_conflict(cls, path: Path) -> SetupError:
-        return cls(f"OpenCode Skill path {path} already exists and is not owned by PowerContext.")
-
-    @classmethod
-    def opencode_plugin_conflict(cls, path: Path) -> SetupError:
-        return cls(f"OpenCode plugin path {path} already exists and is not owned by PowerContext.")
-
-    @classmethod
-    def invalid_dsh_ref(cls, ref: str) -> SetupError:
-        return cls(f"invalid DeepSeek Harness ref: {ref}")
-
-    @classmethod
-    def invalid_dsh_source(cls) -> SetupError:
-        return cls("invalid DeepSeek Harness source; use a local path or an HTTPS/SSH GitHub repository")
-
-    @classmethod
-    def invalid_pi_ref(cls, ref: str) -> SetupError:
-        return cls(f"invalid Pi ref: {ref}")
-
-    @classmethod
-    def invalid_pi_source(cls) -> SetupError:
-        return cls("invalid Pi source; use a local path or an HTTPS/SSH GitHub repository")
-
-    @classmethod
-    def git_clone_failed(cls) -> SetupError:
-        return cls("failed to clone the GitHub source")
-
-    @classmethod
-    def invalid_hermes_ref(cls, ref: str) -> SetupError:
-        return cls(f"invalid Hermes ref: {ref}")
-
-    @classmethod
-    def invalid_hermes_source(cls, source: str) -> SetupError:
-        return cls(f"invalid Hermes source: {source}")
-
-    @classmethod
-    def missing_hermes_plugin(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext Hermes plugin was not found under {path}.")
-
-    @classmethod
-    def hermes_plugin_write(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot install PowerContext Hermes plugin at {path}: {error}")
-
-    @classmethod
-    def unsupported_hermes_version(cls, actual: str, minimum: str) -> SetupError:
-        return cls(f"Hermes Agent v{actual} is unsupported; PowerContext requires Hermes Agent v{minimum} or newer.")
-
-    @classmethod
-    def missing_workbuddy_plugin(cls, path: Path) -> SetupError:
-        return cls(f"PowerContext WorkBuddy plugin was not found under {path}.")
-
-    @classmethod
-    def invalid_workbuddy_ref(cls, ref: str) -> SetupError:
-        return cls(f"invalid WorkBuddy ref: {ref}")
-
-    @classmethod
-    def invalid_workbuddy_source(cls, source: str) -> SetupError:
-        return cls(f"invalid WorkBuddy source: {source}")
-
-    @classmethod
-    def workbuddy_home_unavailable(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot create WorkBuddy home directory {path}: {error}")
-
-    @classmethod
-    def workbuddy_hooks_write(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot install PowerContext WorkBuddy hooks at {path}: {error}")
-
-    @classmethod
-    def workbuddy_skill_write(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot install PowerContext WorkBuddy skill at {path}: {error}")
-
-    @classmethod
-    def workbuddy_skill_conflict(cls, path: Path) -> SetupError:
-        return cls(f"WorkBuddy Skill path {path} already exists and is not owned by PowerContext.")
-
-    @classmethod
-    def workbuddy_settings_write(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot update WorkBuddy settings at {path}: {error}")
-
-    @classmethod
-    def workbuddy_mcp_write(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot update WorkBuddy MCP configuration at {path}: {error}")
-
-    @classmethod
-    def invalid_workbuddy_settings(cls, path: Path) -> SetupError:
-        return cls(f"WorkBuddy settings at {path} must contain a JSON object with a hooks mapping.")
-
-    @classmethod
-    def invalid_workbuddy_mcp(cls, path: Path) -> SetupError:
-        return cls(f"WorkBuddy MCP configuration at {path} must contain a JSON object with an mcpServers mapping.")
-
-    @classmethod
-    def data_directory(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot create PowerContext data directory {path}: {error}")
-
-    @classmethod
-    def command_unavailable(cls, command: list[str], error: BaseException) -> SetupError:
-        return cls(f"Cannot run {' '.join(command)}: {error}")
-
-    @classmethod
-    def command_failed(cls, command: list[str], detail: str) -> SetupError:
-        return cls(f"`{' '.join(command)}` failed: {detail}")
-
-    @classmethod
-    def invalid_command_output(cls, command: list[str], detail: str) -> SetupError:
-        return cls(f"`{' '.join(command)}` returned {detail}")
-
-    @classmethod
-    def missing_result(cls, name: str) -> SetupError:
-        return cls(f"Integration CLI did not return {name}")
-
-    @classmethod
-    def post_install_verification(cls, failures: list[str]) -> SetupError:
-        return cls(f"post-install verification failed: {'; '.join(failures)}")
-
-    @classmethod
-    def claude_plugin_not_enabled(cls) -> SetupError:
-        return cls("Claude Code did not report an enabled PowerContext plugin after installation.")
-
-    @classmethod
-    def claude_marketplace_source_mismatch(cls, requested: str, existing: str) -> SetupError:
-        return cls(
-            f"Claude Code marketplace `{CLAUDE_MARKETPLACE_NAME}` uses {existing}, "
-            f"but setup requested {requested}. Remove it with "
-            f"`claude plugin marketplace remove {CLAUDE_MARKETPLACE_NAME}`, then rerun setup."
-        )
-
-    @classmethod
-    def invalid_claude_settings(cls, path: Path) -> SetupError:
-        return cls(f"Claude Code settings at {path} must contain a JSON object with object-valued plugin options.")
-
-    @classmethod
-    def claude_settings_write(cls, path: Path, error: OSError) -> SetupError:
-        return cls(f"Cannot update Claude Code settings at {path}: {error}")
-
-    @classmethod
-    def claude_server_url_credentials(cls) -> SetupError:
-        return cls("PowerContext Server URL must not contain credentials.")
-
-    @classmethod
-    def claude_server_url_scheme(cls) -> SetupError:
-        return cls("PowerContext Server URL must use HTTP or HTTPS.")
-
-    @classmethod
-    def claude_server_url_suffix(cls) -> SetupError:
-        return cls("PowerContext Server URL must not contain a query or fragment.")
-
-    @classmethod
-    def claude_server_url_transport(cls) -> SetupError:
-        return cls("Unencrypted PowerContext Server URLs must be loopback addresses.")
-
-
-@dataclass(frozen=True, slots=True)
-class CodexSetupResult:
-    marketplace: str
-    plugin: str
-    plugin_version: str
-    data_dir: str
-    authorization_state: str = "not_attempted"
-
-
-@dataclass(frozen=True, slots=True)
-class ClaudeCodeSetupResult:
-    marketplace: str
-    plugin: str
-    plugin_version: str
-    settings_file: str
-    cache_dir: str
-    data_dir: str
-    authorization_state: str = "not_attempted"
-
-
-@dataclass(frozen=True, slots=True)
-class OpenClawSetupResult:
-    plugin: str
-    plugin_path: str
-    server_url: str
-    data_dir: str
 
 
 class DiagnosticStatus(StrEnum):
@@ -448,873 +161,168 @@ class Diagnostic:
         return result
 
 
+SourceOption = Annotated[str, typer.Option(help="PowerContext Git source or local checkout path.")]
+RefOption = Annotated[str, typer.Option(help="Git ref used for a remote source.")]
+ServerOption = Annotated[str | None, typer.Option(help="Server URL; resolves environment and saved settings.")]
+HttpOption = Annotated[
+    bool | None,
+    typer.Option("--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."),
+]
+JsonOption = Annotated[bool, typer.Option("--json", help="Write the result as JSON.")]
+CaptureOption = Annotated[
+    bool | None,
+    typer.Option(
+        "--capture-prompts/--no-capture-prompts",
+        help="Claude Code, Kimi Code and ZCode only; omission preserves the capture preference.",
+    ),
+]
+AgentsArgument = Annotated[list[str] | None, typer.Argument(help="Agent names; select interactively when omitted.")]
+
+
 @setup_app.callback()
-def setup_configuration(
+def setup_agents(
     context: typer.Context,
-    env_file: Annotated[
-        Path | None, typer.Option(help="Setup environment file; defaults to .env in this directory.")
+    agents: AgentsArgument = None,
+    source: SourceOption = DEFAULT_MARKETPLACE_SOURCE,
+    ref: RefOption = DEFAULT_MARKETPLACE_REF,
+    server_url: ServerOption = None,
+    allow_insecure_http: HttpOption = None,
+    json_output: JsonOption = False,
+    capture_prompts: CaptureOption = None,
+    scope_id: Annotated[str | None, typer.Option(help="Existing Scope ID for Kimi Code.")] = None,
+    workspace_scope: Annotated[
+        bool,
+        typer.Option("--workspace-scope", help="Kimi Code: resolve workspace bindings, then the Server default Scope."),
+    ] = False,
+    boundary_flush: Annotated[
+        bool | None, typer.Option("--boundary-flush/--no-boundary-flush", help="ZCode boundary capture preference.")
     ] = None,
+    profile: Annotated[
+        str | None,
+        typer.Option(help="DSH profile or Kimi MCP profile: minimal, recommended, full; omission preserves it."),
+    ] = None,
+    dsh_command: Annotated[Path | None, typer.Option(help="DSH launcher path.")] = None,
+    env_file: Annotated[Path | None, typer.Option(help="Setup environment file; defaults to .env.")] = None,
 ) -> None:
-    """Select a safely parsed configuration file for all setup targets."""
+    """Install, configure, activate and diagnose the selected agent integrations."""
+    from powercontext.cli.hosts import (
+        diagnostic_result,
+        doctor_checks,
+        native_options,
+        report_agents,
+        select_hosts,
+        validate_native_options,
+    )
     from powercontext.cli.transport import setup_environment_file
 
     token = setup_environment_file.set(env_file)
     context.call_on_close(lambda: setup_environment_file.reset(token))
-
-
-@setup_app.command("codex")
-def setup_codex(
-    source: Annotated[
-        str,
-        typer.Option(help="Codex marketplace Git source or local path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote marketplace source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install the PowerContext Codex plugin and prepare local storage."""
-
-    try:
-        result = setup_host(
-            "codex",
-            source=source,
-            ref=ref,
-            server_url=server_url,
-            allow_insecure_http=allow_insecure_http,
-            json_output=json_output,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-
-    diagnostics = run_codex_diagnostics()
-    # Installing against a Server with basic Memory support remains valid. Doctor
-    # separately reports missing full-profile tools instead of failing installation.
-    connection_checks = codex_setup_checks(diagnostics)
-    if not _diagnostics_ok(connection_checks):
-        _write_diagnostics(diagnostics, json_output=json_output)
-        raise typer.Exit(code=1)
-
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext Codex setup complete.")
-    typer.echo(f"Plugin: {result.plugin}@{result.marketplace} ({result.plugin_version})")
-    typer.echo(f"Data directory: {result.data_dir}")
-    typer.echo(f"Authorization: {result.authorization_state}")
-    typer.echo("Next: run `powercontext server run`, start a new Codex session, then review `/hooks`.")
-
-
-@setup_app.command("claude-code")
-def setup_claude_code(
-    source: Annotated[
-        str,
-        typer.Option(help="Claude Code marketplace Git source or local path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote marketplace source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    capture_prompts: Annotated[
-        bool,
-        typer.Option(help="Capture Claude Code user prompts as ordinary Source evidence."),
-    ] = True,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install the PowerContext Claude Code plugin."""
-
-    plan = _claude_setup_plan()
-    _write_claude_setup_plan(plan)
-    try:
-        result = setup_host(
-            "claude-code",
-            source=source,
-            ref=ref,
-            server_url=server_url,
-            allow_insecure_http=allow_insecure_http,
-            json_output=json_output,
-            capture_prompts=capture_prompts,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext Claude Code setup complete.")
-    typer.echo(f"Plugin: {result.plugin}@{result.marketplace} ({result.plugin_version})")
-    typer.echo(f"Settings: {result.settings_file}")
-    typer.echo("Next: run `powercontext server run`, start a new Claude Code session, then review `/hooks` and `/mcp`.")
-
-
-@setup_app.command("dsh")
-def setup_dsh(
-    profile: Annotated[
-        DshProfile | None, typer.Option(help="DSH profile; prompts on a TTY, otherwise defaults to web.")
-    ] = None,
-    dsh_command: Annotated[
-        Path | None, typer.Option(help="Path to the DSH launcher; Desktop requires its installed command.")
-    ] = None,
-    source: Annotated[
-        str,
-        typer.Option(help="PowerContext Git source or local checkout path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install the PowerContext DeepSeek Harness plugin and prepare local storage."""
-
-    from powercontext.cli.dsh import run_dsh_diagnostics
-
-    try:
-        if profile is None:
-            profile = (
-                DshProfile(typer.prompt("DSH profile", default="web", type=click.Choice(["web", "desktop"])))
-                if not json_output and stdin_is_tty()
-                else DshProfile.WEB
-            )
-        target = resolve_dsh_target(profile, dsh_command)
-        if not json_output:
-            typer.echo(f"DSH target: {profile} ({target.directory})")
-        if profile == DshProfile.DESKTOP:
-            typer.echo("Desktop must be fully quit before installation (closing its window only hides it).", err=True)
-        result = setup_host(
-            "dsh",
-            source=source,
-            ref=ref,
-            server_url=server_url,
-            allow_insecure_http=allow_insecure_http,
-            json_output=json_output,
-            dsh_target=target,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-
-    diagnostics = run_dsh_diagnostics(target=target)
-    if not _diagnostics_ok(diagnostics):
-        _write_diagnostics(diagnostics, json_output=json_output)
-        raise typer.Exit(code=1)
-
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext DeepSeek Harness setup complete.")
-    typer.echo(f"Plugin: {result.plugin} ({result.plugin_path})")
-    typer.echo(f"Data directory: {result.data_dir}")
-    typer.echo(
-        "Next: run `powercontext server run`, then reopen DeepSeek Harness Desktop."
-        if profile == DshProfile.DESKTOP
-        else "Next: run `powercontext server run`, then start `dsh web`."
-    )
-
-
-@setup_app.command("zcode")
-def setup_zcode(
-    source: Annotated[
-        str, typer.Option(help="PowerContext Git source or local checkout path.")
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[str, typer.Option(help="Git ref for a remote source.")] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None, typer.Option(help="PowerContext Server URL; resolves environment and saved settings.")
-    ] = None,
-    capture_prompts: Annotated[
-        bool | None,
-        typer.Option(
-            "--capture-prompts/--no-capture-prompts", help="Capture prompts; omission preserves saved preference."
-        ),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option("--allow-insecure-http/--no-allow-insecure-http", help="Allow unencrypted remote HTTP."),
-    ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Write the result as JSON.")] = False,
-) -> None:
-    """Install the ZCode CLI or Windows desktop plugin."""
-
-    from powercontext.cli.zcode import preserve_zcode_installation, run_zcode_diagnostics, saved_zcode_capture_prompts
-
-    try:
-        with preserve_zcode_installation():
-            result = setup_host(
-                "zcode",
-                source=source,
-                ref=ref,
-                server_url=server_url,
-                capture_prompts=capture_prompts if capture_prompts is not None else saved_zcode_capture_prompts(),
-                allow_insecure_http=allow_insecure_http,
-                json_output=json_output,
-            ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-    diagnostics = run_zcode_diagnostics()
-    required = {
-        name: item
-        for name, item in diagnostics.items()
-        if not (name in {"runtime", "mcp_session"} and item.status is DiagnosticStatus.SKIPPED)
+    selected = select_hosts(agents, json_output=json_output)
+    options = {
+        "capture_prompts": capture_prompts,
+        "scope_id": scope_id,
+        "boundary_flush": boundary_flush,
+        "workspace_scope": workspace_scope or None,
+        "profile": profile,
     }
-    status = _diagnostics_status(required)
-    if status is not DiagnosticStatus.OK:
-        _write_diagnostics(diagnostics, json_output=json_output, summary_status=status)
-        raise typer.Exit(code=1)
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo(f"PowerContext ZCode setup complete: {result.plugin_path}")
-    typer.echo("Next: fully quit and reopen ZCode, then start a new session and run `powercontext doctor zcode`.")
+    validate_native_options(selected, **options, dsh_command=dsh_command)
 
+    def complete(host):
+        native = native_options(host, **options)
+        if host == "dsh":
+            native["dsh_target"] = resolve_dsh_target(DshProfile(profile) if profile is not None else None, dsh_command)
+            if native["dsh_target"].profile == DshProfile.DESKTOP:
+                typer.echo("Fully quit DSH Desktop before replacing its plugin.", err=True)
+        if host == "kimi-code" and not scope_id and not workspace_scope and not json_output and stdin_is_tty():
+            from powercontext.cli.kimi_code import kimi_home
 
-@setup_app.command("openclaw")
-def setup_openclaw(
-    source: Annotated[
-        str,
-        typer.Option(help="OpenClaw plugin Git source or local PowerContext checkout path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Build, install, and configure the PowerContext OpenClaw memory plugin."""
-
-    try:
-        result = setup_host(
-            "openclaw",
-            source=source,
-            ref=ref,
+            if not (kimi_home() / "plugins/managed/powercontext/powercontext.json").is_file():
+                native["scope_id"] = typer.prompt("Existing Scope ID for Kimi Code")
+        result = setup(
+            host,
+            source,
+            ref,
             server_url=server_url,
             allow_insecure_http=allow_insecure_http,
             json_output=json_output,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
+            **native,
+        )
+        checks = doctor_checks(host, **native)
+        return {"setup": "complete", "result": result, **diagnostic_result(checks)}
 
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext OpenClaw setup complete.")
-    typer.echo(f"Plugin: {result.plugin}")
-    typer.echo(f"Plugin path: {result.plugin_path}")
-    typer.echo(f"Server: {result.server_url}")
-    typer.echo(f"Data directory: {result.data_dir}")
-    typer.echo("Next: start a new OpenClaw session.")
-
-
-@setup_app.command("pi")
-def setup_pi(
-    source: Annotated[
-        str,
-        typer.Option(help="PowerContext Git source or local checkout path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install the PowerContext Pi package and prepare local storage."""
-
-    from powercontext.cli.pi import run_pi_diagnostics
-
-    try:
-        result = setup_host(
-            "pi",
-            source=source,
-            ref=ref,
-            server_url=server_url,
-            allow_insecure_http=allow_insecure_http,
-            json_output=json_output,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-
-    diagnostics = run_pi_diagnostics()
-    if not _diagnostics_ok(diagnostics):
-        _write_diagnostics(diagnostics, json_output=json_output)
-        raise typer.Exit(code=1)
-
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext Pi setup complete.")
-    typer.echo(f"Package: {result.package} ({result.package_path})")
-    typer.echo(f"Data directory: {result.data_dir}")
-    typer.echo("Next: run `powercontext server run`, then start a new Pi session.")
-
-
-@setup_app.command("opencode")
-def setup_opencode(
-    source: Annotated[
-        str,
-        typer.Option(help="PowerContext Git source or local checkout path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install the PowerContext OpenCode plugin and Skill."""
-
-    from powercontext.cli.opencode import run_opencode_diagnostics
-
-    try:
-        result = setup_host(
-            "opencode",
-            source=source,
-            ref=ref,
-            server_url=server_url,
-            allow_insecure_http=allow_insecure_http,
-            json_output=json_output,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-
-    diagnostics = run_opencode_diagnostics()
-    if not _diagnostics_ok(diagnostics):
-        _write_diagnostics(diagnostics, json_output=json_output)
-        raise typer.Exit(code=1)
-
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext OpenCode setup complete.")
-    typer.echo(f"Plugin: {result.plugin} ({result.plugin_path})")
-    typer.echo(f"Skill: {result.skill_path}")
-    typer.echo(f"Data directory: {result.data_dir}")
-    typer.echo("Next: run `powercontext server run`, then start a new OpenCode session.")
-
-
-@setup_app.command("hermes")
-def setup_hermes(
-    source: Annotated[
-        str,
-        typer.Option(help="PowerContext Git source or local checkout path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install the PowerContext Hermes provider and /pc command companion."""
-
-    from powercontext.cli.hermes import run_hermes_diagnostics
-
-    try:
-        result = setup_host(
-            "hermes",
-            source=source,
-            ref=ref,
-            server_url=server_url,
-            allow_insecure_http=allow_insecure_http,
-            json_output=json_output,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-
-    diagnostics = run_hermes_diagnostics()
-    if not _diagnostics_ok(diagnostics):
-        _write_diagnostics(diagnostics, json_output=json_output)
-        raise typer.Exit(code=1)
-
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext Hermes setup complete.")
-    typer.echo(f"Plugin: {result.plugin} ({result.plugin_path})")
-    typer.echo(f"Command companion: {result.command_plugin_path}")
-    typer.echo(f"Hermes home: {result.hermes_home}")
-    typer.echo(f"Data directory: {result.data_dir}")
-    typer.echo("Next: run `hermes memory setup`, select PowerContext, then start Hermes.")
-
-
-@setup_app.command("select")
-def setup_select(
-    host: Annotated[
-        list[str] | None,
-        typer.Option(help="First-class host to install. Repeatable. Required with --json or a non-TTY."),
-    ] = None,
-    source: Annotated[
-        str,
-        typer.Option(help="Git source or local path passed to each selected installer."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server base URL override for every selected Agent."),
-    ] = None,
-    capture_prompts: Annotated[
-        bool,
-        typer.Option(help="Capture Claude Code user prompts as ordinary Source evidence."),
-    ] = True,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install selected first-class host plugins without scanning PATH."""
-
-    from powercontext.cli.hosts import run_setup_select
-
-    run_setup_select(
-        hosts=host,
-        source=source,
-        ref=ref,
-        server_url=server_url,
-        capture_prompts=capture_prompts,
-        json_output=json_output,
-        allow_insecure_http=allow_insecure_http,
-    )
-
-
-@setup_app.command("workbuddy")
-def setup_workbuddy(
-    source: Annotated[
-        str,
-        typer.Option(help="PowerContext Git source or local checkout path."),
-    ] = DEFAULT_MARKETPLACE_SOURCE,
-    ref: Annotated[
-        str,
-        typer.Option(help="Git ref used for a remote source."),
-    ] = DEFAULT_MARKETPLACE_REF,
-    server_url: Annotated[
-        str | None,
-        typer.Option(help="PowerContext Server URL; resolves host/common environment and saved settings."),
-    ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Install the PowerContext WorkBuddy hooks, MCP server, and Skill."""
-
-    from powercontext.cli.workbuddy import run_workbuddy_diagnostics
-
-    try:
-        result = setup_host(
-            "workbuddy",
-            source=source,
-            ref=ref,
-            server_url=server_url,
-            allow_insecure_http=allow_insecure_http,
-            json_output=json_output,
-        ).result
-    except SetupError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from error
-
-    diagnostics = run_workbuddy_diagnostics()
-    if not _diagnostics_ok(diagnostics):
-        _write_diagnostics(diagnostics, json_output=json_output)
-        raise typer.Exit(code=1)
-
-    if json_output:
-        typer.echo(json.dumps(asdict(result), indent=2))
-        return
-    typer.echo("PowerContext WorkBuddy setup complete.")
-    typer.echo(f"Plugin: {result.plugin} ({result.plugin_path})")
-    typer.echo(f"WorkBuddy home: {result.workbuddy_home}")
-    typer.echo(f"Hooks directory: {result.hooks_dir}")
-    typer.echo(f"Data directory: {result.data_dir}")
-    typer.echo("Next: run `powercontext server run`, restart WorkBuddy, then send a prompt.")
+    report_agents(selected, complete, json_output=json_output)
 
 
 @doctor_app.callback()
 def doctor(
-    context: typer.Context,
-    server_url: Annotated[
-        str | None,
-        typer.Option(
-            envvar="POWERCONTEXT_CLIENT_SERVER_URL",
-            help="PowerContext Server base URL.",
-        ),
+    agents: AgentsArgument = None,
+    server_url: ServerOption = None,
+    allow_insecure_http: HttpOption = None,
+    json_output: JsonOption = False,
+    profile: Annotated[
+        DshProfile | None, typer.Option(help="DSH profile; defaults to the saved profile or web.")
     ] = None,
-    allow_insecure_http: Annotated[
-        bool | None,
-        typer.Option(
-            "--allow-insecure-http/--no-allow-insecure-http", help="Explicitly allow unencrypted remote HTTP."
-        ),
-    ] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
+    dsh_command: Annotated[Path | None, typer.Option(help="DSH launcher path.")] = None,
+    runtime: Annotated[bool, typer.Option(help="Inspect Kimi Hook history.")] = False,
+    mcp: Annotated[bool, typer.Option(help="Discover Kimi Server MCP tools without executing operations.")] = False,
+    cwd: Annotated[Path | None, typer.Option(help="Kimi workspace for Scope resolution and runtime history.")] = None,
+    session_id: Annotated[str | None, typer.Option(help="Exact Kimi session.")] = None,
+    runtime_data_dir: Annotated[Path | None, typer.Option(help="Actual ZCode plugin data directory.")] = None,
+    prepare: Annotated[bool, typer.Option(help="Probe ZCode readonly context preparation.")] = False,
 ) -> None:
-    """Check the installed package and configured Server."""
-
-    if context.invoked_subcommand is not None:
-        return
-    diagnostics = run_diagnostics(server_url=server_url, allow_insecure_http=allow_insecure_http)
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("codex")
-def doctor_codex(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional Codex CLI and PowerContext plugin."""
-
-    diagnostics = run_codex_diagnostics()
-    add_transport_diagnostic(diagnostics, "codex")
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("claude-code")
-def doctor_claude_code(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional Claude Code CLI and PowerContext plugin."""
-
-    diagnostics = run_claude_code_diagnostics()
-    add_transport_diagnostic(diagnostics, "claude-code")
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("dsh")
-def doctor_dsh(
-    profile: Annotated[DshProfile, typer.Option(help="DSH profile to inspect.")] = DshProfile.WEB,
-    dsh_command: Annotated[Path | None, typer.Option(help="Path to the DSH launcher.")] = None,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional DeepSeek Harness CLI and PowerContext plugin."""
-
-    from powercontext.cli.dsh import run_dsh_diagnostics
-
-    try:
-        target = resolve_dsh_target(profile, dsh_command)
-    except SetupError as error:
-        diagnostics = {
-            "dsh": Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error)),
-            "plugin": Diagnostic(
-                status=DiagnosticStatus.SKIPPED,
-                detail="not checked because the selected DeepSeek Harness profile is unavailable",
-            ),
-        }
-    else:
-        diagnostics = run_dsh_diagnostics(target=target)
-        add_transport_diagnostic(diagnostics, "dsh", dsh_target=target)
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("zcode")
-def doctor_zcode(
-    json_output: Annotated[bool, typer.Option("--json", help="Write the result as JSON.")] = False,
-    runtime_data_dir: Annotated[
-        Path | None, typer.Option("--runtime-data-dir", help="Actual ZCode plugin data directory.")
-    ] = None,
-    prepare: Annotated[bool, typer.Option("--prepare", help="Probe readonly context preparation.")] = False,
-) -> None:
-    """Check ZCode plugin registration, Hook, MCP, and Server readiness."""
-
-    from powercontext.cli.zcode import run_zcode_diagnostics
-
-    diagnostics = run_zcode_diagnostics(runtime_data_dir=runtime_data_dir, prepare=prepare)
-    add_transport_diagnostic(diagnostics, "zcode")
-    # Unobserved optional history is not a failed connectivity probe. Preserve its
-    # skipped status in the report rather than claiming the session was observed.
-    required = {
-        name: item
-        for name, item in diagnostics.items()
-        if not (name in {"runtime", "mcp_session"} and item.status is DiagnosticStatus.SKIPPED)
-    }
-    status = _diagnostics_status(required)
-    _write_diagnostics(diagnostics, json_output=json_output, summary_status=status)
-    if status is not DiagnosticStatus.OK:
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("pi")
-def doctor_pi(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional Pi CLI and PowerContext package."""
-
-    from powercontext.cli.pi import run_pi_diagnostics
-
-    diagnostics = run_pi_diagnostics()
-
-    add_transport_diagnostic(diagnostics, "pi")
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("opencode")
-def doctor_opencode(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional OpenCode CLI, plugin, and Skill."""
-
-    from powercontext.cli.opencode import run_opencode_diagnostics
-
-    diagnostics = run_opencode_diagnostics()
-    add_transport_diagnostic(diagnostics, "opencode")
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("hermes")
-def doctor_hermes(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional Hermes CLI and PowerContext memory provider."""
-
-    from powercontext.cli.hermes import run_hermes_diagnostics
-
-    diagnostics = run_hermes_diagnostics()
-    add_transport_diagnostic(diagnostics, "hermes")
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("workbuddy")
-def doctor_workbuddy(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional WorkBuddy hooks, MCP server, and Skill."""
-
-    from powercontext.cli.workbuddy import run_workbuddy_diagnostics
-
-    diagnostics = run_workbuddy_diagnostics()
-    add_transport_diagnostic(diagnostics, "workbuddy")
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("openclaw")
-def doctor_openclaw(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Check the optional OpenClaw CLI and PowerContext memory plugin."""
-
-    from powercontext.cli.openclaw import run_openclaw_diagnostics
-
-    diagnostics = run_openclaw_diagnostics()
-    add_transport_diagnostic(diagnostics, "openclaw")
-    _write_diagnostics(diagnostics, json_output=json_output)
-    if not _diagnostics_ok(diagnostics):
-        raise typer.Exit(code=1)
-
-
-@doctor_app.command("integrations")
-def doctor_integrations(
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Write the result as JSON."),
-    ] = False,
-) -> None:
-    """Report first-class host CLI and integration status without failing on missing CLIs."""
-
-    from powercontext.cli.hosts import run_doctor_integrations
-
-    run_doctor_integrations(json_output=json_output)
-
-
-def install_codex_plugin(*, source: str, ref: str, server_url: str | None = None) -> CodexSetupResult:
-    """Install the plugin from one local or Git marketplace source."""
-
-    if which("codex") is None:
-        raise SetupError.codex_unavailable()
-
-    data_dir = powercontext_data_dir()
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise SetupError.data_directory(data_dir, error) from error
-
-    marketplace_source, is_local = _normalize_marketplace_source(source)
-    marketplace_arguments = ["plugin", "marketplace", "add", marketplace_source]
-    if not is_local:
-        marketplace_arguments.extend(("--ref", ref))
-    marketplace = _run_codex_json(*marketplace_arguments)
-    marketplace_name = _required_string(marketplace, "marketplaceName")
-
-    plugin = _run_codex_json("plugin", "add", f"{PLUGIN_NAME}@{marketplace_name}")
-    from powercontext.cli.authorization import (
-        configure_codex_desktop_authorization,
-        configure_stored_authorization,
-        credential_path,
-        read_stored_authorization,
-        setup_authorization_value,
+    """Check selected integrations, or saved integrations and the environment by default."""
+    from powercontext.cli.hosts import (
+        diagnostic_result,
+        doctor_checks,
+        report_agents,
+        select_hosts,
+        validate_native_options,
     )
+    from powercontext.cli.installation import installers
+    from powercontext.cli.transport import client_config_file
 
-    authorization_server_url = server_url or DEFAULT_CLAUDE_CODE_SERVER_URL
-    authorization_state = configure_stored_authorization(
-        "codex",
-        server_url=authorization_server_url,
-        value=setup_authorization_value("codex"),
-    )
-    authorization = read_stored_authorization(credential_path("codex"), server_url=authorization_server_url)
-    _configure_codex_endpoint(marketplace_name, _required_string(plugin, "version"), authorization_server_url)
-    if authorization.authorization is not None:
+    if session_id is not None and not runtime:
+        raise typer.BadParameter("--session-id requires --runtime")  # noqa: TRY003 - CLI input validation.
+    explicit_server = server_url is not None or allow_insecure_http is not None
+    if agents is None and not explicit_server:
+        path = client_config_file()
         try:
-            configure_codex_desktop_authorization(authorization.authorization)
-        except OSError as error:
-            raise SetupError(f"Cannot configure Codex Desktop authorization: {error}") from error  # noqa: TRY003
-    return CodexSetupResult(
-        marketplace=marketplace_name,
-        plugin=_required_string(plugin, "name"),
-        plugin_version=_required_string(plugin, "version"),
-        data_dir=str(data_dir),
-        authorization_state=authorization_state,
+            saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"version": 1, "hosts": {}}
+            configured = saved.get("hosts") if isinstance(saved, dict) else None
+            if not isinstance(saved, dict) or saved.get("version") != 1 or not isinstance(configured, dict):
+                raise ValueError  # noqa: TRY301 - invalid saved connections.
+            agents = [name for name in configured if name in installers()]
+        except (OSError, ValueError) as error:
+            raise typer.BadParameter("Cannot read saved agent connections") from error  # noqa: TRY003 - CLI input validation.
+    options = {
+        "runtime": True if runtime else None,
+        "mcp": True if mcp else None,
+        "cwd": cwd,
+        "session_id": session_id,
+        "runtime_data_dir": runtime_data_dir,
+        "prepare": True if prepare else None,
+        "dsh_command": dsh_command,
+    }
+    selected = select_hosts(agents, json_output=json_output) if agents else ()
+    validate_native_options(selected, **options)
+    if profile is not None and "dsh" not in selected:
+        raise typer.BadParameter("Doctor --profile requires selecting dsh")  # noqa: TRY003
+    if not selected:
+        checks = run_diagnostics(server_url=server_url, allow_insecure_http=allow_insecure_http)
+        _write_diagnostics(checks, json_output=json_output)
+        if not _diagnostics_ok(checks):
+            raise typer.Exit(code=1)
+        return
+    if explicit_server:
+        raise typer.BadParameter("Agent diagnostics use their saved connections; change them with config agent")  # noqa: TRY003 - CLI input validation.
+    report_agents(
+        selected,
+        lambda host: diagnostic_result(doctor_checks(host, **options, profile=profile if host == "dsh" else None)),
+        json_output=json_output,
     )
 
 
-def _configure_codex_endpoint(marketplace: str, plugin_version: str, server_url: str) -> None:
+def _codex_endpoint_updates(marketplace: str, plugin_version: str, server_url: str) -> dict[Path, bytes]:
     """Keep the installed native MCP and Hook endpoint and saved credential source identical."""
 
     from powercontext.cli.authorization import credential_path
@@ -1346,119 +354,26 @@ def _configure_codex_endpoint(marketplace: str, plugin_version: str, server_url:
         entry["http_headers_helper"] = (
             subprocess.list2cmdline(helper) if sys.platform == "win32" else shlex.join(helper)
         )
-        _write_bytes_atomically(path, (json.dumps(config, indent=2) + "\n").encode())
+        return {path: (json.dumps(config, indent=2) + "\n").encode()}
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise SetupError(  # noqa: TRY003
             f"Cannot configure the installed Codex MCP endpoint at {path}; rerun setup after checking the plugin cache"
         ) from error
 
 
-def install_claude_code_plugin(
-    *,
-    source: str,
-    ref: str,
-    server_url: str,
-    capture_prompts: bool,
-    allow_insecure_http: bool = False,
-) -> ClaudeCodeSetupResult:
-    """Install and verify the plugin from one local or Git marketplace source."""
-
-    if which("claude") is None:
-        raise SetupError.claude_unavailable()
-    server_url = _normalize_claude_server_url(server_url, allow_insecure_http=allow_insecure_http)
-
-    marketplace_source = _normalize_claude_marketplace_source(source, ref=ref)
-    marketplaces = _run_claude_json("plugin", "marketplace", "list")
-    marketplace = _claude_marketplace(marketplaces, CLAUDE_MARKETPLACE_NAME)
-    if marketplace is not None and not _claude_marketplace_matches(marketplace, marketplace_source):
-        raise SetupError.claude_marketplace_source_mismatch(
-            marketplace_source,
-            _describe_claude_marketplace_source(marketplace),
-        )
-    marketplace_existed = marketplace is not None
-
-    plugins = _run_claude_json("plugin", "list")
-    previous_plugin = _claude_plugin(plugins, scope="user")
-    plugin_existed = previous_plugin is not None
-    settings_snapshot = _snapshot_claude_settings()
-    marketplace_added = False
-    plugin_added = False
-    try:
-        if not marketplace_existed:
-            _run_claude("plugin", "marketplace", "add", marketplace_source, "--scope", "user")
-            marketplace_added = True
-        else:
-            # An existing marketplace and plugin keep their cached version until
-            # both are refreshed, so setup would otherwise configure a status
-            # line for a cache this release never wrote.
-            _run_claude("plugin", "marketplace", "update", CLAUDE_MARKETPLACE_NAME)
-        if plugin_existed:
-            _run_claude(
-                "plugin",
-                "update",
-                f"{PLUGIN_NAME}@{CLAUDE_MARKETPLACE_NAME}",
-                "--scope",
-                "user",
-            )
-        _run_claude(
-            "plugin",
-            "install",
-            f"{PLUGIN_NAME}@{CLAUDE_MARKETPLACE_NAME}",
-            "--scope",
-            "user",
-        )
-        plugin_added = not plugin_existed
-        installed = _run_claude_json("plugin", "list")
-        plugin = _require_enabled_claude_plugin(installed, scope="user")
-        _configure_claude_plugin(
-            plugin=plugin,
-            server_url=server_url,
-            capture_prompts=capture_prompts,
-            allow_insecure_http=allow_insecure_http,
-        )
-    except SetupError:
-        if plugin_added:
-            with suppress(SetupError):
-                _run_claude(
-                    "plugin",
-                    "uninstall",
-                    f"{PLUGIN_NAME}@{CLAUDE_MARKETPLACE_NAME}",
-                    "--scope",
-                    "user",
-                )
-        with suppress(OSError):
-            _restore_claude_settings(settings_snapshot)
-        if marketplace_added:
-            with suppress(SetupError):
-                _run_claude(
-                    "plugin",
-                    "marketplace",
-                    "remove",
-                    CLAUDE_MARKETPLACE_NAME,
-                )
-        raise
-
-    plan = _claude_setup_plan()
-    from powercontext.cli.authorization import configure_stored_authorization, setup_authorization_value
-
-    authorization_state = configure_stored_authorization(
-        "claude-code", server_url=server_url, value=setup_authorization_value("claude-code")
-    )
-    return ClaudeCodeSetupResult(
-        marketplace=CLAUDE_MARKETPLACE_NAME,
-        plugin=PLUGIN_NAME,
-        plugin_version=_required_string(plugin, "version"),
-        settings_file=plan["settings_file"],
-        cache_dir=plan["cache_dir"],
-        data_dir=plan["data_dir"],
-        authorization_state=authorization_state,
-    )
-
-
 def run_diagnostics(*, server_url: str | None = None, allow_insecure_http: bool | None = None) -> dict[str, Diagnostic]:
     """Collect installed-environment diagnostics without changing state."""
 
-    package = Diagnostic(status=DiagnosticStatus.OK, detail=f"powercontext {version('powercontext')}")
+    return {
+        "package": Diagnostic(status=DiagnosticStatus.OK, detail=f"powercontext {version('powercontext')}"),
+        **server_diagnostics(server_url=server_url, allow_insecure_http=allow_insecure_http),
+    }
+
+
+def server_diagnostics(
+    *, server_url: str | None, allow_insecure_http: bool | None, readiness: Diagnostic | None = None
+) -> dict[str, Diagnostic]:
+    """Check the selected Server and its optional local service registration."""
     service: dict[str, Diagnostic] = {}
     try:
         server_url, allowed = resolve_client_transport(
@@ -1474,6 +389,8 @@ def run_diagnostics(*, server_url: str | None = None, allow_insecure_http: bool 
                 status=DiagnosticStatus.DEGRADED,
                 detail="Insecure HTTP explicitly enabled; credentials and content are unencrypted in transit",
             )
+        if readiness is not None:
+            return {**service, "server": readiness}
         liveness = _server_liveness_diagnostic(server_url)
     readiness = (
         _server_readiness_diagnostic(server_url)
@@ -1484,7 +401,6 @@ def run_diagnostics(*, server_url: str | None = None, allow_insecure_http: bool 
         )
     )
     return {
-        "package": package,
         **service,
         "server_liveness": liveness,
         "server_readiness": readiness,
@@ -1498,7 +414,11 @@ def _local_service_diagnostics(server_url: str) -> dict[str, Diagnostic]:
     if not is_loopback_host(parsed.hostname):
         return {}
 
-    from powercontext.service.controller import ServiceController
+    try:
+        from powercontext.service.controller import ServiceController
+    except ModuleNotFoundError:
+        # Personal service inspection is optional for CLI-only installations.
+        return {}
     from powercontext.service.model import (
         DefinitionState,
         ManagerState,
@@ -1573,172 +493,6 @@ def _local_service_diagnostics(server_url: str) -> dict[str, Diagnostic]:
             f"{status.manager.value}; ownership: {status.manager_ownership.value}"
             if status.log_location is None
             else (f"{status.manager.value}; ownership: {status.manager_ownership.value}; logs: {status.log_location}")
-        ),
-    )
-    return diagnostics
-
-
-def codex_setup_checks(diagnostics: dict[str, Diagnostic]) -> dict[str, Diagnostic]:
-    """Require working basic connectivity at installation, leaving full coverage to doctor."""
-    return {name: check for name, check in diagnostics.items() if name != "mcp_full_profile"}
-
-
-def run_codex_diagnostics() -> dict[str, Diagnostic]:
-    """Collect plugin and native MCP diagnostics for the optional Codex integration."""
-
-    executable = which("codex")
-    if executable is None:
-        return {
-            "codex": Diagnostic(
-                status=DiagnosticStatus.FAILED,
-                detail="Codex CLI is not installed or is not on PATH",
-            ),
-            "plugin": Diagnostic(
-                status=DiagnosticStatus.SKIPPED,
-                detail="not checked because Codex CLI is unavailable",
-            ),
-        }
-    try:
-        result = _run_codex_json("plugin", "list")
-    except SetupError as error:
-        return {
-            "codex": Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error)),
-            "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
-        }
-    installed = result.get("installed")
-    plugin = None
-    if isinstance(installed, list):
-        plugin = next(
-            (
-                item
-                for item in installed
-                if isinstance(item, dict)
-                and item.get("name") == PLUGIN_NAME
-                and item.get("installed") is True
-                and item.get("enabled") is True
-            ),
-            None,
-        )
-    diagnostics = {
-        "codex": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
-        "mcp_full_profile": Diagnostic(
-            status=DiagnosticStatus.SKIPPED, detail="not checked because native MCP discovery has not succeeded"
-        ),
-        "plugin": Diagnostic(
-            status=DiagnosticStatus.OK if plugin is not None else DiagnosticStatus.FAILED,
-            detail=(
-                f"{plugin.get('pluginId')} enabled={plugin.get('enabled')}"
-                if plugin is not None
-                else "PowerContext plugin is not installed"
-            ),
-        ),
-    }
-    if plugin is None:
-        diagnostics["mcp_configuration"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because the PowerContext plugin is unavailable",
-        )
-        diagnostics["authorization"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because the PowerContext MCP entry is unavailable",
-        )
-        diagnostics["mcp_tools"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because the PowerContext plugin is unavailable",
-        )
-        return diagnostics
-
-    try:
-        servers = _run_codex_mcp_list()
-    except SetupError as error:
-        diagnostics["mcp_configuration"] = Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error))
-        diagnostics["authorization"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because native MCP configuration is unavailable",
-        )
-        diagnostics["mcp_tools"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because native MCP configuration is unavailable",
-        )
-        return diagnostics
-
-    server = next((item for item in servers if item.get("name") == PLUGIN_NAME), None)
-    transport = server.get("transport") if server is not None else None
-    environment_headers = transport.get("env_http_headers") if isinstance(transport, dict) else None
-    mcp_url = transport.get("url") if isinstance(transport, dict) else None
-    configuration_ok = (
-        server is not None
-        and server.get("enabled") is True
-        and isinstance(mcp_url, str)
-        and bool(mcp_url)
-        and environment_headers == {"Authorization": "POWERCONTEXT_CODEX_AUTHORIZATION"}
-    )
-    diagnostics["mcp_configuration"] = Diagnostic(
-        status=DiagnosticStatus.OK if configuration_ok else DiagnosticStatus.FAILED,
-        detail=(
-            f"native HTTP MCP enabled with environment overrides; auth_status={server.get('auth_status', 'unknown')}"
-            if configuration_ok and server is not None
-            else "PowerContext native MCP entry is missing, disabled, or lacks environment-backed authorization; "
-            "reinstall the current plugin"
-        ),
-    )
-    if not configuration_ok or not isinstance(mcp_url, str):
-        diagnostics["authorization"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because native MCP configuration is invalid",
-        )
-        diagnostics["mcp_tools"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because native MCP configuration is invalid",
-        )
-        return diagnostics
-
-    credential_helper = isinstance(transport, dict) and bool(transport.get("http_headers_helper"))
-    authorization_diagnostic, native_authorization = _resolve_codex_native_authorization(
-        mcp_url, credential_helper=credential_helper
-    )
-    diagnostics["authorization"] = authorization_diagnostic
-    if not authorization_diagnostic.ok:
-        diagnostics["mcp_tools"] = Diagnostic(
-            status=DiagnosticStatus.SKIPPED,
-            detail="not checked because Codex host authorization is invalid",
-        )
-        return diagnostics
-
-    try:
-        native_server = _probe_codex_mcp_status(authorization=native_authorization)
-    except SetupError as error:
-        diagnostics["mcp_tools"] = Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error))
-        return diagnostics
-    tools = native_server.get("tools")
-    tool_names = set(tools) if isinstance(tools, dict) else set()
-    missing = sorted(_CODEX_REQUIRED_MCP_TOOLS - tool_names)
-    if native_authorization is None and (
-        not credential_helper or (authorization_diagnostic.checks or {}).get("setup_managed") == "url_mismatch"
-    ):
-        failure_hint = (
-            "; check Server availability and, for an authenticated Server, set "
-            "POWERCONTEXT_CODEX_AUTHORIZATION while rerunning `powercontext setup codex`"
-        )
-    else:
-        failure_hint = "; check Server availability and whether the effective host credential is still valid"
-    diagnostics["mcp_tools"] = Diagnostic(
-        status=DiagnosticStatus.OK if not missing else DiagnosticStatus.FAILED,
-        detail=(
-            f"Codex native MCP initialized and discovered {len(tool_names)} tools"
-            if not missing
-            else "Codex native MCP did not discover required tools: " + ", ".join(missing) + failure_hint
-        ),
-    )
-    missing_full = sorted(_CODEX_FULL_MCP_TOOLS - tool_names)
-    diagnostics["mcp_full_profile"] = Diagnostic(
-        status=DiagnosticStatus.OK if not missing_full else DiagnosticStatus.DEGRADED,
-        detail=(
-            "Codex native MCP exposes all full-profile tools; model readiness and Hook execution are separate checks"
-            if not missing_full
-            else "Full-profile tools unavailable: "
-            + ", ".join(missing_full)
-            + "; upgrade the Server and refresh the plugin, then open a new Codex session"
         ),
     )
     return diagnostics
@@ -1942,44 +696,120 @@ def _resolve_codex_native_authorization(
     )
 
 
+def _codex_search_path() -> str:
+    """Return the PATH value to search, mirroring which()'s unset-PATH fallback roots."""
+    path = os.environ.get("PATH")
+    if path is not None:
+        return path
+    confstr = getattr(os, "confstr", None)
+    if confstr is None:
+        return os.defpath
+    try:
+        return confstr("CS_PATH")
+    except ValueError:
+        # CS_PATH is not a known confstr variable on this platform.
+        return os.defpath
+
+
+def _codex_path_executable() -> str | None:
+    """Resolve Codex from PATH directories without the implicit current-directory preference.
+
+    ``shutil.which`` inserts the current directory first on Windows (unconditionally
+    before Python 3.12, and unless ``NoDefaultCurrentDirectoryInExePath`` is set from
+    3.12 on), which lets a ``codex.cmd`` in the working directory shadow the PATH
+    executable. Discovery per #2184 is about PATH, so enumerate PATH entries directly
+    while keeping which()'s matching semantics across Python 3.11-3.14: PATHEXT
+    candidates on Windows, the bare name with an executable-bit check on POSIX.
+    Explicit PATH entries - including ``.`` and empty entries - keep their usual meaning.
+    An unset PATH falls back to which()'s search roots (``os.confstr("CS_PATH")``, then
+    ``os.defpath``), and an empty PATH value means no search at all, like which().
+    """
+    name = "codex"
+    if sys.platform == "win32":
+        extensions = [
+            extension.rstrip(".")
+            for extension in (os.getenv("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep)
+            if extension
+        ]
+        candidates = [name + extension for extension in extensions]
+        if name.upper().endswith(tuple(extension.upper() for extension in extensions)):
+            candidates.insert(0, name)
+    else:
+        candidates = [name]
+    path = _codex_search_path()
+    # Parity with which() (bpo-35755): an empty PATH value means no search at all,
+    # while empty entries inside a non-empty PATH keep their usual cwd meaning.
+    if not path:
+        return None
+    seen: set[str] = set()
+    for directory in path.split(os.pathsep):
+        key = os.path.normcase(directory)
+        if key in seen:
+            continue
+        seen.add(key)
+        for candidate in candidates:
+            resolved = os.path.join(directory, candidate)
+            if os.path.isfile(resolved) and (sys.platform == "win32" or os.access(resolved, os.X_OK)):
+                return resolved
+    return None
+
+
+def _codex_command(*arguments: str) -> list[str]:
+    """Resolve Codex and reject inputs that Windows batch parsing can reinterpret."""
+    executable = _codex_path_executable()
+    if executable is None:
+        raise SetupError("Codex CLI is not installed or is not on PATH.")  # noqa: TRY003
+    command = [executable, *arguments]
+    # shell=False does not prevent cmd.exe from interpreting a batch launcher's inputs.
+    # Windows also launches PATHEXT aliases ending in spaces or dots as batch files.
+    if sys.platform == "win32" and Path(executable.rstrip(" .")).suffix.casefold() in {".cmd", ".bat"}:
+        if any(character in '&|<>()^%!"\x7f' or ord(character) < 32 for value in command for character in value):
+            raise SetupError(  # noqa: TRY003
+                "Codex CLI Windows batch launchers cannot safely pass shell metacharacters or ASCII control characters "
+                "in their path or arguments. Use a native Codex executable, or a batch-launcher path and arguments "
+                "without these characters."
+            )
+    return command
+
+
 def _run_codex_mcp_list() -> list[dict[str, Any]]:
     """Read Codex's resolved native MCP configuration without exposing header values."""
 
-    command = ["codex", "mcp", "list", "--json"]
+    command = _codex_command("mcp", "list", "--json")
     try:
         completed = subprocess.run(  # noqa: S603 - arguments are fixed and do not contain credentials.
             command,
             check=False,
             capture_output=True,
-            text=True,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise SetupError.command_unavailable(command[:-1], error) from error
+        raise SetupError(f"Cannot run {' '.join(command[:-1])}: {error}") from error  # noqa: TRY003
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
-        raise SetupError.command_failed(command[:-1], detail)
+        detail = (
+            completed.stderr.decode("utf-8", errors="replace").strip()
+            or completed.stdout.decode("utf-8", errors="replace").strip()
+            or f"exit code {completed.returncode}"
+        )
+        raise SetupError(f"`{' '.join(command[:-1])}` failed: {detail}")  # noqa: TRY003
     try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise SetupError.invalid_command_output(command[:-1], "invalid JSON") from error
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SetupError(f"`{' '.join(command[:-1])}` returned invalid JSON") from error  # noqa: TRY003
     if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
-        raise SetupError.invalid_command_output(command[:-1], "an unexpected result")
+        raise SetupError(f"`{' '.join(command[:-1])}` returned an unexpected result")  # noqa: TRY003
     return cast(list[dict[str, Any]], payload)
 
 
 def _probe_codex_mcp_status(*, authorization: str | None = None) -> dict[str, Any]:  # noqa: C901
     """Initialize Codex app-server and return its PowerContext MCP status."""
 
-    executable = which("codex")
-    if executable is None:
-        raise SetupError.codex_unavailable()
+    command = _codex_command("app-server", "--listen", "stdio://")
     environment = os.environ.copy()
     if authorization is None:
         environment.pop("POWERCONTEXT_CODEX_AUTHORIZATION", None)
     else:
         environment["POWERCONTEXT_CODEX_AUTHORIZATION"] = authorization
-    command = [executable, "app-server", "--listen", "stdio://"]
     try:
         process = subprocess.Popen(  # noqa: S603 - arguments are fixed and contain no credentials.
             command,
@@ -1992,7 +822,7 @@ def _probe_codex_mcp_status(*, authorization: str | None = None) -> dict[str, An
             env=environment,
         )
     except OSError as error:
-        raise SetupError.command_unavailable(command, error) from error
+        raise SetupError(f"Cannot run {' '.join(command)}: {error}") from error  # noqa: TRY003
     stdin = process.stdin
     stdout = process.stdout
     if stdin is None or stdout is None:
@@ -2082,43 +912,6 @@ def _probe_codex_mcp_status(*, authorization: str | None = None) -> dict[str, An
             process.kill()
             process.wait(timeout=5)
         reader.join(timeout=1)
-
-
-def run_claude_code_diagnostics() -> dict[str, Diagnostic]:
-    """Collect diagnostics for the optional Claude Code integration."""
-
-    executable = which("claude")
-    if executable is None:
-        return {
-            "claude_code": Diagnostic(
-                status=DiagnosticStatus.FAILED,
-                detail="Claude Code CLI is not installed or is not on PATH",
-            ),
-            "plugin": Diagnostic(
-                status=DiagnosticStatus.SKIPPED,
-                detail="not checked because Claude Code CLI is unavailable",
-            ),
-        }
-    try:
-        result = _run_claude_json("plugin", "list")
-    except SetupError as error:
-        return {
-            "claude_code": Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error)),
-            "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
-        }
-    plugin = _claude_plugin(result)
-    plugin_enabled = plugin is not None and plugin.get("enabled") is True
-    return {
-        "claude_code": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
-        "plugin": Diagnostic(
-            status=DiagnosticStatus.OK if plugin_enabled else DiagnosticStatus.FAILED,
-            detail=(
-                f"{plugin.get('id')} enabled={plugin.get('enabled')}"
-                if plugin is not None
-                else "PowerContext plugin is not installed"
-            ),
-        ),
-    }
 
 
 def _server_liveness_diagnostic(server_url: str) -> Diagnostic:
@@ -2237,51 +1030,9 @@ def _normalize_claude_marketplace_source(source: str, *, ref: str) -> str:
     return f"{source}#{ref}"
 
 
-def _normalize_claude_server_url(value: str, *, allow_insecure_http: bool = False) -> str:
-    normalized = value.strip().rstrip("/")
-    parsed = urlsplit(normalized)
-    if parsed.username is not None or parsed.password is not None:
-        raise SetupError.claude_server_url_credentials()
-    if parsed.hostname is None or parsed.scheme not in {"http", "https"}:
-        raise SetupError.claude_server_url_scheme()
-    if parsed.query or parsed.fragment:
-        raise SetupError.claude_server_url_suffix()
-    if parsed.scheme == "http" and not is_loopback_host(parsed.hostname) and not allow_insecure_http:
-        raise SetupError.claude_server_url_transport()
-    path = parsed.path.rstrip("/")
-    if path.endswith("/mcp"):
-        path = path.removesuffix("/mcp")
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
-
-
 def _claude_config_dir() -> Path:
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(configured).expanduser() if configured else Path.home() / ".claude"
-
-
-def _claude_setup_plan() -> dict[str, str]:
-    config_dir = _claude_config_dir()
-    return {
-        "settings_file": str(config_dir / "settings.json"),
-        "cache_dir": str(config_dir / "plugins" / "cache" / CLAUDE_MARKETPLACE_NAME / PLUGIN_NAME / "<version>"),
-        "data_dir": str(config_dir / "plugins" / "data" / f"{PLUGIN_NAME}-{CLAUDE_MARKETPLACE_NAME}"),
-    }
-
-
-def _write_claude_setup_plan(plan: dict[str, str]) -> None:
-    typer.echo("Claude Code setup plan (no changes made yet):", err=True)
-    typer.echo(f"  Settings entry: {plan['settings_file']}", err=True)
-    typer.echo(f"  Plugin cache: {plan['cache_dir']}", err=True)
-    typer.echo(f"  Plugin data: {plan['data_dir']}", err=True)
-    typer.echo("  Permissions: read/write access to the Claude Code configuration directory", err=True)
-    typer.echo(
-        f"  Rollback: claude plugin uninstall {PLUGIN_NAME}@{CLAUDE_MARKETPLACE_NAME} --scope user",
-        err=True,
-    )
-    typer.echo(
-        f"  Rollback: claude plugin marketplace remove {CLAUDE_MARKETPLACE_NAME}",
-        err=True,
-    )
 
 
 def _claude_marketplace(value: object, name: str) -> dict[str, Any] | None:
@@ -2345,28 +1096,20 @@ def _claude_plugin(value: object, *, scope: str | None = None) -> dict[str, Any]
     return None
 
 
-def _require_enabled_claude_plugin(value: object, *, scope: str | None = None) -> dict[str, Any]:
+def _require_claude_plugin(value: object, *, scope: str | None = None) -> dict[str, Any]:
     plugin = _claude_plugin(value, scope=scope)
-    if plugin is None or plugin.get("enabled") is not True:
-        raise SetupError.claude_plugin_not_enabled()
+    if plugin is None:
+        raise SetupError("Claude Code did not report an installed PowerContext plugin after installation.")  # noqa: TRY003
     return plugin
 
 
-def _snapshot_claude_settings() -> bytes | None:
-    settings_file = _claude_config_dir() / "settings.json"
-    try:
-        return settings_file.read_bytes()
-    except FileNotFoundError:
-        return None
-
-
-def _configure_claude_plugin(
+def _claude_configuration_updates(
     *,
     plugin: dict[str, Any],
     server_url: str,
-    capture_prompts: bool,
+    capture_prompts: bool | None,
     allow_insecure_http: bool = False,
-) -> None:
+) -> dict[Path, bytes]:
     """Merge non-sensitive plugin options unsupported by the Claude install CLI."""
 
     settings_file = _claude_config_dir() / "settings.json"
@@ -2374,26 +1117,38 @@ def _configure_claude_plugin(
         settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.exists() else {}
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         if isinstance(error, OSError):
-            raise SetupError.claude_settings_write(settings_file, error) from error
-        raise SetupError.invalid_claude_settings(settings_file) from error
+            raise SetupError(f"Cannot update Claude Code settings at {settings_file}: {error}") from error  # noqa: TRY003
+        raise SetupError(  # noqa: TRY003
+            f"Claude Code settings at {settings_file} must contain a JSON object with object-valued plugin options."
+        ) from error
     if not isinstance(settings, dict):
-        raise SetupError.invalid_claude_settings(settings_file)
+        raise SetupError(  # noqa: TRY003
+            f"Claude Code settings at {settings_file} must contain a JSON object with object-valued plugin options."
+        )
 
     plugin_configs = settings.setdefault("pluginConfigs", {})
     if not isinstance(plugin_configs, dict):
-        raise SetupError.invalid_claude_settings(settings_file)
+        raise SetupError(  # noqa: TRY003
+            f"Claude Code settings at {settings_file} must contain a JSON object with object-valued plugin options."
+        )
     plugin_id = f"{PLUGIN_NAME}@{CLAUDE_MARKETPLACE_NAME}"
     plugin_config = plugin_configs.setdefault(plugin_id, {})
     if not isinstance(plugin_config, dict):
-        raise SetupError.invalid_claude_settings(settings_file)
+        raise SetupError(  # noqa: TRY003
+            f"Claude Code settings at {settings_file} must contain a JSON object with object-valued plugin options."
+        )
     options = plugin_config.setdefault("options", {})
     if not isinstance(options, dict):
-        raise SetupError.invalid_claude_settings(settings_file)
+        raise SetupError(  # noqa: TRY003
+            f"Claude Code settings at {settings_file} must contain a JSON object with object-valued plugin options."
+        )
     options.update({
         "server_url": server_url,
-        "capture_prompts": capture_prompts,
         "allow_insecure_http": allow_insecure_http,
     })
+
+    if capture_prompts is not None:
+        options["capture_prompts"] = capture_prompts
 
     install_path = _claude_plugin_install_path(plugin)
     statusline_command = shlex.join([
@@ -2409,10 +1164,7 @@ def _configure_claude_plugin(
             "command": statusline_command,
             "refreshInterval": 30,
         }
-    try:
-        _write_bytes_atomically(settings_file, (json.dumps(settings, indent=2) + "\n").encode())
-    except OSError as error:
-        raise SetupError.claude_settings_write(settings_file, error) from error
+    return {settings_file: (json.dumps(settings, indent=2) + "\n").encode()}
 
 
 def _claude_plugin_install_path(plugin: dict[str, Any]) -> Path:
@@ -2439,60 +1191,48 @@ def _is_powercontext_statusline(value: object) -> bool:
     )
 
 
-def _restore_claude_settings(snapshot: bytes | None) -> None:
-    settings_file = _claude_config_dir() / "settings.json"
-    if snapshot is None:
-        settings_file.unlink(missing_ok=True)
-        return
-    _write_bytes_atomically(settings_file, snapshot)
-
-
-def _write_bytes_atomically(path: Path, content: bytes) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(temporary_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.write(descriptor, content)
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        os.replace(temporary_path, path)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        with suppress(FileNotFoundError):
-            temporary_path.unlink()
-
-
 def _run_codex_json(*arguments: str) -> dict[str, Any]:
-    command = ["codex", *arguments, "--json"]
+    command = _codex_command(*arguments, "--json")
     try:
         completed = subprocess.run(  # noqa: S603 - arguments are passed directly to the fixed Codex executable.
             command,
             check=False,
             capture_output=True,
-            text=True,
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise SetupError.command_unavailable(command[:-1], error) from error
+        raise SetupError(f"Cannot run {' '.join(command[:-1])}: {error}") from error  # noqa: TRY003
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
-        raise SetupError.command_failed(command[:-1], detail)
+        detail = (
+            completed.stderr.decode("utf-8", errors="replace").strip()
+            or completed.stdout.decode("utf-8", errors="replace").strip()
+            or f"exit code {completed.returncode}"
+        )
+        raise SetupError(f"`{' '.join(command[:-1])}` failed: {detail}")  # noqa: TRY003
     try:
-        result = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise SetupError.invalid_command_output(command[:-1], "invalid JSON") from error
+        result = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SetupError(f"`{' '.join(command[:-1])}` returned invalid JSON") from error  # noqa: TRY003
     if not isinstance(result, dict):
-        raise SetupError.invalid_command_output(command[:-1], "an unexpected result")
+        raise SetupError(f"`{' '.join(command[:-1])}` returned an unexpected result")  # noqa: TRY003
     return result
+
+
+def _installed_codex_plugin() -> dict[str, Any] | None:
+    plugins = [
+        item
+        for item in _run_codex_json("plugin", "list")["installed"]
+        if item["name"] == PLUGIN_NAME and item["installed"]
+    ]
+    if len(plugins) > 1:
+        raise SetupError("Expected one installed PowerContext plugin in Codex; inspect codex plugin list")  # noqa: TRY003
+    return plugins[0] if plugins else None
 
 
 def _run_claude(*arguments: str) -> subprocess.CompletedProcess[str]:
     executable = which("claude")
     if executable is None:
-        raise SetupError.claude_unavailable()
+        raise SetupError("Claude Code CLI is not installed or is not on PATH.")  # noqa: TRY003
     command = [executable, *arguments]
     try:
         completed = subprocess.run(  # noqa: S603 - arguments are passed directly to the fixed Claude executable.
@@ -2505,10 +1245,10 @@ def _run_claude(*arguments: str) -> subprocess.CompletedProcess[str]:
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise SetupError.command_unavailable(command, error) from error
+        raise SetupError(f"Cannot run {' '.join(command)}: {error}") from error  # noqa: TRY003
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
-        raise SetupError.command_failed(command, detail)
+        raise SetupError(f"`{' '.join(command)}` failed: {detail}")  # noqa: TRY003
     return completed
 
 
@@ -2518,29 +1258,296 @@ def _run_claude_json(*arguments: str) -> object:
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as error:
-        raise SetupError.invalid_command_output(["claude", *command], "invalid JSON") from error
+        raise SetupError(f"`{' '.join(['claude', *command])}` returned invalid JSON") from error  # noqa: TRY003
 
 
 def _required_string(value: dict[str, Any], name: str) -> str:
     result = value.get(name)
     if not isinstance(result, str) or not result:
-        raise SetupError.missing_result(name)
+        raise SetupError(f"Integration CLI did not return {name}")  # noqa: TRY003
     return result
 
 
-__all__ = [
-    "ClaudeCodeSetupResult",
-    "CodexSetupResult",
-    "Diagnostic",
-    "DiagnosticStatus",
-    "OpenClawSetupResult",
-    "SetupError",
-    "doctor_app",
-    "install_claude_code_plugin",
-    "install_codex_plugin",
-    "run_claude_code_diagnostics",
-    "run_codex_diagnostics",
-    "run_diagnostics",
-    "setup_app",
-    "setup_openclaw",
-]
+__all__ = ["Diagnostic", "DiagnosticStatus", "SetupError", "doctor_app", "run_diagnostics", "setup_app"]
+
+
+class CodexInstaller:
+    def install(self, source):
+        if _codex_path_executable() is None:
+            raise SetupError("Codex CLI is not installed or is not on PATH.")  # noqa: TRY003
+        marketplace_source, local = _normalize_marketplace_source(source.location)
+        arguments = ["plugin", "marketplace", "add", marketplace_source]
+        if not local:
+            arguments.extend(("--ref", source.ref))
+        marketplace = _required_string(_run_codex_json(*arguments), "marketplaceName")
+        plugin = next(
+            (
+                item
+                for item in _run_codex_json("plugin", "list")["installed"]
+                if item["name"] == PLUGIN_NAME and item["marketplaceName"] == marketplace and item["installed"]
+            ),
+            None,
+        )
+        if plugin is None or plugin.get("enabled") is not False:
+            plugin = _run_codex_json("plugin", "add", f"{PLUGIN_NAME}@{marketplace}")
+        return {
+            "marketplace": marketplace,
+            "plugin": _required_string(plugin, "name"),
+            "plugin_version": _required_string(plugin, "version"),
+            "data_dir": str(powercontext_data_dir()),
+        }
+
+    def configure(self, connection):
+        from powercontext.cli.authorization import (
+            configure_codex_desktop_authorization,
+            credential_path,
+            read_stored_authorization,
+        )
+        from powercontext.cli.transport import configure_connection
+
+        record = _installed_codex_plugin()
+        if record is None:
+            raise SetupError("PowerContext is not installed in Codex; run powercontext setup codex")  # noqa: TRY003
+        marketplace = _required_string(record, "marketplaceName")
+        state = configure_connection(
+            connection,
+            writes=_codex_endpoint_updates(marketplace, _required_string(record, "version"), connection.server_url),
+        )
+        value = read_stored_authorization(credential_path("codex"), server_url=connection.server_url).authorization
+        if value is not None:
+            configure_codex_desktop_authorization(value)
+        return {"authorization_state": state}
+
+    def verify(self) -> dict[str, Diagnostic]:
+        """Collect plugin and native MCP diagnostics for the optional Codex integration."""
+
+        executable = _codex_path_executable()
+        if executable is None:
+            return {
+                "codex": Diagnostic(
+                    status=DiagnosticStatus.FAILED,
+                    detail="Codex CLI is not installed or is not on PATH",
+                ),
+                "plugin": Diagnostic(
+                    status=DiagnosticStatus.SKIPPED,
+                    detail="not checked because Codex CLI is unavailable",
+                ),
+            }
+        try:
+            plugin = _installed_codex_plugin()
+        except SetupError as error:
+            return {
+                "codex": Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error)),
+                "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
+            }
+        plugin_enabled = plugin is not None and plugin.get("enabled") is True
+        detail = (
+            f"{plugin.get('pluginId')} enabled={plugin.get('enabled')}"
+            if plugin is not None
+            else "PowerContext plugin is not installed"
+        )
+        if plugin is not None and not plugin_enabled:
+            detail += (
+                f"; setup preserves disabled plugin version {plugin.get('version')}; "
+                "use codex plugin add to refresh its source and enable it"
+            )
+        diagnostics = {
+            "codex": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
+            "mcp_full_profile": Diagnostic(
+                status=DiagnosticStatus.SKIPPED, detail="not checked because native MCP discovery has not succeeded"
+            ),
+            "plugin": Diagnostic(
+                status=DiagnosticStatus.OK if plugin_enabled else DiagnosticStatus.FAILED,
+                detail=detail,
+            ),
+        }
+        if not plugin_enabled:
+            diagnostics["mcp_configuration"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because the PowerContext plugin is unavailable",
+            )
+            diagnostics["authorization"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because the PowerContext MCP entry is unavailable",
+            )
+            diagnostics["mcp_tools"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because the PowerContext plugin is unavailable",
+            )
+            return diagnostics
+
+        try:
+            servers = _run_codex_mcp_list()
+        except SetupError as error:
+            diagnostics["mcp_configuration"] = Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error))
+            diagnostics["authorization"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because native MCP configuration is unavailable",
+            )
+            diagnostics["mcp_tools"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because native MCP configuration is unavailable",
+            )
+            return diagnostics
+
+        server = next((item for item in servers if item.get("name") == PLUGIN_NAME), None)
+        transport = server.get("transport") if server is not None else None
+        environment_headers = transport.get("env_http_headers") if isinstance(transport, dict) else None
+        mcp_url = transport.get("url") if isinstance(transport, dict) else None
+        configuration_ok = (
+            server is not None
+            and server.get("enabled") is True
+            and isinstance(mcp_url, str)
+            and bool(mcp_url)
+            and environment_headers == {"Authorization": "POWERCONTEXT_CODEX_AUTHORIZATION"}
+        )
+        diagnostics["mcp_configuration"] = Diagnostic(
+            status=DiagnosticStatus.OK if configuration_ok else DiagnosticStatus.FAILED,
+            detail=(
+                f"native HTTP MCP enabled with environment overrides; auth_status={server.get('auth_status', 'unknown')}"
+                if configuration_ok and server is not None
+                else "PowerContext native MCP entry is missing, disabled, or lacks environment-backed authorization; "
+                "reinstall the current plugin"
+            ),
+        )
+        if not configuration_ok or not isinstance(mcp_url, str):
+            diagnostics["authorization"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because native MCP configuration is invalid",
+            )
+            diagnostics["mcp_tools"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because native MCP configuration is invalid",
+            )
+            return diagnostics
+
+        credential_helper = isinstance(transport, dict) and bool(transport.get("http_headers_helper"))
+        authorization_diagnostic, native_authorization = _resolve_codex_native_authorization(
+            mcp_url, credential_helper=credential_helper
+        )
+        diagnostics["authorization"] = authorization_diagnostic
+        if not authorization_diagnostic.ok:
+            diagnostics["mcp_tools"] = Diagnostic(
+                status=DiagnosticStatus.SKIPPED,
+                detail="not checked because Codex host authorization is invalid",
+            )
+            return diagnostics
+
+        try:
+            native_server = _probe_codex_mcp_status(authorization=native_authorization)
+        except SetupError as error:
+            diagnostics["mcp_tools"] = Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error))
+            return diagnostics
+        tools = native_server.get("tools")
+        tool_names = set(tools) if isinstance(tools, dict) else set()
+        missing = sorted(_CODEX_REQUIRED_MCP_TOOLS - tool_names)
+        if native_authorization is None and (
+            not credential_helper or (authorization_diagnostic.checks or {}).get("setup_managed") == "url_mismatch"
+        ):
+            failure_hint = (
+                "; check Server availability and, for an authenticated Server, set "
+                "POWERCONTEXT_CODEX_AUTHORIZATION while rerunning `powercontext setup codex`"
+            )
+        else:
+            failure_hint = "; check Server availability and whether the effective host credential is still valid"
+        diagnostics["mcp_tools"] = Diagnostic(
+            status=DiagnosticStatus.OK if not missing else DiagnosticStatus.FAILED,
+            detail=(
+                f"Codex native MCP initialized and discovered {len(tool_names)} tools"
+                if not missing
+                else "Codex native MCP did not discover required tools: " + ", ".join(missing) + failure_hint
+            ),
+        )
+        missing_full = sorted(_CODEX_FULL_MCP_TOOLS - tool_names)
+        diagnostics["mcp_full_profile"] = Diagnostic(
+            status=DiagnosticStatus.OK if not missing_full else DiagnosticStatus.DEGRADED,
+            detail=(
+                "Codex native MCP exposes all full-profile tools; model readiness and Hook execution are separate checks"
+                if not missing_full
+                else "Full-profile tools unavailable: "
+                + ", ".join(missing_full)
+                + "; upgrade the Server and refresh the plugin, then open a new Codex session"
+            ),
+        )
+        return diagnostics
+
+
+@dataclass
+class ClaudeInstaller:
+    capture_prompts: bool | None = None
+
+    def install(self, source):
+        if which("claude") is None:
+            raise SetupError("Claude Code CLI is not installed or is not on PATH.")  # noqa: TRY003
+        location = _normalize_claude_marketplace_source(source.location, ref=source.ref)
+        market = _claude_marketplace(_run_claude_json("plugin", "marketplace", "list"), CLAUDE_MARKETPLACE_NAME)
+        if market is not None and not _claude_marketplace_matches(market, location):
+            raise SetupError(  # noqa: TRY003
+                f"Claude Code marketplace `powercontext` uses {_describe_claude_marketplace_source(market)}, but setup requested {location}. Remove it with `claude plugin marketplace remove powercontext`, then rerun setup."
+            )
+        installed = _claude_plugin(_run_claude_json("plugin", "list"), scope="user")
+        if market is None:
+            _run_claude("plugin", "marketplace", "add", location, "--scope", "user")
+        else:
+            _run_claude("plugin", "marketplace", "update", CLAUDE_MARKETPLACE_NAME)
+        operation = "install" if installed is None else "update"
+        _run_claude("plugin", operation, f"{PLUGIN_NAME}@{CLAUDE_MARKETPLACE_NAME}", "--scope", "user")
+        plugin = _require_claude_plugin(_run_claude_json("plugin", "list"), scope="user")
+        config_dir = _claude_config_dir()
+        return {
+            "marketplace": CLAUDE_MARKETPLACE_NAME,
+            "plugin": PLUGIN_NAME,
+            "plugin_version": _required_string(plugin, "version"),
+            "settings_file": str(config_dir / "settings.json"),
+            "cache_dir": str(_claude_plugin_install_path(plugin)),
+            "data_dir": str(config_dir / "plugins/data" / f"{PLUGIN_NAME}-{CLAUDE_MARKETPLACE_NAME}"),
+        }
+
+    def configure(self, connection):
+        from powercontext.cli.transport import configure_connection
+
+        plugin = _require_claude_plugin(_run_claude_json("plugin", "list"), scope="user")
+        updates = _claude_configuration_updates(
+            plugin=plugin,
+            server_url=connection.server_url,
+            capture_prompts=self.capture_prompts,
+            allow_insecure_http=connection.allow_insecure_http,
+        )
+        return {"authorization_state": configure_connection(connection, writes=updates)}
+
+    def verify(self) -> dict[str, Diagnostic]:
+        """Collect diagnostics for the optional Claude Code integration."""
+
+        executable = which("claude")
+        if executable is None:
+            return {
+                "claude_code": Diagnostic(
+                    status=DiagnosticStatus.FAILED,
+                    detail="Claude Code CLI is not installed or is not on PATH",
+                ),
+                "plugin": Diagnostic(
+                    status=DiagnosticStatus.SKIPPED,
+                    detail="not checked because Claude Code CLI is unavailable",
+                ),
+            }
+        try:
+            result = _run_claude_json("plugin", "list")
+        except SetupError as error:
+            return {
+                "claude_code": Diagnostic(status=DiagnosticStatus.FAILED, detail=str(error)),
+                "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
+            }
+        plugin = _claude_plugin(result)
+        errors = plugin.get("errors") if plugin is not None else None
+        plugin_enabled = plugin is not None and plugin.get("enabled") is True and not errors
+        return {
+            "claude_code": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
+            "plugin": Diagnostic(
+                status=DiagnosticStatus.OK if plugin_enabled else DiagnosticStatus.FAILED,
+                detail=(
+                    f"{plugin.get('id')} enabled={plugin.get('enabled')}" + (f"; errors: {errors}" if errors else "")
+                    if plugin is not None
+                    else "PowerContext plugin is not installed"
+                ),
+            ),
+        }

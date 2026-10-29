@@ -18,11 +18,6 @@ from collections.abc import Callable
 
 import powercontext.cli.config_wizard_agents as wizard_agents
 from powercontext.cli.config_wizard_agents import AGENT_SPECS
-from powercontext.cli.hosts import FIRST_CLASS_HOSTS
-
-
-def test_wizard_catalog_covers_first_class_hosts() -> None:
-    assert tuple(spec.identifier for spec in AGENT_SPECS) == tuple(host.name for host in FIRST_CLASS_HOSTS)
 
 
 def test_openclaw_keeps_its_plugin_configuration_contract() -> None:

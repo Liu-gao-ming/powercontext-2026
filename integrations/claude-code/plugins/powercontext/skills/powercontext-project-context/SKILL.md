@@ -1,4 +1,5 @@
 ---
+# POWERCONTEXT-GUIDANCE:START
 name: powercontext-project-context
 description: PowerContext memory search/save, inventory, work handoff and candidate review (搜索记忆、记住、盘点、交接、审查候选). Use for explicit requests or missing project history; ordinary coding and current-context summaries need no Skill detour.
 ---
@@ -15,7 +16,7 @@ Read only the relevant reference when its workflow detail is needed; self-contai
 | Inventory or audit / 盘点、列出记忆 | `list_memory_entries`; [Scope and Memory](references/scope-memory.md). Empty search does not authorize inventory. |
 | Save, correct, retire / 记住、纠正、停用记忆 | `remember_memory` for explicit save; [Scope and Memory](references/scope-memory.md). |
 | Transfer or resume work / 交接、接续工作 | `handoff_current_work`; [Work Handoff](references/work-handoff.md). Ordinary transfer is temporary; durable commit needs explicit intent. |
-| Inspect candidates / 审查候选 | `list_artifact_candidates`; [Review and publication](references/review-publication.md). Inspection grants no decision authority. |
+| Inspect candidates / 审查候选 | `list_candidates`; [Review and publication](references/review-publication.md). Inspection grants no decision authority. |
 
 Before the first data operation, resolve the host/Server Scope as described in [Scope and Memory](references/scope-memory.md); reuse the returned ID, never guess one.
 
@@ -32,3 +33,6 @@ Automatic capture is only Source acceptance, not proof of saved Memory or succes
 Check actual returned results: empty search is normal; failed, denied, unavailable, and unknown outcomes are distinct.
 Do not claim saved, committed, approved, installed, or executed without the corresponding result. A timed-out write has
 an unknown outcome: inspect status when available before retrying. A Skill itself grants no execution authority.
+
+Semantic recall or vector indexing may use the configured embedding provider and incur external API cost; cached embeddings can be reused, and preparing context reuses the query embedding. Respect the configured budget and existing authorization before starting additional indexing.
+<!-- POWERCONTEXT-GUIDANCE:END -->

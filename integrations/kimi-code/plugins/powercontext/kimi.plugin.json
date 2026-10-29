@@ -1,0 +1,32 @@
+{
+  "name": "powercontext",
+  "version": "0.1.0",
+  "description": "Project memory backed by PowerContext Server",
+  "author": {
+    "name": "OceanBase"
+  },
+  "license": "Apache-2.0",
+  "skills": "./skills/",
+  "sessionStart": {
+    "skill": "powercontext-project-context"
+  },
+  "mcpServers": {
+    "powercontext": {
+      "url": "http://127.0.0.1:8000/mcp",
+      "enabledTools": [
+        "search_memory",
+        "remember_memory",
+        "get_artifact_revision"
+      ],
+      "startupTimeoutMs": 10000,
+      "toolTimeoutMs": 10000
+    }
+  },
+  "hooks": [
+    {
+      "event": "UserPromptSubmit",
+      "command": "node ./hooks/user_prompt_submit.mjs",
+      "timeout": 5
+    }
+  ]
+}

@@ -22,13 +22,13 @@ from pydantic import BaseModel, ValidationError
 from powercontext.artifacts import ArtifactLineage
 from powercontext.builtin.artifacts.experience import Experience, ExperienceContent, ExperienceDraft
 from powercontext.builtin.artifacts.skill import SkillDraft
-from powercontext.builtin.review import ArtifactCandidate
+from powercontext.builtin.review import Candidate
 from powercontext.builtin.runtime import (
     GenerateExperienceRequest,
     GenerateSkillRequest,
     ProposeExperienceRequest,
     ProposeSkillRequest,
-    ReviseArtifactCandidateRequest,
+    ReviseCandidateRequest,
 )
 
 EXPERIENCE = {"situation": "Situation", "action": "Action", "outcome": "Outcome", "lesson": "Lesson"}
@@ -48,9 +48,9 @@ INPUTS = [
     (GenerateExperienceRequest, {}),
     (ProposeSkillRequest, {"proposal": SKILL}),
     (GenerateSkillRequest, {"origin": "source"}),
-    (ReviseArtifactCandidateRequest, {"candidate_id": "candidate", "expected_version": 1, "proposal": EXPERIENCE}),
+    (ReviseCandidateRequest, {"candidate_id": "candidate", "expected_version": 1, "proposal": EXPERIENCE}),
     (
-        ArtifactCandidate[ExperienceContent],
+        Candidate[ExperienceContent],
         {
             "candidate_id": "candidate",
             "version": 1,

@@ -42,7 +42,7 @@ from powercontext.builtin.artifacts.handoff import (
     HandoffStatement,
     PrepareHandoff,
 )
-from powercontext.builtin.artifacts.handoff.generation import HandoffGenerationStatement
+from powercontext.builtin.artifacts.handoff.generation import HandoffGenerationStatement, rollover_draft_violation
 from powercontext.builtin.artifacts.memory import (
     MemoryExtractionInput,
     MemoryExtractionOutput,
@@ -51,11 +51,14 @@ from powercontext.builtin.artifacts.memory import (
 )
 from powercontext.builtin.artifacts.profile.models import normalize_profile_markdown
 from powercontext.builtin.artifacts.profile.service import ProfileGenerationInput, ProfileGenerationOutput
+from powercontext.builtin.artifacts.topic_memory.admission import TopicMemoryContentAdmission
 from powercontext.builtin.artifacts.topic_memory.generation import (
+    TopicMemoryEvidence,
     TopicMemoryEvolveInput,
     TopicMemoryEvolveOutput,
     TopicMemoryGlobalInput,
     TopicMemoryGlobalOutput,
+    TopicMemoryHistoricalSlot,
     TopicMemoryPlannerInput,
     TopicMemoryPlannerOutput,
     TopicMemoryProbeInput,
@@ -68,6 +71,7 @@ from powercontext.builtin.artifacts.topic_memory.generation import (
     TopicMemoryTemporaryInput,
     TopicMemoryTemporaryOutput,
 )
+from powercontext.builtin.artifacts.topic_memory.models import TopicMemoryContent
 from powercontext.sources import SourceRef
 
 
@@ -156,7 +160,12 @@ def _handoff(value: HandoffGenerationInput, output: HandoffGenerationOutput) -> 
         evidence_id: HandoffSourceCitation(source_ref=SourceRef(source_type="content", source_id=f"demo-{index}"))
         for index, evidence_id in enumerate(sorted(evidence))
     }
-    PrepareHandoff(objective=value.objective, evidence=tuple(citations.values()), max_bytes=value.max_bytes)
+    PrepareHandoff(
+        objective=value.objective,
+        rollover_reasons=value.rollover_reasons,
+        evidence=tuple(citations.values()),
+        max_bytes=value.max_bytes,
+    )
 
     def statement(item: HandoffGenerationStatement) -> HandoffStatement:
         _require(bool(item.evidence_ids) and set(item.evidence_ids) <= evidence)
@@ -170,13 +179,14 @@ def _handoff(value: HandoffGenerationInput, output: HandoffGenerationOutput) -> 
         omissions.append(
             HandoffOmission(text=item.text, citation=None if item.evidence_id is None else citations[item.evidence_id])
         )
-    HandoffDraft(
+    draft = HandoffDraft(
         objective=value.objective,
         state=tuple(statement(item) for item in output.state),
         disposition=output.disposition,
         next_action=None if output.next_action is None else statement(output.next_action),
         omissions=tuple(omissions),
     )
+    _require(not value.rollover_reasons or rollover_draft_violation(draft) is None)
 
 
 def _topic_memory_probe(value: TopicMemoryProbeInput, output: TopicMemoryProbeOutput) -> None:
@@ -200,6 +210,9 @@ def _topic_memory_global(value: TopicMemoryGlobalInput, output: TopicMemoryGloba
         if proposal.proposal_id is not None:
             _require(proposal.proposal_id not in proposal_ids)
             proposal_ids.add(proposal.proposal_id)
+    _admit_topic_proposals(
+        value.evidence, output.proposals, value.historical, stage_ids=(item.probe_id for item in value.probes)
+    )
 
 
 def _topic_memory_planner(value: TopicMemoryPlannerInput, output: TopicMemoryPlannerOutput) -> None:
@@ -244,6 +257,13 @@ def _topic_memory_evolve(value: TopicMemoryEvolveInput, output: TopicMemoryEvolv
             if value.historical is None
             else proposal.candidate_id == value.historical.candidate_id
         )
+        _admit_topic_proposals(
+            value.evidence,
+            (proposal,),
+            () if value.historical is None else (value.historical,),
+            value.temporary,
+            stage_ids=(value.work_id,),
+        )
 
 
 def _topic_memory_temporary(value: TopicMemoryTemporaryInput, output: TopicMemoryTemporaryOutput) -> None:
@@ -255,6 +275,7 @@ def _topic_memory_temporary(value: TopicMemoryTemporaryInput, output: TopicMemor
         if proposal.proposal_id is not None:
             _require(proposal.proposal_id not in proposal_ids)
             proposal_ids.add(proposal.proposal_id)
+    _admit_topic_proposals(value.evidence, output.proposals, stage_ids=(value.work_id,))
 
 
 def _topic_memory_reduce(value: TopicMemoryReductionInput, output: TopicMemoryReductionOutput) -> None:
@@ -268,6 +289,7 @@ def _topic_memory_reduce(value: TopicMemoryReductionInput, output: TopicMemoryRe
     _require(set(result.evidence_ids) == {evidence_id for item in items for evidence_id in item.evidence_ids})
     if isinstance(result, TopicMemoryProposal):
         _require(result.candidate_id is None and result.proposal_id is None)
+        _admit_topic_proposals((), (result,), intermediate=value.temporary)
 
 
 def _topic_memory_reconcile(value: TopicMemoryReconcileInput, output: TopicMemoryReconcileOutput) -> None:
@@ -295,3 +317,34 @@ def _topic_memory_reconcile(value: TopicMemoryReconcileInput, output: TopicMemor
             )
     for item in outputs:
         _require(set(item.evidence_ids) <= input_evidence)
+    _admit_topic_proposals((), outputs, value.historical, inputs, stage_ids=(value.component_id,))
+
+
+def _admit_topic_proposals(
+    evidence: Iterable[TopicMemoryEvidence],
+    proposals: Iterable[TopicMemoryProposal],
+    historical: Iterable[TopicMemoryHistoricalSlot] = (),
+    intermediate: Iterable[TopicMemoryProposal] = (),
+    *,
+    stage_ids: Iterable[str] = (),
+) -> None:
+    """Apply runtime content admission to custom demonstrations without changing their JSON."""
+    material = {item.evidence_id: item.content for item in evidence}
+    proposals = tuple(proposals)
+    # Intermediate outputs carry references, not canonical Source bodies. They
+    # identify internal IDs but cannot establish support for their own content.
+    internal_ids = set(stage_ids)
+    for item in (*intermediate, *proposals):
+        internal_ids.update(item.evidence_ids)
+        if item.proposal_id is not None:
+            internal_ids.add(item.proposal_id)
+    admission = TopicMemoryContentAdmission(
+        material,
+        {
+            item.candidate_id: TopicMemoryContent(title=item.title, summary=item.summary, detail=item.detail)
+            for item in historical
+        },
+        internal_ids=internal_ids,
+    )
+    for proposal in proposals:
+        _require(admission.rejection(proposal.content, proposal.evidence_ids, proposal.candidate_id) is None)

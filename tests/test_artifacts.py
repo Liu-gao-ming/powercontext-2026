@@ -28,8 +28,10 @@ from powercontext.artifacts import (
     ArtifactLineage,
     ArtifactRef,
     ArtifactStore,
+    StableHandle,
 )
 from powercontext.context import Artifacts
+from powercontext.limits import MAX_ARTIFACT_HANDLE_KEY_LENGTH
 from powercontext.sources import SourceRef
 
 
@@ -88,6 +90,27 @@ def test_artifact_reference_rejects_invalid_identity(
     with pytest.raises(ValidationError) as error:
         ArtifactRef(family=family, artifact_id=artifact_id, revision=revision)
     assert error.value.errors()[0]["loc"][0] == field
+
+
+@pytest.mark.parametrize("key", ["a", "payment-retry-policy", "policy2", "a" * MAX_ARTIFACT_HANDLE_KEY_LENGTH])
+def test_stable_handle_accepts_canonical_keys(key: str) -> None:
+    assert StableHandle(family="profile", key=key).key == key
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["", "Payment-Retry-Policy", "payment_retry_policy", "-policy", "policy-", "policy--retry", "policy key"],
+)
+def test_stable_handle_rejects_noncanonical_keys(key: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        StableHandle(family="profile", key=key)
+    assert error.value.errors()[0]["loc"] == ("key",)
+
+
+def test_stable_handle_rejects_keys_over_the_length_limit() -> None:
+    with pytest.raises(ValidationError) as error:
+        StableHandle(family="profile", key="a" * (MAX_ARTIFACT_HANDLE_KEY_LENGTH + 1))
+    assert error.value.errors()[0]["loc"] == ("key",)
 
 
 @pytest.mark.parametrize(

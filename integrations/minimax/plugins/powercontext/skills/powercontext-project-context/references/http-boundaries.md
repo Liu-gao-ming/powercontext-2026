@@ -1,3 +1,5 @@
+
+<!-- POWERCONTEXT-GUIDANCE:START -->
 # HTTP and MCP boundaries
 
 The runtime tool catalog determines which capabilities are callable. PowerContext's HTTP API is larger than its MCP tool set. An OpenAPI operationId does not mean the host exposes a matching MCP tool.
@@ -11,7 +13,7 @@ The runtime tool catalog determines which capabilities are callable. PowerContex
 | Topic Memory | `search_topic_memory`, `get_topic_memory` |
 | Sources and work | `capture_content_source`, `create_work_contract`, `handoff_current_work`, `acknowledge_handoff`, `record_task_outcome` |
 | Handoffs | `activate_handoff`, `finalize_handoff`, `commit_handoff`, `continue_handoff`, `get_handoff_report` |
-| Candidate review | `list_artifact_candidates`, `get_artifact_candidate`, `approve_artifact_candidate`, `reject_artifact_candidate`, `revise_artifact_candidate` |
+| Candidate review | `list_candidates`, `get_candidate`, `approve_candidate`, `reject_candidate`, `revise_candidate` |
 | Artifact publication | `publish_artifact` |
 
 This table describes the server contract used by the package. Hosts may hide tools, and older servers may lack some operations. Check the active deployment's catalog.
@@ -39,3 +41,4 @@ Context assembly can select existing Memory, Experience, Topic Memory, Profile, 
 - [MCP projection](https://github.com/oceanbase/powercontext/blob/master/src/powercontext/server/mcp.py): tools selected from HTTP and their side-effect annotations.
 
 Prefer the corresponding local source files when available. Remote master changes over time; check the actual version and tool catalog when diagnosing an older deployment.
+<!-- POWERCONTEXT-GUIDANCE:END -->

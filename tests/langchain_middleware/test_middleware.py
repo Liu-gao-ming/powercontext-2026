@@ -51,7 +51,7 @@ from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import InferenceConfig, RuntimeConfig
 from powercontext.client import PowerContextClient
 from powercontext.http import (
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     CaptureContentSourceRequest,
     ExperienceProposal,
     FlushMemoryRequest,
@@ -246,8 +246,8 @@ def test_middleware_injects_only_approved_experience(tmp_path: Path) -> None:
         assert _system_texts(model.inputs[-1]) == []
         assert _system_texts(pending_result["messages"]) == []
 
-        await client.approve_artifact_candidate(
-            ApproveArtifactCandidateRequest(
+        await client.approve_candidate(
+            ApproveCandidateRequest(
                 scope_id=scope_id,
                 candidate_id=candidate.candidate_id,
                 expected_version=candidate.version,

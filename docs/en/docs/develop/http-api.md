@@ -199,16 +199,21 @@ use the same policy enforcement point; MCP tool visibility is not permission.
 | --- | --- | --- |
 | Health and capabilities | `/health/*`, `/v1/capabilities` | Probe the deployment and discover enabled runtime behavior |
 | Access Control | `/v1/access/*` | Inspect identity, check decisions, and administer roles, Bindings, and audit events |
-| Source and context | `/v1/sources/content`, `/v1/context/prepare` | Capture evidence and prepare bounded context |
+| Source and context | `/v1/sources/content`, `/v1/scopes/{scope_id}/subject-sources`, `/v1/context/prepare` | Capture evidence, write Sources to business and subject Scopes, and prepare bounded context |
 | Work continuity | `/v1/work/*` | Create work contracts, prepare or acknowledge Handoffs, and record outcomes |
 | Low-level Handoff | `/v1/handoff/*` | Activate, prepare, finalize, commit, or continue a Handoff |
-| Atomic Memory | `/v1/atomic-memory/*`, generic Artifact routes | Search, list, inspect state, merge, forget, and restore; use generic Artifact routes for content reads and writes |
+| Atomic Memory | `/v1/atomic-memory/*`, `/v1/scopes/{scope_id}/artifacts/*` (`family=atomic-memory`) | Search, list, inspect state, merge, forget, and restore; create, read, and revise content and inspect history |
 | Memory compatibility | `/v1/memory/*` | Flush, remember, search, list, and legacy identity reads; legacy collection mutations return an explicit unsupported error |
+| Topic Memory | `/v1/topic-memory/*`, `/v1/scopes/{scope_id}/artifacts/*` (`family=topic-memory`) | Request background processing, search, and expand topics; create, read, and revise content and inspect history |
+| Profile | `/v1/profile/*`, `/v1/scopes/{scope_id}/profile-policy`, `/v1/scopes/{scope_id}/artifacts/*` (`family=profile`) | Process Profile generation, configure generation policy, read and write Profiles, and inspect history |
 | Experience and Skill | `/v1/experience/*`, `/v1/skill/*`, `/v1/skills/*` | Propose, review, package, govern, distribute, and read managed Skill revisions |
-| Review | `/v1/artifact-candidates/*` | List, inspect, revise, approve, or reject pending Candidates |
+| Review | `/v1/candidates/*` | List, inspect, revise, approve, or reject pending Candidates |
 | External Skills | `/v1/external-skills/*` | Scan configured targets and resolve or import packages |
 | Handoff Reports | `/v1/handoff-reports/*` | Generate a read-only report for a Scope selection |
 | Statistics | `/v1/stats` | Read scoped usage statistics |
+
+Create an Artifact with `POST /v1/scopes/{scope_id}/artifacts`, specifying `family` in the request body.
+Profile candidate review uses `/v1/candidates/*`.
 
 The OpenAPI contract defines the complete path list, schemas, limits, and status codes. The higher-level workflow and
 Python examples are in [Interfaces](interfaces.md).

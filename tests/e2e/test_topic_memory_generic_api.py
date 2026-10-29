@@ -27,7 +27,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
 from powercontext.builtin.inference import EmbeddingResult, InferenceUnavailableError, InferenceUsage
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
-from powercontext.builtin.persistence.sqlite.topic_memory_index import SQLiteTopicMemoryFTSIndex
 from powercontext.builtin.persistence.statistics import StatisticsRepository
 from powercontext.builtin.persistence.tag_schema import ensure_topic_memory_tag_schema
 from powercontext.builtin.runtime import InferenceConfig, RuntimeConfig
@@ -93,6 +92,60 @@ def _create(client, scope, word):
     response = client.post(f"/v1/scopes/{scope}/artifacts", json={"family": "topic-memory", "content": _content(word)})
     assert response.status_code == 201, response.text
     return response
+
+
+@pytest.mark.parametrize("mode", ["text", "hybrid"])
+@pytest.mark.parametrize("floor", [4, 2**63 - 1, 2**63, 10**100], ids=["four", "sqlite-max", "sqlite-overflow", "huge"])
+def test_topic_search_impossible_lexical_floor_keeps_semantic_candidates(tmp_path, mode, floor):
+    embedding = Embeddings() if mode == "hybrid" else None
+    with TestClient(_app(tmp_path, embedding), raise_server_exceptions=False) as client:
+        scope = _scope(client, "impossible-floor")
+        path = f"/v1/scopes/{scope}/artifacts/topic-memory/search"
+        request = {
+            "query": "alpha beta gamma",
+            "mode": mode,
+            "admission": {"lexical_min_matched_terms": floor},
+            "include_scores": True,
+        }
+        empty = client.post(path, json=request)
+        assert empty.status_code == 200, empty.text
+        assert empty.json() == {"results": []}
+
+        topic = _create(client, scope, "alpha beta gamma").json()
+        ordinary = client.post(path, json={"query": "alpha beta gamma", "mode": mode, "include_scores": True})
+        assert ordinary.status_code == 200, ordinary.text
+        assert ordinary.json()["results"][0]["artifact_id"] == topic["artifact_id"]
+        assert {"topic_fts", "detail_fts"} <= ordinary.json()["results"][0]["scores"]["channels"].keys()
+
+        response = client.post(path, json=request)
+        assert response.status_code == 200, response.text
+        if mode == "text":
+            assert response.json() == {"results": []}
+        else:
+            result = response.json()["results"][0]
+            assert result["artifact_id"] == topic["artifact_id"]
+            assert result["content"] == _content("alpha beta gamma")
+            assert set(result["scores"]["channels"]) == {"topic_vector", "detail_vector"}
+
+
+@pytest.mark.parametrize("query", ["alpha", "alpha beta"])
+def test_topic_search_large_floor_preserves_short_query_admission(tmp_path, query):
+    with TestClient(_app(tmp_path)) as client:
+        scope = _scope(client, "short-floor")
+        topic = _create(client, scope, "alpha beta gamma").json()
+        response = client.post(
+            f"/v1/scopes/{scope}/artifacts/topic-memory/search",
+            json={
+                "query": query,
+                "mode": "text",
+                "admission": {"lexical_min_matched_terms": 2**63},
+                "include_scores": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        result = response.json()["results"][0]
+        assert result["artifact_id"] == topic["artifact_id"]
+        assert set(result["scores"]["channels"]) == {"topic_fts", "detail_fts"}
 
 
 def _topic_embedding_requests(database, scope=None):
@@ -169,6 +222,7 @@ def test_topic_lifecycle_tags_filtered_pages_and_publication_survive_restart(tmp
         )
         _create(client, scope, "unmatched")
         listing = f"/v1/scopes/{scope}/artifacts/topic-memory"
+        assert client.get(listing, params={"limit": 101}).status_code == 400
         first = client.get(listing, params={"tag": "CHOSEN", "limit": 1}).json()
         assert first["next_cursor"] and len(first["items"]) == 1
         assert first["items"][0]["artifact_id"] == second.json()["artifact_id"]
@@ -697,23 +751,26 @@ def test_legacy_tags_survive_transactional_upgrade_and_repeated_startup(tmp_path
     class InterruptedUpgrade(Exception):
         pass
 
-    async def interrupted_upgrade():
+    async def upgrade(*, interrupt=False):
         engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
         try:
-            with pytest.raises(InterruptedUpgrade):
-                async with engine.begin() as connection:
-                    await ensure_topic_memory_tag_schema(connection)
+            async with engine.begin() as connection:
+                await ensure_topic_memory_tag_schema(connection)
+                if interrupt:
                     raise InterruptedUpgrade
         finally:
             await engine.dispose()
 
-    asyncio.run(interrupted_upgrade())
+    with pytest.raises(InterruptedUpgrade):
+        asyncio.run(upgrade(interrupt=True))
     with sqlite3.connect(database) as connection:
         assert (
             "ck_pc_artifact_tags_family"
             in connection.execute("SELECT sql FROM sqlite_master WHERE name = 'pc_artifact_tags'").fetchone()[0]
         )
         assert connection.execute("SELECT * FROM pc_artifact_tags").fetchall() == rows
+    # Repair the isolated legacy constraint before normal Server admission.
+    asyncio.run(upgrade())
     configuration_tags = {}
     for restart in range(2):
         with TestClient(_app(tmp_path)) as client:
@@ -825,7 +882,7 @@ def test_prepared_replace_rechecks_head_and_publication_races_are_idempotent(tmp
     asyncio.run(scenario())
 
 
-def test_index_failure_rolls_back_create_replace_and_publication(tmp_path, monkeypatch):
+def test_index_failure_rolls_back_create_replace_and_publication(tmp_path):
     with TestClient(_app(tmp_path), raise_server_exceptions=False) as client:
         source, target = _scope(client, "atomic-source"), _scope(client, "atomic-target")
         created = _create(client, source, "original")
@@ -836,16 +893,13 @@ def test_index_failure_rolls_back_create_replace_and_publication(tmp_path, monke
             "target_scope_id": target,
             "idempotency_key": "atomic",
         }
-        original = SQLiteTopicMemoryFTSIndex.replace
-
-        async def fail_after_index_write(self, *args, **kwargs):
-            await original(self, *args, **kwargs)
-            raise RuntimeError("injected index storage failure")  # noqa: TRY003
-
         with sqlite3.connect(tmp_path / "topics.db") as connection:
             source_count = connection.execute("SELECT count(*) FROM pc_sources").fetchone()[0]
-        with monkeypatch.context() as patch:
-            patch.setattr(SQLiteTopicMemoryFTSIndex, "replace", fail_after_index_write)
+            connection.execute(
+                "CREATE TRIGGER reject_topic_projection BEFORE INSERT ON pc_topic_memory_active_topics "
+                "BEGIN SELECT RAISE(ABORT, 'index storage failure'); END"
+            )
+        try:
             failed_create = client.post(
                 f"/v1/scopes/{source}/artifacts", json={"family": "topic-memory", "content": _content("failed")}
             )
@@ -857,6 +911,9 @@ def test_index_failure_rolls_back_create_replace_and_publication(tmp_path, monke
                 == 500
             )
             assert client.post("/v1/artifact-publications", json=request).status_code == 500
+        finally:
+            with sqlite3.connect(tmp_path / "topics.db") as connection:
+                connection.execute("DROP TRIGGER reject_topic_projection")
         assert client.get(path).json()["content"] == _content("original")
         assert len(client.get(path + "/revisions").json()["items"]) == 1
         assert len(client.get(f"/v1/scopes/{source}/artifacts/topic-memory").json()["items"]) == 1
@@ -884,3 +941,19 @@ def test_manual_embedding_obeys_configured_timeout_without_writing(tmp_path):
         assert failed.status_code == 503, failed.text
         assert client.get(f"/v1/scopes/{scope}/artifacts/topic-memory").json()["items"] == []
         _create(client, scope, "recovered")
+
+
+def test_direct_topic_writes_keep_structural_validation_for_literal_templates(tmp_path):
+    content = {
+        "title": "T-19",
+        "summary": "S-19 coordinated without merging historical identities.",
+        "detail": "D-19 coordinated detail preserving distinct historical identity.",
+    }
+    with TestClient(_app(tmp_path)) as client:
+        scope = _scope(client, "literal-template")
+        created = client.post(f"/v1/scopes/{scope}/artifacts", json={"family": "topic-memory", "content": content})
+        assert created.status_code == 201, created.text
+        artifact_id = created.json()["artifact_id"]
+        exact = client.get(f"/v1/scopes/{scope}/artifacts/topic-memory/{artifact_id}/revisions/1")
+        assert exact.status_code == 200, exact.text
+        assert exact.json()["content"] == content

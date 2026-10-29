@@ -15,15 +15,17 @@
 import re
 from pathlib import Path
 
-from sqlalchemy import BigInteger, Date, Integer, LargeBinary, String, Table
+from sqlalchemy import BigInteger, Date, DateTime, Integer, LargeBinary, String, Table
 from sqlalchemy.dialects import mysql
 from sqlalchemy.schema import CreateTable, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 
 from powercontext.builtin.persistence.tables import (
     AGENT_SKILL_TARGETS_TABLE,
+    ARTIFACT_HANDLES_TABLE,
     ARTIFACTS_TABLE,
     BUILTIN_TABLES,
     SHARED_METADATA,
+    SHARED_TABLES,
     SKILL_PACKAGES_TABLE,
     SOURCE_CURSORS_TABLE,
     SOURCES_TABLE,
@@ -49,8 +51,12 @@ def _column_budget(column) -> int:
         return column.type.length
     if isinstance(column.type, Integer):
         return 4
+    if isinstance(column.type, DateTime):
+        return 8
     if isinstance(column.type, Date):
         return 3
+    if isinstance(column.type, DateTime):
+        return 8
     raise _UnbudgetedColumnTypeError(column.type)
 
 
@@ -60,6 +66,35 @@ def test_mysql_ddl_uses_utf8mb4_bin_for_identity_keys() -> None:
     assert "scope_id VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
     assert "source_id VARCHAR(256) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
     assert "source_type VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL" in ddl
+
+
+def test_artifact_handles_use_scope_local_identity_and_exact_revision_target() -> None:
+    primary_key = tuple(column.name for column in ARTIFACT_HANDLES_TABLE.primary_key.columns)
+    foreign_keys = tuple(
+        constraint
+        for constraint in ARTIFACT_HANDLES_TABLE.foreign_key_constraints
+        if constraint.referred_table is ARTIFACTS_TABLE
+    )
+
+    assert primary_key == ("scope_id", "family", "handle_key")
+    assert len(foreign_keys) == 1
+    assert tuple(element.parent.name for element in foreign_keys[0].elements) == (
+        "scope_id",
+        "family",
+        "artifact_id",
+        "revision",
+    )
+    assert tuple(element.column.name for element in foreign_keys[0].elements) == (
+        "scope_id",
+        "family",
+        "artifact_id",
+        "revision",
+    )
+    assert foreign_keys[0].ondelete == "RESTRICT"
+    assert "ck_pc_artifact_handles_revision_positive" in {
+        constraint.name for constraint in ARTIFACT_HANDLES_TABLE.constraints
+    }
+    assert ARTIFACT_HANDLES_TABLE in SHARED_TABLES
 
 
 def test_mysql_ddl_uses_mediumblob_for_every_canonical_payload() -> None:

@@ -4,11 +4,13 @@
       "schemas/pre_dream.json"
     ],
     "p0002": [],
-    "p0003": []
+    "p0003": [],
+    "p0004": []
   },
   "sqlite_baselines": {
     "e1cae089a8a565291a7a1f782cea1f6c6e1a6cdd9eab75ef0c4ca61dfda453cb": "p0001",
-    "fcee685ed307ee6d02fe5e950ed4e80be75f38d19de902ccacf443f21ee8c73d": "p0003"
+    "fcee685ed307ee6d02fe5e950ed4e80be75f38d19de902ccacf443f21ee8c73d": "p0003",
+    "8cb2d41e53cde751c8d0ef4023c344ec5ec78d9e579366c1c93d17de30aa5ea4": "p0004"
   },
   "sqlite_fingerprints": {
     "p0001": [
@@ -20,13 +22,18 @@
     "p0003": [
       "9958fa0413ed3c16442df27dc48057d438e2cf3f7e4312c5a914cccd9d3acaab",
       "fcee685ed307ee6d02fe5e950ed4e80be75f38d19de902ccacf443f21ee8c73d"
+    ],
+    "p0004": [
+      "f65244be963a382a62565118ff874cd775ab1ea33cf51a49881b40391e47c051",
+      "8cb2d41e53cde751c8d0ef4023c344ec5ec78d9e579366c1c93d17de30aa5ea4"
     ]
   },
   "affected_objects": [
     "pc_artifacts",
     "pc_artifact_heads",
     "pc_artifact_candidate_versions",
-    "pc_artifact_tags"
+    "pc_artifact_tags",
+    "pc_artifact_handles"
   ],
   "retained_objects": [
     "pc_retained_p0002_artifact_tags"
@@ -38,5 +45,8 @@
   },
   "retained_revisions": {
     "pc_retained_p0002_artifact_tags": "p0003"
-  }
+  },
+  "mysql_layouts": [
+    "mysql_layouts.json"
+  ]
 }

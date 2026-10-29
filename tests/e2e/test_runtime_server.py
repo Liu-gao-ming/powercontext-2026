@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -46,6 +47,7 @@ from powercontext.builtin.artifacts.memory import (
 )
 from powercontext.builtin.artifacts.memory.errors import InvalidMemoryCandidateError
 from powercontext.builtin.inference import EmbeddingResult, GenerationResult, InferenceConfigurationError
+from powercontext.builtin.persistence.migrations.deployment import deployment_runner
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import (
@@ -61,6 +63,7 @@ from powercontext.http import (
     ArtifactAddress,
     AtomicMemoryLifecycleRequest,
     CaptureContentSourceRequest,
+    CaptureWorkingNoteRequest,
     CommitHandoffRequest,
     ContinueHandoffRequest,
     CreateScopeRequest,
@@ -85,6 +88,7 @@ from powercontext.http import (
     ReviseMemoryEntryRequest,
     ScopeSelection,
     SearchMemoryRequest,
+    WorkingNoteKind,
 )
 from powercontext.http import MemorySearchMode as HttpMemorySearchMode
 from powercontext.server.factory import create_server_app
@@ -198,15 +202,38 @@ def _server_settings(
     )
 
 
+def _initialize_remote_server_storage(
+    settings: ServerSettings, tmp_path: Path, *, embedding_profile: EmbeddingProfile | None = None
+) -> None:
+    if not isinstance(settings.database, OceanBaseConfig):
+        return
+    runner = deployment_runner(
+        settings,
+        evidence_dir=tmp_path / "migration-evidence",
+        lock_coordination="single-host",
+        embedding_profile=embedding_profile,
+    )
+    plan = runner.plan(backup_policy="skip")
+    result = runner.apply(
+        plan_id=plan.plan_id,
+        backup_policy="skip",
+        accepted=True,
+        maintenance_confirmed=True,
+        accept_no_backup=True,
+    )
+    assert result.state == "ready"
+    assert result.readiness_scope == "server"
+
+
 @pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
 def test_server_databases_share_source_to_memory_search_behavior(
     database: SQLiteConfig | OceanBaseConfig,
+    tmp_path: Path,
 ) -> None:
+    settings = ServerSettings(database=database, mcp=McpConfig(enabled=False))
+    _initialize_remote_server_storage(settings, tmp_path)
     app = create_server_app(
-        settings=ServerSettings(
-            database=database,
-            mcp=McpConfig(enabled=False),
-        ),
+        settings=settings,
         candidate_pipeline=atomic_memory_pipeline(ContentCandidatePipeline()),
     )
 
@@ -280,15 +307,114 @@ def test_server_databases_share_source_to_memory_search_behavior(
     asyncio.run(scenario())
 
 
+def test_working_note_http_and_sdk_capture_stays_out_of_memory(tmp_path: Path) -> None:
+    app = create_server_app(
+        settings=_server_settings(tmp_path / "working-note.db"),
+        candidate_pipeline=atomic_memory_pipeline(ContentCandidatePipeline()),
+    )
+
+    async def scenario() -> None:
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as transport,
+        ):
+            client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
+            scope = await client.create_scope(
+                CreateScopeRequest(
+                    title="Working note",
+                    summary="Session-local evidence",
+                    idempotency_key="working-note-http",
+                )
+            )
+            with pytest.raises(ServerResponseError) as reserved_metadata:
+                await client.capture_content_source(
+                    CaptureContentSourceRequest(
+                        scope_id=scope.scope_id,
+                        source_id="spoofed-note",
+                        content="Generic capture cannot assign a server-owned Source kind.",
+                        metadata={"kind": "working_note"},
+                    )
+                )
+            working_note_metadata = await transport.post(
+                "/v1/sources/working-notes",
+                json={
+                    "scope_id": scope.scope_id,
+                    "source_id": "metadata-expiry",
+                    "content": "The public contract does not expose Working Note metadata.",
+                    "session_id": "session-1",
+                    "note_kind": "validation",
+                    "metadata": {"expires_at": "2000-01-01T00:00:00+00:00"},
+                },
+            )
+            captured = await client.capture_working_note(
+                CaptureWorkingNoteRequest(
+                    scope_id=scope.scope_id,
+                    source_id="note-1",
+                    content="The database migration probe passed locally.",
+                    session_id="session-1",
+                    note_kind=WorkingNoteKind.VALIDATION,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                )
+            )
+            with pytest.raises(ServerResponseError) as expired:
+                await client.capture_working_note(
+                    CaptureWorkingNoteRequest(
+                        scope_id=scope.scope_id,
+                        source_id="note-expired",
+                        content="This note is already stale.",
+                        session_id="session-1",
+                        note_kind=WorkingNoteKind.VALIDATION,
+                        expires_at=datetime.now(UTC) - timedelta(days=1),
+                    )
+                )
+            naive_expiry = await transport.post(
+                "/v1/sources/working-notes",
+                json={
+                    "scope_id": scope.scope_id,
+                    "source_id": "note-naive-expiry",
+                    "content": "The expiry has no time zone.",
+                    "session_id": "session-1",
+                    "note_kind": "validation",
+                    "expires_at": "2000-01-01T00:00:00",
+                },
+            )
+            flushed = await client.flush_memory(FlushMemoryRequest(scope_id=scope.scope_id))
+            entries = await client.list_memory_entries(ListMemoryEntriesRequest(scope_id=scope.scope_id))
+
+        assert captured.source.name == "content"
+        assert reserved_metadata.value.status_code == 422
+        assert reserved_metadata.value.code == "invalid_request"
+        assert working_note_metadata.status_code == 422
+        assert working_note_metadata.json()["error"]["code"] == "invalid_request"
+        assert captured.position == 1
+        assert captured.position == flushed.current_cursor
+        assert expired.value.status_code == 422
+        assert expired.value.code == "invalid_request"
+        assert expired.value.details == {"field": "expires_at", "reason": "not_in_future"}
+        assert naive_expiry.status_code == 422
+        naive_details = naive_expiry.json()["error"]["details"]["errors"]
+        assert [(entry["loc"], entry["type"]) for entry in naive_details] == [
+            (["body", "expires_at"], "timezone_aware"),
+        ]
+        assert flushed.memory is None
+        assert entries.entries == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
 def test_server_databases_keep_case_and_accent_variant_identities_distinct(
     database: SQLiteConfig | OceanBaseConfig,
+    tmp_path: Path,
 ) -> None:
     marker = uuid4().hex[:12]
     memory_text = "Rotate the production signing key every ninety days."
-    app = create_server_app(
-        settings=ServerSettings(database=database, mcp=McpConfig(enabled=False)),
-    )
+    settings = ServerSettings(database=database, mcp=McpConfig(enabled=False))
+    _initialize_remote_server_storage(settings, tmp_path)
+    app = create_server_app(settings=settings)
 
     async def scenario() -> None:
         async with (
@@ -719,12 +845,12 @@ def test_sdk_closes_the_delegation_handoff_and_outcome_loop(tmp_path: Path) -> N
 @pytest.mark.parametrize("database_kind", ["sqlite", "oceanbase"])
 def test_server_databases_share_vector_and_hybrid_search_behavior(
     database: SQLiteConfig | OceanBaseConfig,
+    tmp_path: Path,
 ) -> None:
+    settings = ServerSettings(database=database, mcp=McpConfig(enabled=False))
+    _initialize_remote_server_storage(settings, tmp_path, embedding_profile=EMBEDDING_PROFILE)
     app = create_server_app(
-        settings=ServerSettings(
-            database=database,
-            mcp=McpConfig(enabled=False),
-        ),
+        settings=settings,
         candidate_pipeline=atomic_memory_pipeline(ContentCandidatePipeline()),
         embedding_model=KeywordEmbeddingModel(),
     )

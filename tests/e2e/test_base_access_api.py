@@ -227,6 +227,57 @@ def test_source_and_artifact_api_round_trip(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_captured_source_identity_reads_back_through_the_exact_path(tmp_path: Path) -> None:
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'source-identity.db'}"),
+            auth=BearerAuthConfig(enabled=False),
+            mcp=McpConfig(enabled=False),
+        )
+    )
+
+    async def scenario() -> None:
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as transport,
+        ):
+            client = PowerContextClient("http://testserver", http_client=transport, trust_transport_security=True)
+            scope_id = (await client.get_default_scope()).scope_id
+            encoded_scope = quote(scope_id, safe="")
+
+            accepted = [
+                "ascii-source-731",
+                "中文来源-731",
+                "folder/source-731",
+                "source with space-731",
+                "emoji-🙂-id",
+            ]
+            for source_id in accepted:
+                captured = await transport.post(
+                    "/v1/sources/content",
+                    json={"scope_id": scope_id, "source_id": source_id, "content": f"payload::{source_id}"},
+                )
+                assert captured.status_code == 202, captured.text
+
+                exact = await transport.get(f"/v1/scopes/{encoded_scope}/sources/content/{quote(source_id, safe='')}")
+                assert exact.status_code == 200, exact.text
+                assert exact.json()["source_id"] == source_id
+                assert exact.json()["content"] == f"payload::{source_id}"
+
+            page = await transport.get(f"/v1/scopes/{encoded_scope}/sources", params={"limit": 100})
+            assert page.status_code == 200, page.text
+            assert [item["source_id"] for item in page.json()["items"]] == accepted
+
+            for rejected in ("   ", " leading", "trailing "):
+                rejected_capture = await transport.post(
+                    "/v1/sources/content",
+                    json={"scope_id": scope_id, "source_id": rejected, "content": "rejected"},
+                )
+                assert rejected_capture.status_code == 422, rejected_capture.text
+
+    asyncio.run(scenario())
+
+
 def test_subject_key_projects_one_source_into_a_stable_user_root(tmp_path: Path) -> None:
     app = create_server_app(
         settings=ServerSettings(

@@ -21,7 +21,14 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 
-from powercontext_e2e.harbor_agent import REMOTE_SOURCE_OVERRIDE, _install_bub_command
+from powercontext_e2e.harbor_agent import (
+    ACP_SDK_REQUIREMENT,
+    BUB_ACP_SERVER_VERSION,
+    REMOTE_BIN_DIR,
+    REMOTE_SOURCE_OVERRIDE,
+    _install_acp_server_command,
+    _install_bub_command,
+)
 from powercontext_e2e.harbor_codex import MCP_URL_REWRITE, plugin_mcp_url
 
 _SOURCE_OVERRIDE = Path(__file__).resolve().parents[1] / "source-overrides.txt"
@@ -49,6 +56,20 @@ def test_off_arm_installs_bub_without_the_powercontext_plugin() -> None:
 
     assert "integrations/bub" not in command
     assert f"bub=={version('bub')}" in command
+
+
+def test_acp_server_install_names_the_pre_release_sdk_and_keeps_the_harness_bub() -> None:
+    # uv resolves the server's pre-release ACP SDK only as a direct requirement, and Bub's plugin project would
+    # otherwise let the install upgrade the host.
+    command = shlex.split(_install_acp_server_command())
+    install_index = command.index(f"{REMOTE_BIN_DIR}/bub") + 1
+
+    assert command[install_index] == "install"
+    assert set(command[install_index + 1 :]) == {
+        f"bub-acp-server=={BUB_ACP_SERVER_VERSION}",
+        ACP_SDK_REQUIREMENT,
+        f"bub=={version('bub')}",
+    }
 
 
 def test_codex_plugin_accepts_the_server_url_the_harness_writes(monkeypatch, tmp_path: Path) -> None:

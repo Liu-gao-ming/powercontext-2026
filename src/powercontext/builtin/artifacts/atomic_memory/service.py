@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -59,10 +60,17 @@ from powercontext.builtin.artifacts.merge_models import (
     ArtifactMergeWrite,
     PreparedArtifactMerge,
 )
-from powercontext.builtin.persistence.artifact_governance import ArtifactGovernance, ArtifactLifecycleState
+from powercontext.builtin.persistence.artifact_governance import (
+    ArtifactGovernance,
+    ArtifactLifecycleState,
+    decode_artifact_governance,
+)
 from powercontext.builtin.persistence.artifacts import ArtifactRepository
 from powercontext.builtin.persistence.atomic_memory import AtomicMemoryStateRepository
-from powercontext.builtin.persistence.atomic_memory_index import PreparedAtomicMemoryProjection
+from powercontext.builtin.persistence.atomic_memory_index import AtomicMemoryIndexHit, PreparedAtomicMemoryProjection
+from powercontext.builtin.persistence.errors import RepositoryNotFoundError
+from powercontext.builtin.persistence.sources import _SourceReadSet
+from powercontext.errors import ArtifactNotFoundError
 from powercontext.sources import SourceRef
 
 if TYPE_CHECKING:
@@ -78,6 +86,12 @@ class AtomicMemoryProjections(Protocol):
         scope_id: str,
         record: AtomicMemoryRecord,
         prepared: PreparedAtomicMemoryProjection,
+    ) -> None: ...
+    async def publish_many(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        records: Sequence[tuple[AtomicMemoryRecord, PreparedAtomicMemoryProjection]],
     ) -> None: ...
     async def remove(self, connection: AsyncConnection, scope_id: str, artifact_id: str) -> None: ...
 
@@ -271,6 +285,17 @@ class AtomicMemoryMergeAdapter:
     ) -> None:
         await self.projections.publish(connection, scope_id, _atomic_record(record), prepared)
 
+    async def publish_many(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        records: Sequence[tuple[ArtifactMergeRecord, PreparedAtomicMemoryProjection]],
+        execution_context: Any,
+    ) -> None:
+        await self.projections.publish_many(
+            connection, scope_id, tuple((_atomic_record(record), prepared) for record, prepared in records)
+        )
+
     async def remove(self, connection: AsyncConnection, scope_id: str, artifact_id: str) -> None:
         await self.projections.remove(connection, scope_id, artifact_id)
 
@@ -324,6 +349,58 @@ class AtomicMemoryService:
             await self.shared.get(connection, scope_id, artifact_id, context, revision=revision, for_update=for_update)
         )
 
+    async def read_many(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        heads: Sequence[Mapping[Any, Any]],
+    ) -> tuple[AtomicMemoryRecord, ...]:
+        """Hydrate a snapshot's heads without rereading their Revision or governance."""
+        states = tuple(decode_artifact_governance(head) for head in heads)
+        artifacts = await self.artifacts.decode_many(connection, scope_id, heads)
+        return tuple(
+            _atomic_record(ArtifactMergeRecord(artifact=artifact, state=state))
+            for artifact, state in zip(artifacts, states, strict=True)
+        )
+
+    async def authorize_comparison_hit(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        head: Mapping[Any, Any],
+        hit: AtomicMemoryIndexHit,
+        context: Any,
+    ) -> AtomicMemoryRead:
+        """Validate a recalled body against its authoritative head, without expanding lineage."""
+        state = decode_artifact_governance(head)
+        if head["content"] is None:
+            raise RepositoryNotFoundError("artifact", (scope_id, state.artifact))
+        content = self.artifacts.decode_content(head)
+        if not isinstance(content, AtomicMemoryContent):
+            raise AtomicMemoryRelationError("the stored artifact is not an Atomic Memory")  # noqa: TRY003
+        read = AtomicMemoryRead(ref=state.artifact, **_atomic_state(state).model_dump())
+        await self.security.authorize(connection, scope_id, context, "write", read.ref)
+        if (
+            read.ref != hit.artifact_ref
+            or read.state_version != hit.state_version
+            or read.state is not AtomicMemoryStateValue.ACTIVE
+            or content.kind != hit.kind
+            or content.text != hit.text
+        ):
+            raise AtomicMemoryConflictError("Related memory changed before comparison")  # noqa: TRY003
+        return read
+
+    async def read_state(self, connection, scope_id: str, artifact_id: str, context) -> AtomicMemoryRead:
+        """Read the current reference and lifecycle from one authoritative head."""
+        ref = ArtifactRef(family="atomic-memory", artifact_id=artifact_id, revision=1)
+        current = None
+        with suppress(RepositoryNotFoundError):
+            current = await self.shared.states.get(connection, scope_id, "atomic-memory", artifact_id)
+        await self.security.authorize(connection, scope_id, context, "read", ref)
+        if current is None:
+            raise ArtifactNotFoundError(ref)
+        return AtomicMemoryRead(ref=current.artifact, **_atomic_state(current).model_dump())
+
     async def inspect_change(
         self,
         connection: AsyncConnection,
@@ -336,6 +413,7 @@ class AtomicMemoryService:
         expected_state_version: int | None = None,
         lineage: ArtifactLineage | None = None,
         reads: Sequence[AtomicMemoryRead] = (),
+        source_read_set: _SourceReadSet | None = None,
     ) -> AtomicMemoryPlan:
         return _atomic_plan(
             await self.shared.inspect_change(
@@ -348,7 +426,19 @@ class AtomicMemoryService:
                 expected_state_version=expected_state_version,
                 lineage=lineage,
                 reads=tuple(_common_read(read) for read in reads),
+                source_read_set=source_read_set,
             )
+        )
+
+    async def inspect_creates(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        items: Sequence[tuple[str, AtomicMemoryContent]],
+        context: Any,
+    ) -> tuple[AtomicMemoryPlan, ...]:
+        return tuple(
+            _atomic_plan(plan) for plan in await self.shared.inspect_creates(connection, scope_id, items, context)
         )
 
     async def inspect_merge(
@@ -362,6 +452,7 @@ class AtomicMemoryService:
         *,
         lineage: ArtifactLineage | None = None,
         reads: Sequence[AtomicMemoryRead] = (),
+        source_read_set: _SourceReadSet | None = None,
     ) -> AtomicMemoryPlan:
         return _atomic_plan(
             await self.shared.inspect_merge(
@@ -373,6 +464,7 @@ class AtomicMemoryService:
                 context,
                 lineage=lineage,
                 reads=tuple(_common_read(read) for read in reads),
+                source_read_set=source_read_set,
             )
         )
 
@@ -467,6 +559,8 @@ class AtomicMemoryService:
         *,
         read_set: Sequence[AtomicMemoryRead] = (),
         direct_source: SourceRef | None = None,
+        direct_sources: Sequence[SourceRef | None] | None = None,
+        source_read_set: _SourceReadSet | None = None,
     ) -> tuple[AtomicMemoryMutationResult, ...]:
         results = await self.shared.commit_window(
             connection,
@@ -477,6 +571,8 @@ class AtomicMemoryService:
             context,
             read_set=tuple(_common_read(read) for read in read_set),
             direct_source=direct_source,
+            direct_sources=direct_sources,
+            source_read_set=source_read_set,
         )
         return tuple(
             AtomicMemoryMutationResult(

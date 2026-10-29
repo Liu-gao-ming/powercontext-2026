@@ -38,6 +38,15 @@ Use the scoped HTTP routes in the [API contract](../develop/http-api.md):
 Keep the family, Artifact ID, and exact Revision when citing a result or handing it to another Agent.
 The current head can advance while a historical Revision remains unchanged.
 
+## Name an exact revision with a stable handle
+
+A stable handle gives one exact Artifact Revision a human-readable, Scope-local name. Bind it with
+`PUT /v1/scopes/{scope_id}/artifact-handles/{family}/{key}` and resolve it with `GET` on the same route.
+
+Bindings are permanent. After `(scope_id, family, key)` is committed, it cannot be updated, released, or deleted.
+Repeating the same binding is idempotent; binding the key to another Artifact Revision returns `409 Conflict`.
+Verify the family, Artifact ID, Revision, and key before binding. If a key is bound by mistake, choose a new key.
+
 Artifact `sources` preserve each source's `source_type` and `source_id`, including dynamically registered types such
 as `note`. Treat `source_type` as an open Source name when reading lists, details, and historical revisions.
 Source IDs retain accepted Unicode characters and interior spaces, such as `用户偏好` and `release notes`.
@@ -52,9 +61,9 @@ reads.
 ## Search relevant current heads
 
 Use `POST /v1/scopes/{scope_id}/artifacts/{family}/search` for relevance search within one Scope. The built-in route
-supports Experience, managed Skill, and Topic Memory. Results contain complete content and exact revisions; optional
+supports Experience, managed Skill, Topic Memory, and Atomic Memory. Results contain complete content and exact revisions; optional
 scores belong to the search response. See [Search Artifacts](search-artifacts.md) for Family support, admission,
-thresholds, and failure behavior, and [Fusion algorithms and parameters](search-fusion.md) for Topic RRF controls.
+thresholds, and failure behavior, and [Fusion algorithms and parameters](search-fusion.md) for Topic and Atomic RRF controls.
 
 ## Change content through its workflow
 

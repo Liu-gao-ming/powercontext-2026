@@ -33,11 +33,13 @@ powercontext setup hermes
 powercontext doctor hermes
 ```
 
-The setup command copies the provider to `$HERMES_HOME/plugins/powercontext`, installs
-`$HERMES_HOME/plugins/powercontext-command`, and enables the companion without granting built-in tool override
-permissions. It does not start the Server or select the provider in Hermes.
+The setup command copies the provider to `$HERMES_HOME/plugins/powercontext` and installs
+`$HERMES_HOME/plugins/powercontext-command`. It enables the companion unless explicitly disabled, without granting
+built-in tool override permissions. If `memory.provider` is absent, setup selects PowerContext automatically;
+an existing provider choice, including an explicitly empty value, is preserved. Setup does not start the Server.
 
-Run the Hermes memory setup wizard and select `PowerContext`:
+To switch from an existing provider or change provider settings, run the Hermes memory setup wizard and select
+`PowerContext`:
 
 ```bash
 hermes memory setup

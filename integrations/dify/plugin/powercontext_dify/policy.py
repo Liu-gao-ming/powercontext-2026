@@ -14,5 +14,18 @@
 
 """Model-facing parameter policy shared by declarations and SDK validation."""
 
-HIDDEN_PARAMETERS = frozenset({"scope_id", "tag_filter", "expected_revision", "max_bytes", "include_code", "assembly"})
+HIDDEN_PARAMETERS = frozenset(
+    {
+        "scope_id",
+        "tag_filter",
+        "expected_revision",
+        "max_bytes",
+        "include_code",
+        # Diagnostics stay off the model-facing surface: a Workflow routes `result.content`, and
+        # `reason` is for an operator or an evaluation harness, not for the model to react to.
+        "explain",
+        "assembly",
+        "bootstrap_receipt_id",
+    }
+)
 MEMORY_KINDS = ("decision", "constraint", "current-state", "task-outcome", "next-step", "agent-note")

@@ -67,7 +67,9 @@ parameters:
     to dify. Pass one JSON-encoded value as text, never a native object/array/null.
     Encode strings with JSON quotes; use the text null for null; omit optional inputs
     when unused. Decode exactly once and preserve every field. Decoded JSON Schema:
-    {"anyOf":[{"type":"object","additionalProperties":true},{"type":"null"}]}'
+    {"anyOf":[{"type":"object","additionalProperties":true,"description":"Caller metadata.
+    The reserved kind value `working_note` is rejected; use the dedicated Working
+    Note capture operation instead."},{"type":"null"}]}'
 output_schema:
   type: object
   properties:

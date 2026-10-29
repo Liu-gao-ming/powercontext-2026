@@ -1,3 +1,5 @@
+
+<!-- POWERCONTEXT-GUIDANCE:START -->
 # Scope and Memory
 
 ## Read context
@@ -19,3 +21,4 @@
 - OpenCode asks for confirmation before a named PowerContext mutation.
 
 Automatic hooks attempt bounded context and Source capture; neither substitutes for an explicit Memory save.
+<!-- POWERCONTEXT-GUIDANCE:END -->

@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
+from typing import Any
 
-from sqlalchemy import Text, and_, cast, func, select
+from sqlalchemy import Text, and_, cast, func, literal, null, select, union_all
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -30,9 +31,9 @@ from powercontext.builtin.persistence.atomic_memory import atomic_memory_state_e
 from powercontext.builtin.persistence.database import SELECTION_BATCH_SIZE
 from powercontext.builtin.persistence.errors import InvalidRepositoryArgumentError
 from powercontext.builtin.persistence.tables import (
-    ARTIFACT_CANDIDATE_HEADS_TABLE,
     ARTIFACT_HEADS_TABLE,
     ARTIFACTS_TABLE,
+    CANDIDATE_HEADS_TABLE,
     MODEL_USAGE_DAILY_TABLE,
     MYSQL_IDENTITY_COLLATION,
     RECALL_EFFORT_DAILY_TABLE,
@@ -87,10 +88,6 @@ class StoredRecallTokenUsage:
 class StatisticsRepository:
     """Read scoped product heads and maintain bounded usage aggregates."""
 
-    async def inventory(self, connection: AsyncConnection, scope_id: str, /) -> StoredInventoryCounts:
-        counts = await self.inventory_many(connection, (scope_id,))
-        return counts[validate_scope_id(scope_id)]
-
     async def inventory_many(
         self,
         connection: AsyncConnection,
@@ -109,72 +106,66 @@ class StatisticsRepository:
             kind = func.json_unquote(kind).collate(MYSQL_IDENTITY_COLLATION)
         else:
             kind = kind.collate("BINARY")
-        for batch in _batches(scopes):
-            for scope, position in (
-                await connection.execute(
-                    select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id, SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
-                        SOURCE_JOURNAL_HEADS_TABLE.c.scope_id.in_(batch)
+        # The categories share a result shape, so fetch their aggregates in one
+        # round trip without multiplying rows between independent inventories.
+        source = SOURCE_JOURNAL_HEADS_TABLE.c
+        head = ARTIFACT_HEADS_TABLE.c
+        candidate = CANDIDATE_HEADS_TABLE.c
+        batch_size = SELECTION_BATCH_SIZE // 4
+        for offset in range(0, len(scopes), batch_size):
+            batch = scopes[offset : offset + batch_size]
+            counts = union_all(
+                select(
+                    source.scope_id,
+                    literal(0).label("category"),
+                    null().label("family"),
+                    null().label("kind"),
+                    null().label("state"),
+                    source.position.label("total"),
+                ).where(source.scope_id.in_(batch)),
+                select(head.scope_id, literal(1), head.family, null(), null(), func.count())
+                .where(head.scope_id.in_(batch), head.family != "memory")
+                .group_by(head.scope_id, head.family),
+                select(candidate.scope_id, literal(2), candidate.family, null(), candidate.status, func.count())
+                .where(candidate.scope_id.in_(batch))
+                .group_by(candidate.scope_id, candidate.family, candidate.status),
+                # Count all lifecycle states against exact authoritative heads.
+                select(head.scope_id, literal(3), null(), kind, atomic_memory_state_expression(), func.count())
+                .select_from(
+                    ARTIFACT_HEADS_TABLE.join(
+                        ARTIFACTS_TABLE,
+                        and_(
+                            ARTIFACTS_TABLE.c.scope_id == head.scope_id,
+                            ARTIFACTS_TABLE.c.family == head.family,
+                            ARTIFACTS_TABLE.c.artifact_id == head.artifact_id,
+                            ARTIFACTS_TABLE.c.revision == head.revision,
+                        ),
                     )
                 )
-            ).all():
-                positions[str(scope)] = int(position)
-            for scope, family, total in (
+                .where(head.scope_id.in_(batch), head.family == "atomic-memory")
+                .group_by(head.scope_id, kind, atomic_memory_state_expression()),
+            ).subquery("inventory_counts")
+            rows = (
                 await connection.execute(
-                    select(ARTIFACT_HEADS_TABLE.c.scope_id, ARTIFACT_HEADS_TABLE.c.family, func.count())
-                    .where(
-                        ARTIFACT_HEADS_TABLE.c.scope_id.in_(batch),
-                        ARTIFACT_HEADS_TABLE.c.family != "memory",
-                    )
-                    .group_by(ARTIFACT_HEADS_TABLE.c.scope_id, ARTIFACT_HEADS_TABLE.c.family)
-                    .order_by(ARTIFACT_HEADS_TABLE.c.scope_id, ARTIFACT_HEADS_TABLE.c.family)
-                )
-            ).all():
-                artifacts[str(scope)].append((str(family), int(total)))
-            for scope, family, status, total in (
-                await connection.execute(
-                    select(
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.family,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.status,
-                        func.count(),
-                    )
-                    .where(ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id.in_(batch))
-                    .group_by(
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.family,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.status,
-                    )
-                    .order_by(
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.family,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.status,
+                    select(counts).order_by(
+                        counts.c.scope_id,
+                        counts.c.category,
+                        counts.c.family,
+                        counts.c.kind,
+                        counts.c.state,
                     )
                 )
-            ).all():
-                candidates[str(scope)].append((str(family), str(status), int(total)))
-            # The current search projection holds only active records. Count all
-            # four states against exact authoritative heads, extracting kind in
-            # SQL so neither content nor lineage is expanded in the runtime.
-            for scope, memory_kind, state, total in (
-                await connection.execute(
-                    select(ARTIFACT_HEADS_TABLE.c.scope_id, kind, atomic_memory_state_expression(), func.count())
-                    .select_from(
-                        ARTIFACT_HEADS_TABLE.join(
-                            ARTIFACTS_TABLE,
-                            and_(
-                                ARTIFACTS_TABLE.c.scope_id == ARTIFACT_HEADS_TABLE.c.scope_id,
-                                ARTIFACTS_TABLE.c.family == ARTIFACT_HEADS_TABLE.c.family,
-                                ARTIFACTS_TABLE.c.artifact_id == ARTIFACT_HEADS_TABLE.c.artifact_id,
-                                ARTIFACTS_TABLE.c.revision == ARTIFACT_HEADS_TABLE.c.revision,
-                            ),
-                        )
-                    )
-                    .where(ARTIFACT_HEADS_TABLE.c.scope_id.in_(batch), ARTIFACT_HEADS_TABLE.c.family == "atomic-memory")
-                    .group_by(ARTIFACT_HEADS_TABLE.c.scope_id, kind, atomic_memory_state_expression())
-                    .order_by(ARTIFACT_HEADS_TABLE.c.scope_id, kind, atomic_memory_state_expression())
-                )
-            ).all():
-                memories[str(scope)].append((str(memory_kind), str(state), int(total)))
+            ).mappings()
+            for row in rows:
+                scope, total = str(row["scope_id"]), int(row["total"])
+                if row["category"] == 0:
+                    positions[scope] = total
+                elif row["category"] == 1:
+                    artifacts[scope].append((str(row["family"]), total))
+                elif row["category"] == 2:
+                    candidates[scope].append((str(row["family"]), str(row["state"]), total))
+                else:
+                    memories[scope].append((str(row["kind"]), str(row["state"]), total))
         return {
             scope: StoredInventoryCounts(
                 sources=positions.get(scope, 0),
@@ -250,62 +241,37 @@ class StatisticsRepository:
             raise InvalidRepositoryArgumentError("dialect", f"unsupported database dialect: {dialect}")
         await connection.execute(statement)
 
-    async def usage(
-        self,
-        connection: AsyncConnection,
-        scope_id: str,
-        start_date: date,
-        end_date: date,
-        /,
-    ) -> tuple[StoredModelUsage, ...]:
-        rows = await self.usage_many(connection, (scope_id,), start_date, end_date)
-        return rows[validate_scope_id(scope_id)]
-
-    async def usage_many(
+    async def daily_usage_many(
         self,
         connection: AsyncConnection,
         scope_ids: Sequence[str],
         start_date: date,
         end_date: date,
-        /,
-    ) -> dict[str, tuple[StoredModelUsage, ...]]:
-        """Return each requested Scope's daily model usage over one shared period."""
-
+        *,
+        estimator: tuple[str, str] | None,
+    ) -> tuple[dict[str, tuple[StoredModelUsage, ...]], dict[str, tuple[StoredRecallTokenUsage, ...]]]:
+        """Read model and recall aggregates together without inventory or recurrence."""
         scopes = _validated_scopes(scope_ids)
         if start_date > end_date:
             raise InvalidRepositoryArgumentError("period", "start_date must not follow end_date")
-        collected: dict[str, list[StoredModelUsage]] = {scope: [] for scope in scopes}
-        for batch in _batches(scopes):
+        usage, recall = {}, {}
+        batch_size = SELECTION_BATCH_SIZE // 2
+        for offset in range(0, len(scopes), batch_size):
+            batch = scopes[offset : offset + batch_size]
             rows = (
                 await connection.execute(
-                    select(MODEL_USAGE_DAILY_TABLE)
-                    .where(
-                        MODEL_USAGE_DAILY_TABLE.c.scope_id.in_(batch),
-                        MODEL_USAGE_DAILY_TABLE.c.usage_date >= start_date,
-                        MODEL_USAGE_DAILY_TABLE.c.usage_date <= end_date,
-                    )
-                    .order_by(
-                        MODEL_USAGE_DAILY_TABLE.c.scope_id,
-                        MODEL_USAGE_DAILY_TABLE.c.usage_date,
-                        MODEL_USAGE_DAILY_TABLE.c.purpose,
-                        MODEL_USAGE_DAILY_TABLE.c.operation,
+                    daily_usage_statement(
+                        batch,
+                        start_date,
+                        end_date,
+                        estimator=estimator,
                     )
                 )
             ).mappings()
-            for row in rows:
-                collected[str(row["scope_id"])].append(
-                    StoredModelUsage(
-                        usage_date=row["usage_date"],
-                        purpose=ModelUsagePurpose(str(row["purpose"])),
-                        operation=ModelUsageOperation(str(row["operation"])),
-                        requests=int(row["requests"]),
-                        input_tokens=int(row["input_tokens"]),
-                        output_tokens=int(row["output_tokens"]),
-                        input_complete=bool(row["input_complete"]),
-                        output_complete=bool(row["output_complete"]),
-                    )
-                )
-        return {scope: tuple(rows) for scope, rows in collected.items()}
+            model_rows, recall_rows = decode_daily_usage(rows, batch)
+            usage.update(model_rows)
+            recall.update(recall_rows)
+        return usage, recall
 
     async def record_recall(
         self,
@@ -394,68 +360,93 @@ class StatisticsRepository:
             raise InvalidRepositoryArgumentError("dialect", f"unsupported database dialect: {dialect}")
         await connection.execute(statement)
 
-    async def recall_usage(
-        self,
-        connection: AsyncConnection,
-        scope_id: str,
-        start_date: date,
-        end_date: date,
-        *,
-        estimator_id: str,
-        estimator_version: str,
-    ) -> tuple[StoredRecallTokenUsage, ...]:
-        rows = await self.recall_usage_many(
-            connection,
-            (scope_id,),
-            start_date,
-            end_date,
-            estimator_id=estimator_id,
-            estimator_version=estimator_version,
+
+def daily_usage_statement(
+    scope_ids: Sequence[str],
+    start_date: date,
+    end_date: date,
+    *,
+    estimator: tuple[str, str] | None,
+):
+    """Compose one bounded daily-aggregate read; callers may add a page header."""
+    scopes = _validated_scopes(scope_ids)
+    if start_date > end_date:
+        raise InvalidRepositoryArgumentError("period", "start_date must not follow end_date")
+    model, recall = MODEL_USAGE_DAILY_TABLE, RECALL_TOKEN_DAILY_TABLE
+    columns = {
+        column.name: column
+        for table in (model, recall)
+        for column in table.c
+        if column.name not in {"estimator_id", "estimator_version"}
+    }
+
+    def project(table, kind):
+        return select(
+            literal(kind).label("usage_kind"),
+            *(
+                table.c[name] if name in table.c else literal(None, type_=column.type).label(name)
+                for name, column in columns.items()
+            ),
+        ).where(
+            table.c.scope_id.in_(scopes),
+            table.c.usage_date >= start_date,
+            table.c.usage_date <= end_date,
         )
-        return rows[validate_scope_id(scope_id)]
 
-    async def recall_usage_many(
-        self,
-        connection: AsyncConnection,
-        scope_ids: Sequence[str],
-        start_date: date,
-        end_date: date,
-        *,
-        estimator_id: str,
-        estimator_version: str,
-    ) -> dict[str, tuple[StoredRecallTokenUsage, ...]]:
-        """Return each requested Scope's daily recall-token aggregates for one estimator."""
+    statements = [project(model, "model")]
+    if estimator is not None:
+        statements.append(
+            project(recall, "recall").where(
+                recall.c.estimator_id == estimator[0],
+                recall.c.estimator_version == estimator[1],
+            )
+        )
+    rows = union_all(*statements).subquery("daily_usage")
+    return select(rows).order_by(
+        rows.c.scope_id, rows.c.usage_date, rows.c.usage_kind, rows.c.purpose, rows.c.operation
+    )
 
-        scopes = _validated_scopes(scope_ids)
-        if start_date > end_date:
-            raise InvalidRepositoryArgumentError("period", "start_date must not follow end_date")
-        collected: dict[str, list[StoredRecallTokenUsage]] = {scope: [] for scope in scopes}
-        for batch in _batches(scopes):
-            rows = (
-                await connection.execute(
-                    select(RECALL_TOKEN_DAILY_TABLE)
-                    .where(
-                        RECALL_TOKEN_DAILY_TABLE.c.scope_id.in_(batch),
-                        RECALL_TOKEN_DAILY_TABLE.c.usage_date >= start_date,
-                        RECALL_TOKEN_DAILY_TABLE.c.usage_date <= end_date,
-                        RECALL_TOKEN_DAILY_TABLE.c.estimator_id == estimator_id,
-                        RECALL_TOKEN_DAILY_TABLE.c.estimator_version == estimator_version,
-                    )
-                    .order_by(RECALL_TOKEN_DAILY_TABLE.c.scope_id, RECALL_TOKEN_DAILY_TABLE.c.usage_date)
-                )
-            ).mappings()
-            for row in rows:
-                collected[str(row["scope_id"])].append(
-                    StoredRecallTokenUsage(
-                        usage_date=row["usage_date"],
-                        preparations=int(row["preparations"]),
-                        ready_preparations=int(row["ready_preparations"]),
-                        comparable_preparations=int(row["comparable_preparations"]),
-                        baseline_tokens=int(row["baseline_tokens"]),
-                        recalled_tokens=int(row["recalled_tokens"]),
-                    )
-                )
-        return {scope: tuple(rows) for scope, rows in collected.items()}
+
+def decode_daily_usage(
+    rows: Iterable[Mapping[Any, Any]],
+    scope_ids: Sequence[str],
+) -> tuple[dict[str, tuple[StoredModelUsage, ...]], dict[str, tuple[StoredRecallTokenUsage, ...]]]:
+    """Separate tagged daily rows while preserving their existing typed aggregation inputs."""
+    usage: dict[str, list[StoredModelUsage]] = {scope: [] for scope in scope_ids}
+    recall: dict[str, list[StoredRecallTokenUsage]] = {scope: [] for scope in scope_ids}
+    for row in rows:
+        scope = str(row["scope_id"])
+        if row["usage_kind"] == "model":
+            usage[scope].append(_model_usage(row))
+        else:
+            recall[scope].append(_recall_usage(row))
+    return {scope: tuple(values) for scope, values in usage.items()}, {
+        scope: tuple(values) for scope, values in recall.items()
+    }
+
+
+def _model_usage(row: Mapping[Any, Any]) -> StoredModelUsage:
+    return StoredModelUsage(
+        usage_date=row["usage_date"],
+        purpose=ModelUsagePurpose(str(row["purpose"])),
+        operation=ModelUsageOperation(str(row["operation"])),
+        requests=int(row["requests"]),
+        input_tokens=int(row["input_tokens"]),
+        output_tokens=int(row["output_tokens"]),
+        input_complete=bool(row["input_complete"]),
+        output_complete=bool(row["output_complete"]),
+    )
+
+
+def _recall_usage(row: Mapping[Any, Any]) -> StoredRecallTokenUsage:
+    return StoredRecallTokenUsage(
+        usage_date=row["usage_date"],
+        preparations=int(row["preparations"]),
+        ready_preparations=int(row["ready_preparations"]),
+        comparable_preparations=int(row["comparable_preparations"]),
+        baseline_tokens=int(row["baseline_tokens"]),
+        recalled_tokens=int(row["recalled_tokens"]),
+    )
 
 
 def _validated_scopes(scope_ids: Sequence[str], /) -> tuple[str, ...]:

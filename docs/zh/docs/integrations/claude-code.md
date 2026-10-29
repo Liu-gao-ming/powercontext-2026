@@ -15,7 +15,11 @@ description: 安装 PowerContext Claude Code 插件，并配置召回、提示�
 ```bash
 powercontext --version
 claude --version
+python3 --version
 ```
+
+Claude Code 使用 `PATH` 上找到的 `python3` 运行插件的 Hook 和状态栏，而不是 PowerContext 安装所用的 Python。
+它们需要 Python 3.9 或更新版本，且只依赖标准库，因此 macOS 自带的系统 Python 即可使用。
 
 Python package 和插件应使用同一个 PowerContext 仓库 ref。Hook 会校验带版本的 Prepared Context contract，
 因此旧 Server 与新插件混用时，召回可能被禁用，但不会阻塞 Claude Code。
@@ -31,13 +35,13 @@ set +a
 powercontext setup claude-code --server-url "$POWERCONTEXT_CLAUDE_SERVER_URL"
 ```
 
-修改 Claude Code 设置前，setup 会报告设置项、插件缓存、持久化数据位置、所需权限和准确的回滚命令。
-之后命令会注册或刷新 Marketplace、以 user scope 更新或安装插件，并通过 Claude Code 的 JSON 输出确认插件已启用。
+setup 会注册或刷新 Marketplace，再以 user scope 安装或更新插件。更新保留显式禁用状态，结果报告已安装版本、
+插件缓存和持久化数据位置。
 
-Marketplace registry、按版本保存的插件缓存和插件数据目录由 Claude Code 管理。Claude 2.1.133 的
-`plugin install` 不支持配置参数，因此 setup 会在安装成功后，把 `server_url` 和 `capture_prompts`
-原子合并到用户级 `pluginConfigs`，并保留其他设置；失败时恢复安装前快照。PowerContext 从
-`CLAUDE_CONFIG_DIR` 或 Claude Code 默认配置目录解析这些位置。
+Marketplace registry、按版本保存的插件缓存和插件数据目录由 Claude Code 管理。安装成功后，setup 将
+`server_url` 和 `capture_prompts` 合并到用户级 `pluginConfigs`，保留其他设置及省略的采集偏好。
+连接配置失败时恢复该阶段的本地变更，已完成的原生安装保留。PowerContext 从 `CLAUDE_CONFIG_DIR`
+或 Claude Code 默认配置目录解析这些位置。
 
 使用本地 checkout 时，传入目录：
 
@@ -52,9 +56,9 @@ powercontext doctor claude-code
 claude
 ```
 
-使用 `/hooks` 确认 `UserPromptSubmit` Hook，使用 `/mcp` 确认 `powercontext` Server。
+使用 `/hooks` 确认 `SessionStart` 和 `UserPromptSubmit` Hook，使用 `/mcp` 确认 `powercontext` Server。
 两者分别负责采集/召回和显式工具调用，必须都连接成功。`doctor claude-code` 主要检查安装状态，
-完整记忆还需完成[Source 与主题验收](../get-started/quickstart.md#4-用普通对话验收-topic-memory)。
+完整记忆还需完成[Source 与主题验收](../get-started/quickstart.md#4-按所选模式验收记忆)。
 
 为新 Scope 执行 `.env.next-steps.md` 中的创建请求，把返回的真实 `scope_id` 写入
 `.env` 的 `POWERCONTEXT_CLAUDE_SCOPE_ID`，然后重新加载并开启新会话。
@@ -76,6 +80,34 @@ MCP endpoint 来自 setup 保存的 `server_url`，Hook 可被 `POWERCONTEXT_CLA
 2. 最多调用一次 `POST /v1/context/prepare`；
 3. 严格校验 `powercontext.prepared-context.v1`，再通过 `additionalContext` 原样注入；
 4. 独立地将 prompt 采集为普通 Content Source 证据。
+
+召回在构造请求前先给 query 定界：不超过 8192 个字符、也不超过 8192 个 UTF-8 字节的 prompt 原样发送；更长的
+prompt 改用最近的文本召回，先取末尾 8192 个字符、再截到末尾 8192 字节。因此长 prompt 只会收窄 query，不会让
+召回失败。采集独立进行，仍按自身上限执行。
+
+启动上下文是独立且默认关闭的 `SessionStart` 路径。在启动 Claude Code 前显式启用：
+
+```bash
+export POWERCONTEXT_CLAUDE_BOOTSTRAP_CONTEXT=true
+claude
+```
+
+在 `startup`、`resume`、`clear`、`compact` 和 `fork` 事件中，固定 profile
+`powercontext.scope-bootstrap.v1` 最多注入 6 个显式标记为 `bootstrap-context` 的 active Atomic Memory Artifact；当前 Scope
+优先，其次是最多 8 个直接 Context References。它不会扫描全部 Memory、Source、transcript、pending Candidate 或生成的
+instruction，也会排除类型类似 secret 的 Memory。内容始终是不可信历史，不能覆盖当前指令。
+
+默认预算为 4096 bytes，可通过 `POWERCONTEXT_CLAUDE_BOOTSTRAP_MAX_BYTES` 在 512 到 8192 之间调整。系统不会
+自动选择 Handoff；只有确实要交给新 Session 时，才显式指定当前 Scope 中一个 exact committed Handoff：
+
+```bash
+export POWERCONTEXT_CLAUDE_BOOTSTRAP_HANDOFF='{"artifact_id":"HANDOFF_ID","revision":3}'
+```
+
+通过 Atomic Memory Artifact tag API，只把经过审阅的决策、约束、目标、已验证状态或仓库指南标记为 `bootstrap-context`。
+插件在 `${CLAUDE_PLUGIN_DATA}` 下只保存不含正文的 receipt；成功注入后，第一条普通查询仅排除正文已完整交付的
+exact Atomic Memory revisions；启动时被截短的 Artifact 和后续修订版本仍可召回。准备、校验或回执失败时都会 fail open，
+不注入任何内容。在新的生命周期包建立前发生失败（包括配置非法）时，还会清除之前保存的过期 receipt。
 
 配置 generation model 后，Source pipeline 可能进一步提取 Memory。提示词采集不会调用 `remember_memory`，
 Hook 也不会把普通 prompt 标记为 `task-outcome`。
@@ -105,10 +137,14 @@ resolver 只把 workspace 路径哈希用作外部 binding key，不会根据 Gi
 随附的 MCP Server 暴露已有的 PowerContext 操作。Claude 可以搜索和列出 Memory；只有用户明确要求持久化变更时，
 才创建、修订或废弃 Memory entry。
 
-转交任务时，随附 Skill 会引导 Claude 用 `handoff_current_work` 准备当前工作，并在“交接”等明确命令下把返回的
-`handoff` 原样传给 `commit_handoff`。接收方用 `continue_handoff` 读取 exact Revision，核验后通过
-`acknowledge_handoff` 回执；完成任务时用 `record_task_outcome` 关联该回执。Prepared Handoff 仍是临时载体，
-exact Revision 才是跨 Agent 的持久交接点。
+对于“交接”“交接当前工作”等普通请求，随附 Skill 引导 Claude 检查当前工作、调用 `handoff_current_work`，
+并返回完整的 `handoff` 成员作为临时载体。准备会记录 boundary Source，不会提交持久 Revision。
+只有“保存持久交接里程碑”等明确请求，才授权将返回值原样传给 `commit_handoff`；仅在成功返回精确 Revision 后，
+才能报告里程碑已提交。预览或设计请求不执行写入。
+
+接收方用 `continue_handoff` 的 `selection: "prepared"` 和完整载体，或精确的已提交 Revision，解析并核验交接，
+然后记录 `acknowledge_handoff` 回执。完成的工作若接续了已接受的持久 Handoff，使用 `record_task_outcome` 关联该回执。
+历史说明和回执都不会授予执行权限。
 
 自动召回不依赖 Claude 是否决定调用 MCP。反过来，MCP Memory 写入也不能替代 prompt 采集：启用采集后，Hook
 会把每条 prompt 保存为普通 Source 证据，之后是否从 Source 生成 Memory 由 Server 决定。
@@ -207,6 +243,9 @@ claude plugin marketplace remove powercontext
 | `POWERCONTEXT_CLAUDE_ALLOW_INSECURE_HTTP` | `false` | 显式允许 PowerContext 请求使用非环回明文 HTTP |
 | `POWERCONTEXT_CLAUDE_SCOPE_ID` | 未设置 | 覆盖持久 binding 和 Server 默认 Scope |
 | `POWERCONTEXT_CLAUDE_AUTHORIZATION` | 未设置 | Hook 与 MCP 请求使用的完整 `Bearer <token>` header |
+| `POWERCONTEXT_CLAUDE_BOOTSTRAP_CONTEXT` | `false` | 在支持的 `SessionStart` 事件中注入精选启动 profile |
+| `POWERCONTEXT_CLAUDE_BOOTSTRAP_MAX_BYTES` | `4096` | 启动上下文总预算；有效范围为 512 到 8192 bytes |
+| `POWERCONTEXT_CLAUDE_BOOTSTRAP_HANDOFF` | 未设置 | 一个 exact committed Handoff 的 JSON 身份，例如 `{"artifact_id":"...","revision":3}` |
 | `POWERCONTEXT_CLAUDE_CAPTURE_PROMPTS` | `true` | 把用户 prompt 采集为普通 Source 证据 |
 | `POWERCONTEXT_CLAUDE_FLUSH_ON_CAPTURE` | `false` | 采集后等待 Source 处理 |
 | `POWERCONTEXT_CLAUDE_REQUEST_TIMEOUT_SECONDS` | `3` | Hook 单次请求超时 |
@@ -219,3 +258,7 @@ Authorization 只能来自环境变量，不能加入 Server URL 或插件选项
 
 `UserPromptSubmit` Hook 的外层超时为十秒。召回与采集共用一个 wall-clock 时间预算，但会独立降级。
 显式允许 HTTP 不会关闭 HTTPS 证书校验。修改环境变量后需要重启 Claude Code。
+
+## 自动输入隐私
+
+本宿主的捕获默认值、关闭方式、凭据识别局限及独立只读查询行为见[自动 prompt 隐私策略](index.md#自动-prompt-隐私策略)。识别到凭据的输入会跳过捕获，已接受的 Source 正文和事件身份不被改写。

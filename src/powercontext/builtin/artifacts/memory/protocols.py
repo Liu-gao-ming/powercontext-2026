@@ -18,12 +18,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
 from powercontext.artifacts import Artifact
 from powercontext.builtin.artifacts.memory.models import MemoryEntryInput, MemoryEntryVersion
+from powercontext.builtin.decision_observations import DecisionObservation
 from powercontext.sources import Source
 
 
@@ -78,6 +79,21 @@ class MemoryWriteGateRequest:
     candidates: tuple[str, ...]
     evidence: tuple[str, ...]
     expected_revision: int | None = None
+    scope_id: str = "unscoped"
+    operation_id: str | None = None
+    subject_refs: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    observation_sink: MemoryWriteObservationSink | None = None
+    defer_observation_emission: bool = False
+
+
+class MemoryWriteObservationSink(Protocol):
+    """Receive a bounded gate observation after its owning domain action is final."""
+
+    async def record(self, observation: DecisionObservation, /) -> None:
+        """Persist or collect one content-free observation."""
+
+        ...
 
 
 class MemoryWriteGate(Protocol):
@@ -91,6 +107,18 @@ class MemoryWriteGate(Protocol):
 
     async def assess(self, request: MemoryWriteGateRequest, /) -> MemoryWriteAssessment:
         """Return one verdict for a candidate set and its bounded evidence projection."""
+
+        ...
+
+
+@runtime_checkable
+class MemoryWriteGatePreflight(Protocol):
+    """Optionally map a deterministic service-side rejection through the gate policy."""
+
+    async def assess_preflight(
+        self, request: MemoryWriteGateRequest, rejection: MemoryWriteAssessment, /
+    ) -> MemoryWriteAssessment:
+        """Return the mode-aware assessment for one bounded preflight rejection."""
 
         ...
 

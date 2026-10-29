@@ -47,8 +47,8 @@ def test_configuration_read_preserves_saved_content_when_component_cannot_run(in
     async def scenario() -> None:
         head = _prompt("Saved guidance remains readable.", revision=4)
 
-        async def read(scope: str, key: str) -> Prompt:
-            return head
+        async def read(scope: str, keys: tuple[str, ...]) -> dict[str, Prompt]:
+            return dict.fromkeys(keys, head)
 
         registry = PromptRegistry(
             builtin_prompt_definitions(), injected=frozenset({"memory.extract"}) if injected else frozenset()
@@ -74,9 +74,8 @@ def test_concurrent_scopes_and_retries_use_frozen_prompt_selections() -> None:
         entered = {scope: asyncio.Event() for scope in heads}
         seen: dict[str, list[str]] = {"a": [], "b": []}
 
-        async def read(scope: str, key: str) -> Prompt:
-            assert key == "memory.extract"
-            return heads[scope]
+        async def read(scope: str, keys: tuple[str, ...]) -> dict[str, Prompt]:
+            return dict.fromkeys(keys, heads[scope])
 
         async def respond(messages, info) -> ModelResponse:
             selection = current_prompt("memory.extract")
@@ -145,8 +144,8 @@ def test_prompt_traces_include_identity_but_exclude_custom_content() -> None:
     )
     prompt = Prompt(artifact_id="memory.extract", revision=7, content=content)
 
-    async def read(scope: str, key: str) -> Prompt:
-        return prompt
+    async def read(scope: str, keys: tuple[str, ...]) -> dict[str, Prompt]:
+        return dict.fromkeys(keys, prompt)
 
     async def reply(messages, info) -> ModelResponse:
         assert private_guidance in info.instructions and private_demo in info.instructions
@@ -198,8 +197,8 @@ def test_injected_component_blocks_existing_custom_head_and_allows_explicit_auto
     async def scenario() -> None:
         head = _prompt("Keep release constraints.")
 
-        async def read(scope: str, key: str) -> Prompt:
-            return head
+        async def read(scope: str, keys: tuple[str, ...]) -> dict[str, Prompt]:
+            return dict.fromkeys(keys, head)
 
         service = PromptService(
             PromptRegistry(builtin_prompt_definitions(), injected=frozenset({"memory.extract"})), read

@@ -54,8 +54,8 @@ def test_documented_container_invocation_starts_out_of_the_box(monkeypatch: pyte
     run_server = Mock()
     tracing = Mock()
     monkeypatch.setattr("powercontext.server.cli._run_server", run_server)
-    monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config: None)
-    monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config: tracing)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_logging", lambda _config, **_kwargs: None)
+    monkeypatch.setattr("powercontext.server.cli.configure_server_tracing", lambda _config, **_kwargs: tracing)
     # Reproduce the container's environment exactly, with no ambient POWERCONTEXT_SERVER_* leaking in.
     for name in list(os.environ):
         if name.startswith("POWERCONTEXT_SERVER_"):

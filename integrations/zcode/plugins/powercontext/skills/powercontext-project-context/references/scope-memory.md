@@ -1,3 +1,5 @@
+
+<!-- POWERCONTEXT-GUIDANCE:START -->
 # Scope and Memory
 
 ## Resolve the current Scope
@@ -38,6 +40,17 @@ unavailable in remote-workspace mode. Never infer resolution origin from the ord
 
 ## Memory reads and writes
 
+Form one short search query from the topic, entity or exact identifier supplied by the current question.
+Preserve its language and technical terms; do not append guessed synonyms, translations or project names.
+Leave answer-format and fallback instructions out of the query, while preserving domain qualifiers, negations,
+versions and exact values. If the topic is unclear, ask for clarification instead of guessing a query.
+
+A successful empty search means this query found no matching Memory, not that no Memory exists.
+It does not authorize broader queries, another Scope, an inventory, local memory files or another retrieval channel.
+Make additional searches only when the current user request authorizes them. Report failed, denied, unavailable
+and unknown operations separately from a successful empty result.
+
+
 - Use `search_memory` with a focused query, `mode: "auto"`, and at most eight results.
   Current hits contain `memory.artifact`, text, state, and `state_version`; they do not contain legacy entry citations.
 - Use `list_atomic_memories` for requested inventories, explicit state filters, and `next_cursor` pagination.
@@ -68,3 +81,4 @@ chain. Legacy `revise_memory_entry` and `retire_memory_entry` are not current MC
 
 Keep the resolved Scope for Handoff, candidate inspection, and other operations. Scope scripts manage binding;
 they never replace the MCP tool. If a required tool is absent, report the operation unavailable and incomplete.
+<!-- POWERCONTEXT-GUIDANCE:END -->

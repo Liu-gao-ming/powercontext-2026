@@ -231,6 +231,14 @@ def build_instruction_skill_package(content: SkillContent, /) -> SkillPackageSna
     return _canonical_snapshot((_PackageFile(SKILL_ENTRYPOINT, skill_markdown, 0o644),), expected_name=content.name)
 
 
+def comparable_skill_content(content: SkillContent, /) -> SkillContent:
+    """Compare legacy instructions in packaged form while preserving existing package identities."""
+
+    if content.package is None:
+        return build_instruction_skill_package(content).as_skill_content()
+    return content
+
+
 def _directory_files(root: Path) -> tuple[_PackageFile, ...]:  # noqa: C901
     files: list[_PackageFile] = []
     seen_inodes: set[tuple[int, int]] = set()
@@ -552,6 +560,7 @@ __all__ = [
     "build_instruction_skill_package",
     "capture_skill_archive",
     "capture_skill_directory",
+    "comparable_skill_content",
     "materialize_skill_package",
     "package_file",
 ]

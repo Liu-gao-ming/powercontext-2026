@@ -77,6 +77,7 @@ export async function confirmDurableWrite(
 const WRITE_OPERATIONS = new Set<OperationId>([
   'remember_memory',
   'capture_content_source',
+  'capture_working_note',
   'revise_memory_entry',
   'retire_memory_entry',
   'replace_artifact',
@@ -89,9 +90,9 @@ const WRITE_OPERATIONS = new Set<OperationId>([
   'record_task_outcome',
   'generate_experience',
   'generate_skill',
-  'approve_artifact_candidate',
-  'reject_artifact_candidate',
-  'revise_artifact_candidate',
+  'approve_candidate',
+  'reject_candidate',
+  'revise_candidate',
   'import_external_skill',
 ])
 

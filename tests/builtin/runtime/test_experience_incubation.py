@@ -23,13 +23,13 @@ from powercontext.builtin.inference import InferenceUnavailableError
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import (
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     BuiltinConfig,
     BuiltinConfigurationError,
     BuiltinRuntime,
     CaptureSource,
     GetExperienceRequest,
-    ListArtifactCandidatesRequest,
+    ListCandidatesRequest,
     RuntimeConfig,
     open_builtin_runtime,
 )
@@ -103,7 +103,7 @@ def test_incubation_uses_an_independent_cursor_and_keeps_candidates_gated() -> N
             memory_cursor = await runtime.atomic_memory.for_scope(scope).cursor()
             incubated = await runtime.experience.for_scope(scope).incubate(limit=1)
             replay = await runtime.experience.for_scope(scope).incubate(limit=1)
-            inbox = await runtime.review.for_scope(scope).list(ListArtifactCandidatesRequest(family="experience"))
+            inbox = await runtime.review.for_scope(scope).list(ListCandidatesRequest(family="experience"))
 
             assert ordinary.candidate_count == 0
             assert ordinary.current_cursor == 1
@@ -121,7 +121,7 @@ def test_incubation_uses_an_independent_cursor_and_keeps_candidates_gated() -> N
             assert candidate.result_artifact is None
 
             approved = await runtime.review.for_scope(scope).approve(
-                ApproveArtifactCandidateRequest(
+                ApproveCandidateRequest(
                     candidate_id=candidate.candidate_id,
                     expected_version=candidate.version,
                 )
@@ -131,6 +131,51 @@ def test_incubation_uses_an_independent_cursor_and_keeps_candidates_gated() -> N
                 GetExperienceRequest(artifact=approved.result_artifact)
             )
             assert experience.lineage.sources == (outcome.source_ref,)
+
+    asyncio.run(scenario())
+
+
+def test_incubation_commits_multiple_candidates_from_one_generation_call() -> None:
+    async def scenario() -> None:
+        pipeline = _TaskOutcomePipeline()
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig()),
+            experience_pipeline=pipeline,
+        ) as runtime:
+            scope = await _create_scope(runtime, "multi-output-experience")
+            first = await runtime.sources.for_scope(scope).capture(
+                CaptureSource(
+                    source_id="task-1",
+                    content="python test_config.py passed",
+                    metadata={"kind": "task-outcome"},
+                )
+            )
+            second = await runtime.sources.for_scope(scope).capture(
+                CaptureSource(
+                    source_id="task-2",
+                    content="python test_upgrade.py passed",
+                    metadata={"kind": "task-outcome"},
+                )
+            )
+
+            incubated = await runtime.experience.for_scope(scope).incubate()
+            inbox = await runtime.review.for_scope(scope).list(ListCandidatesRequest(family="experience"))
+
+            assert len(pipeline.calls) == 1
+            assert tuple(source.name for source in pipeline.calls[0] if isinstance(source, ContentSource)) == (
+                "task-1",
+                "task-2",
+            )
+            assert (incubated.previous_cursor, incubated.current_cursor) == (0, second.sequence)
+            assert incubated.source_count == incubated.candidate_count == 2
+            assert set(incubated.candidate_ids) == {candidate.candidate_id for candidate in inbox.candidates}
+            assert all(candidate.status == "pending" for candidate in inbox.candidates)
+            assert {
+                (candidate.sources[0].source_type, candidate.sources[0].source_id) for candidate in inbox.candidates
+            } == {
+                (first.source_ref.source_type, first.source_ref.source_id),
+                (second.source_ref.source_type, second.source_ref.source_id),
+            }
 
     asyncio.run(scenario())
 
@@ -154,7 +199,7 @@ def test_incubation_retries_the_same_window_after_generation_failure() -> None:
             with pytest.raises(InferenceUnavailableError):
                 await runtime.experience.for_scope(scope).incubate()
             retried = await runtime.experience.for_scope(scope).incubate()
-            inbox = await runtime.review.for_scope(scope).list(ListArtifactCandidatesRequest(family="experience"))
+            inbox = await runtime.review.for_scope(scope).list(ListCandidatesRequest(family="experience"))
 
             assert retried.previous_cursor == 0
             assert retried.current_cursor == 1

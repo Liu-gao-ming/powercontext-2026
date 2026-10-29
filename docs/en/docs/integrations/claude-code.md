@@ -16,7 +16,12 @@ run setup:
 ```bash
 powercontext --version
 claude --version
+python3 --version
 ```
+
+Claude Code runs the plugin's Hooks and status line with the `python3` found on `PATH`, not with the PowerContext
+installation's Python. They need Python 3.9 or newer and use only the standard library, so the macOS system Python
+works.
 
 Use the same PowerContext repository ref for the Python package and plugin. The Hook validates a versioned Prepared
 Context contract, so mixing an older Server with a newer plugin can disable recall without blocking Claude Code.
@@ -33,14 +38,13 @@ set +a
 powercontext setup claude-code --server-url "$POWERCONTEXT_CLAUDE_SERVER_URL"
 ```
 
-Before changing Claude Code settings, setup reports the settings entry, plugin cache, persistent data location,
-required permissions, and exact rollback commands. It then registers or refreshes the Marketplace, updates or installs
-the plugin at user scope, and verifies the enabled plugin through Claude Code's JSON output.
+Setup registers or refreshes the Marketplace, then installs or updates the plugin at user scope. Updates preserve
+explicit plugin disablement. The result reports the installed version, plugin cache, and persistent data location.
 
-Claude Code owns the Marketplace registry, versioned plugin cache, and plugin data directory. Claude 2.1.133 does not
-accept configuration flags on `plugin install`, so setup atomically merges `server_url` and `capture_prompts` into
-the user-level `pluginConfigs` after installation while preserving unrelated settings; on failure it restores the
-pre-install snapshot. PowerContext resolves these locations from `CLAUDE_CONFIG_DIR` or Claude Code's default
+Claude Code owns the Marketplace registry, versioned plugin cache, and plugin data directory. After installation,
+setup merges `server_url` and `capture_prompts` into the user-level `pluginConfigs`, preserving unrelated settings
+and omitted capture preferences. If connection configuration fails, its local changes are restored; the completed
+native installation remains. PowerContext resolves these locations from `CLAUDE_CONFIG_DIR` or Claude Code's default
 configuration directory.
 
 For a local checkout, pass its directory:
@@ -56,9 +60,9 @@ powercontext doctor claude-code
 claude
 ```
 
-Use `/hooks` to confirm the `UserPromptSubmit` Hook and `/mcp` to confirm the `powercontext` Server.
+Use `/hooks` to confirm the `SessionStart` and `UserPromptSubmit` Hooks and `/mcp` to confirm the `powercontext` Server.
 These are separate capture/recall and explicit-tool connections; both must work. `doctor claude-code` primarily checks
-installation state. Complete the [Source and Topic check](../get-started/quickstart.md#4-verify-topic-memory-with-ordinary-conversation) to verify memory behavior.
+installation state. Complete the [Source and Topic check](../get-started/quickstart.md#4-verify-memory-in-your-selected-mode) to verify memory behavior.
 
 For a new Scope, run the creation request in `.env.next-steps.md`, write the returned real `scope_id` to
 `POWERCONTEXT_CLAUDE_SCOPE_ID` in `.env`, reload it, and start a new session. The planned
@@ -81,6 +85,39 @@ For each user prompt, the Hook:
 2. calls `POST /v1/context/prepare` at most once;
 3. strictly validates `powercontext.prepared-context.v1` and injects it unchanged through `additionalContext`;
 4. independently captures the prompt as ordinary Content Source evidence.
+
+Recall bounds its query before the request is built: a prompt of at most 8,192 characters and 8,192 UTF-8 bytes is sent
+as submitted, while a longer prompt recalls from its most recent text, cut to the last 8,192 characters and then to the
+last 8,192 bytes. A long prompt therefore narrows the query instead of failing the recall. Capture is independent and
+keeps its own limit.
+
+Bootstrap context is a separate, opt-in `SessionStart` path. Enable it before launching Claude Code:
+
+```bash
+export POWERCONTEXT_CLAUDE_BOOTSTRAP_CONTEXT=true
+claude
+```
+
+On `startup`, `resume`, `clear`, `compact`, and `fork`, the fixed `powercontext.scope-bootstrap.v1` profile can inject
+at most six active Atomic Memory Artifacts explicitly tagged `bootstrap-context`, considering the current Scope before
+at most eight direct Context References. It never scans all Memory, Sources, transcripts, pending Candidates, or
+generated instructions; secret-like Memory kinds are excluded. The content is untrusted history and cannot override
+current instructions.
+
+The default 4096-byte budget can be set from 512 through 8192 bytes with
+`POWERCONTEXT_CLAUDE_BOOTSTRAP_MAX_BYTES`. No Handoff is selected automatically. Select one exact committed Handoff
+from the current Scope only when it is intended for the new Session:
+
+```bash
+export POWERCONTEXT_CLAUDE_BOOTSTRAP_HANDOFF='{"artifact_id":"HANDOFF_ID","revision":3}'
+```
+
+Use the Atomic Memory Artifact tag API to add `bootstrap-context` only to reviewed decisions, constraints, objectives,
+verified state, or repository guidance. The plugin stores a content-free receipt under `${CLAUDE_PLUGIN_DATA}`;
+successful delivery lets the first ordinary query suppress only fully delivered exact Atomic Memory revisions.
+Artifacts truncated during bootstrap and newer revisions remain eligible. Preparation, validation, and receipt failures
+fail open and inject nothing. Failures before a new lifecycle package is established, including invalid configuration,
+also clear any stale saved receipt.
 
 The Source pipeline may later extract Memory when a generation model is configured. Prompt capture does not call
 `remember_memory`, and the Hook never labels an ordinary prompt as `task-outcome`.
@@ -111,11 +148,15 @@ remote or directory. Set an explicit Scope only when that separation or sharing 
 The bundled MCP Server exposes the existing PowerContext operations. Claude can search and list Memory, and can
 create, revise, or retire an entry when the user explicitly asks to persist a change.
 
-For a task transfer, the bundled Skill guides Claude to prepare current work with `handoff_current_work` and, for an
-explicit imperative such as “handoff this work,” pass the returned `handoff` unchanged to `commit_handoff`. The
-receiver uses `continue_handoff` with the exact Revision, verifies it, and records an `acknowledge_handoff` receipt;
-completed work uses `record_task_outcome` with that receipt. A Prepared Handoff is temporary, while an exact Revision
-is the durable cross-agent transfer point.
+For an ordinary transfer such as “handoff this work,” the bundled Skill guides Claude to inspect current work, call
+`handoff_current_work`, and return the complete `handoff` member as a temporary carrier. Preparation records a boundary
+Source; it does not commit a durable Revision. Only an explicit request such as “commit a durable handoff” authorizes
+passing that returned value unchanged to `commit_handoff`. Report a committed milestone only after it returns an exact
+Revision. Preview or design requests make no writes.
+
+The receiver uses `continue_handoff` with `selection: "prepared"` and the complete carrier, or with an exact committed
+Revision, verifies it, and records an `acknowledge_handoff` receipt. When completed work continues an accepted committed
+Handoff, `record_task_outcome` links that receipt. Historical notes and acknowledgements grant no execution authority.
 
 Automatic recall does not depend on Claude deciding to call MCP. Conversely, MCP Memory writes do not replace prompt
 capture: the Hook stores each enabled prompt as ordinary Source evidence, and the Server decides whether later Source
@@ -222,6 +263,9 @@ run with `--keep-data`.
 | `POWERCONTEXT_CLAUDE_ALLOW_INSECURE_HTTP` | `false` | Explicitly permit non-loopback plaintext HTTP for PowerContext requests |
 | `POWERCONTEXT_CLAUDE_SCOPE_ID` | unset | Override durable bindings and the Server default Scope |
 | `POWERCONTEXT_CLAUDE_AUTHORIZATION` | unset | Complete `Bearer <token>` header for Hook and MCP requests |
+| `POWERCONTEXT_CLAUDE_BOOTSTRAP_CONTEXT` | `false` | Inject the curated bootstrap profile on supported `SessionStart` events |
+| `POWERCONTEXT_CLAUDE_BOOTSTRAP_MAX_BYTES` | `4096` | Bootstrap package limit; valid values are 512 through 8192 bytes |
+| `POWERCONTEXT_CLAUDE_BOOTSTRAP_HANDOFF` | unset | JSON identity of one exact committed Handoff, for example `{"artifact_id":"...","revision":3}` |
 | `POWERCONTEXT_CLAUDE_CAPTURE_PROMPTS` | `true` | Capture user prompts as ordinary Source evidence |
 | `POWERCONTEXT_CLAUDE_FLUSH_ON_CAPTURE` | `false` | Wait for Source processing after capture |
 | `POWERCONTEXT_CLAUDE_REQUEST_TIMEOUT_SECONDS` | `3` | Per-request Hook timeout |
@@ -235,3 +279,7 @@ Authorization is environment-only and must not be added to the Server URL or plu
 The outer `UserPromptSubmit` Hook timeout is ten seconds. Recall and capture use one shared wall-clock budget but fail
 independently. HTTPS certificate validation remains enabled when HTTP is explicitly permitted. Restart Claude Code
 after changing its environment.
+
+## Automatic input privacy
+
+See [Automatic prompt privacy](index.md#automatic-prompt-privacy) for this host's capture default, disable control, credential recognition limits and independent read-only query handling. Recognized inputs are skipped for capture; accepted Source content and event identity are not rewritten.

@@ -11,12 +11,12 @@ Start with:
 powercontext doctor
 ```
 
-The command checks the package, Server liveness, and Server readiness. It exits with status 1 unless every check is
+The command checks saved agents and their Servers, or the package and Server when no agents are saved. It exits 1 unless every check is
 `ok`; a `degraded` readiness result is usable but is not a complete diagnostic success. Add `--json` for automation;
-the top-level result and every check include `ok` and `status`. Check optional host integrations separately:
+JSON includes the overall `ok` result and individual diagnostic statuses. Select host integrations explicitly:
 
 ```bash
-powercontext doctor integrations
+powercontext doctor codex dsh
 powercontext doctor codex
 powercontext doctor claude-code
 powercontext doctor dsh
@@ -26,9 +26,9 @@ powercontext doctor pi
 powercontext doctor hermes
 ```
 
-`doctor integrations` prints every first-class host. A host whose CLI is not on PATH is `missing` and does not fail
-the command. A present host that is broken still exits 1. Single-host commands such as `doctor codex` stay fail-closed
-when that CLI is missing.
+`doctor` checks saved agent connections by default, falling back to package and Server checks when none are saved.
+Explicit names select the agents to check. A missing required CLI or unhealthy agent makes the command exit 1;
+other selected agents still receive their own results.
 
 ## Installation cannot read the Git URL
 
@@ -60,7 +60,7 @@ command -v hermes
 Add the uv tool bin directory to `PATH` if needed. `powercontext setup codex`, `powercontext setup claude-code`,
 `powercontext setup dsh`, `powercontext setup openclaw`, `powercontext setup opencode`, `powercontext setup pi`, and
 `powercontext setup hermes` report an error rather than attempting installation when the host CLI is unavailable.
-`powercontext setup select` installs only the hosts you choose. A selected host that is missing still fails that row
+`powercontext setup codex dsh` installs only the hosts you choose. A selected host that is missing still fails that row
 and does not block the other selected hosts. An unselected host is skipped even if its CLI is on `PATH`.
 
 ## The plugin is missing or stale
@@ -259,15 +259,17 @@ so the previous database remains available for recovery:
    Because `pc_scopes.parent_scope_id` is self-referential, keep ancestor Scope rows before their descendants in the
    exported `pc_scopes` data.
    If the source predates the three Skill lifecycle tables (`pc_skill_packages`, `pc_agent_skill_targets`, and
-   `pc_skill_publications`), the Profile tables, `pc_topic_memory_work_budgets`, or
-   `pc_receipt_migration_review`, remove the absent tables from their respective layers.
+   `pc_skill_publications`), the Profile tables, `pc_topic_memory_work_budgets`, `pc_topic_memory_work_blocks`,
+   `pc_recall_effort_daily`, `pc_receipt_migration_review`, `pc_context_bootstrap_receipts`, or
+   `pc_decision_observations`, remove the absent tables from their respective layers.
    When a work-budget table exists, restore it together with Cursors so failure allowances survive the migration.
+   Restore work-attempt records as well to preserve block identities, diagnostics and accepted retry receipts.
 
    Layer 1 contains parents and tables without foreign keys:
 
    ```bash
    obloader <connection-options> -D <new-database> --csv \
-      --table 'pc_scopes,pc_source_journal_heads,pc_sources,pc_artifacts,pc_source_cursors,pc_memory_source_windows,pc_artifact_processing_leases,pc_artifact_processing_binding_states,pc_artifact_processing_pending,pc_artifact_processing_auto_wave_targets,pc_artifact_processing_sequences,pc_artifact_processing_intents,pc_topic_memory_processing_targets,pc_artifact_processing_schema,pc_artifact_processing_migration_receipts,pc_topic_memory_work_budgets,pc_topic_memory_retrieval_shape,pc_connector_checkpoints,pc_source_definition_manifests,pc_external_skill_registrations,pc_skill_packages,pc_agent_skill_targets,pc_skill_publications,pc_model_usage_daily,pc_recall_token_daily,pc_recall_effort_daily,pc_receipt_migration_review' \
+      --table 'pc_scopes,pc_source_journal_heads,pc_sources,pc_artifacts,pc_portable_restore_receipts,pc_source_cursors,pc_memory_source_windows,pc_artifact_processing_leases,pc_artifact_processing_binding_states,pc_artifact_processing_pending,pc_artifact_processing_auto_wave_targets,pc_artifact_processing_sequences,pc_artifact_processing_intents,pc_topic_memory_processing_targets,pc_artifact_processing_schema,pc_artifact_processing_migration_receipts,pc_topic_memory_work_budgets,pc_topic_memory_work_blocks,pc_topic_memory_retrieval_shape,pc_connector_checkpoints,pc_source_definition_manifests,pc_external_skill_registrations,pc_skill_packages,pc_agent_skill_targets,pc_skill_publications,pc_model_usage_daily,pc_recall_token_daily,pc_recall_effort_daily,pc_receipt_migration_review,pc_decision_observations,pc_lexical_projection_versions' \
      -f <export-directory>
    ```
 
@@ -275,7 +277,7 @@ so the previous database remains available for recovery:
 
    ```bash
    obloader <connection-options> -D <new-database> --csv \
-     --table 'pc_dream_runs,pc_scope_context_references,pc_scope_external_references,pc_scope_creation_requests,pc_scope_settings,pc_scope_bindings,pc_artifact_heads,pc_artifact_lineage_sources,pc_artifact_lineage_artifacts,pc_artifact_publications,pc_artifact_candidate_versions,pc_topic_memory_revision_publications,pc_memory_entry_versions' \
+     --table 'pc_dream_runs,pc_context_bootstrap_receipts,pc_scope_context_references,pc_scope_external_references,pc_scope_creation_requests,pc_scope_settings,pc_scope_bindings,pc_artifact_handles,pc_artifact_heads,pc_artifact_lineage_sources,pc_artifact_lineage_artifacts,pc_artifact_publications,pc_candidate_versions,pc_topic_memory_revision_publications,pc_memory_entry_versions' \
      -f <export-directory>
    ```
 
@@ -283,7 +285,7 @@ so the previous database remains available for recovery:
 
    ```bash
    obloader <connection-options> -D <new-database> --csv \
-      --table 'pc_artifact_candidate_heads,pc_topic_memory_active_topics,pc_topic_memory_active_chunks,pc_memory_entry_heads,pc_artifact_tags,pc_recurrence_match,pc_recurrence_observation' \
+      --table 'pc_candidate_heads,pc_topic_memory_active_topics,pc_topic_memory_active_chunks,pc_memory_entry_heads,pc_artifact_tags,pc_recurrence_match,pc_recurrence_observation' \
      -f <export-directory>
    ```
 

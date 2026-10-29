@@ -22,7 +22,7 @@ from dataclasses import replace
 import pytest
 
 from powercontext.artifacts.search import ArtifactSearchExecutionContext
-from powercontext.server.authz import AccessControlService, AccessDeniedError, PrincipalRef
+from powercontext.server.authz import AccessControlService, AccessDeniedError, AccessIdentityRequiredError, PrincipalRef
 from powercontext.server.authz.repository import RelationalAccessRepository
 from tests.e2e.test_access_control_regressions import AUDIT, _grant, _resource, _scope, _server
 
@@ -52,7 +52,7 @@ def test_unified_atomic_search_requires_scope_read_but_exact_share_remains_reada
             )
             with pytest.raises(AccessDeniedError):
                 await application.search("atomic-memory", {"query": "alpha"}, execution_context=context)
-            with pytest.raises(AccessDeniedError):
+            with pytest.raises(AccessIdentityRequiredError):
                 await application.search(
                     "atomic-memory", {"query": "alpha"}, execution_context=ArtifactSearchExecutionContext()
                 )
@@ -82,16 +82,31 @@ def test_unified_atomic_search_requires_scope_read_but_exact_share_remains_reada
             assert tuple(match.artifact_ref for match in outcome.matches) == tuple(
                 hit.hit.artifact_ref for hit in page.hits
             )
-            assert tuple(match.retrieval_score for match in outcome.matches) == tuple(
-                hit.hit.score for hit in page.hits
+            # The dedicated endpoint keeps raw RRF; normalize its single text
+            # channel by the best possible default contribution, 1 / (60 + 1).
+            assert tuple(match.retrieval_score for match in outcome.matches) == pytest.approx(
+                tuple(hit.hit.score / (1 / 61) for hit in page.hits)
             )
             assert tuple(artifact.as_ref() for artifact in outcome.artifacts) == tuple(
                 match.artifact_ref for match in outcome.matches
             )
             scored = await client.post(path, headers=headers, json={"query": "alpha", "include_scores": True})
-            assert scored.status_code == 422
-            assert scored.json()["error"]["code"] == "artifact_search_not_supported"
-            assert scored.json()["error"]["details"]["field"] == "include_scores"
+            assert scored.status_code == 200, scored.text
+            scored_results = scored.json()["results"]
+            assert [
+                {key: value for key, value in item.items() if key != "scores"} for item in scored_results
+            ] == allowed.json()["results"]
+            for item, match, candidate in zip(scored_results, outcome.matches, page.hits, strict=True):
+                scores = item["scores"]
+                assert scores["retrieval"] == pytest.approx(match.retrieval_score)
+                assert 0 < scores["retrieval"] <= 1
+                assert set(scores["channels"]) == {"text"}
+                channel = scores["channels"]["text"]
+                assert channel["metric"] == "sqlite_bm25"
+                assert channel["higher_is_better"] is False
+                assert channel["raw"] < 0
+                assert candidate.hit.channel_scores is not None
+                assert channel["raw"] == candidate.hit.channel_scores["text"].raw
             invalid = await client.post(path, headers=headers, json={"query": "alpha", "limit": 101})
             assert invalid.status_code == 422
 

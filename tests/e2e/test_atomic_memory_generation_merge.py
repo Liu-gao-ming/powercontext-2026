@@ -29,6 +29,7 @@ from powercontext.builtin.artifacts.atomic_memory.extraction import (
     AtomicMemoryGenerationPipeline,
 )
 from powercontext.builtin.artifacts.atomic_memory.reconciliation import (
+    ATOMIC_MEMORY_RECONCILIATION_INSTRUCTIONS,
     AtomicMemoryArtifactEvidence,
     AtomicMemoryReconciliationContent,
     AtomicMemoryReconciliationInput,
@@ -250,7 +251,8 @@ def test_repeated_source_evolution_keeps_flush_bounded_and_exact_history_readabl
             # The default budget continues to admit a new Source and the compact
             # published fact while exact predecessor revisions grow independently.
             assert all(
-                estimator.estimate(request.model_dump_json()) < config.runtime.atomic_memory_input_tokens_limit
+                estimator.estimate(f"{ATOMIC_MEMORY_RECONCILIATION_INSTRUCTIONS}\n{request.model_dump_json()}")
+                <= config.runtime.atomic_memory_input_tokens_limit
                 for request in reconciler.requests
             )
             for request in reconciler.requests:

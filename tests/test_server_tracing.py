@@ -155,6 +155,201 @@ def test_inference_instrumentation_records_no_content() -> None:
     assert instrumentation.include_model_request_parameters is False
 
 
+def test_inference_spans_sanitize_provider_exception_content() -> None:
+    from pydantic_ai import ModelRequest, UserPromptPart
+    from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.models import ModelRequestParameters
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.models.instrumented import InstrumentedModel
+
+    private = "private provider response sentinel"
+    tracing, exporter = _tracing(instrumented=True)
+    instrumentation = tracing.instrumentation
+    assert instrumentation is not None
+
+    async def fail(_messages, _info):
+        raise ModelHTTPError(400, "fixture-model", {"error": {"message": private}})
+
+    async def scenario() -> None:
+        model = InstrumentedModel(FunctionModel(fail), instrumentation)
+        with pytest.raises(ModelHTTPError):
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart("bounded prompt")])],
+                None,
+                ModelRequestParameters(),
+            )
+
+    asyncio.run(scenario())
+    span = next(span for span in exporter.get_finished_spans() if span.name.startswith("chat "))
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description in (None, "")
+    assert span.events == ()
+    attributes = span.attributes or {}
+    assert attributes["error.type"] == "ModelHTTPError"
+    rendered = repr(dict(attributes)) + repr(span.events) + str(span.status.description)
+    assert private not in rendered
+    tracing.shutdown()
+
+
+def test_worker_execution_span_preserves_inference_failure_category(monkeypatch) -> None:
+    from powercontext.builtin.inference import InvalidInferenceOutputError
+    from powercontext.builtin.persistence.supervision import ArtifactProcessingFence
+    from powercontext.builtin.runtime.processing_contracts import ArtifactProcessingWorkAssignment
+    from powercontext.server.worker_tracing import WorkerTracing
+
+    private = "private inference output sentinel"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracing = ServerTracing(provider)
+    monkeypatch.setattr(
+        "powercontext.server.worker_tracing.configure_server_tracing", lambda *_args, **_kwargs: tracing
+    )
+
+    def fail(_assignment: ArtifactProcessingWorkAssignment):
+        raise InvalidInferenceOutputError("memory-extract", private)
+
+    assignment = ArtifactProcessingWorkAssignment(
+        binding_name="memory-source-window",
+        scope_id="invalid-output",
+        artifact_family="memory",
+        claimed_request_generation=1,
+        fence=ArtifactProcessingFence(
+            supervisor_group="global", holder_id="owner", supervisor_generation=1, lease_mode="single-process"
+        ),
+        worker_id="worker-attempt",
+    )
+    with pytest.raises(InvalidInferenceOutputError):
+        WorkerTracing(TracingConfig(enabled=True)).wrap(fail)(assignment)
+
+    span = next(span for span in exporter.get_finished_spans() if span.name == "artifact_processing.worker.execute")
+    assert (span.attributes or {})["powercontext.error.category"] == "dependency"
+    assert span.status.status_code is StatusCode.ERROR
+    rendered = repr(span.attributes) + repr(span.events) + str(span.status.description)
+    assert private not in rendered
+
+
+def test_topic_memory_dream_worker_records_instrumented_model_span(tmp_path, monkeypatch) -> None:
+    import json
+    from functools import partial
+
+    from pydantic_ai.messages import ModelResponse, TextPart, UserPromptPart
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.models.instrumented import InstrumentedModel
+    from pydantic_ai.usage import RequestUsage
+
+    from powercontext.builtin.artifacts.topic_memory import TopicMemoryContent
+    from powercontext.builtin.runtime import (
+        BuiltinConfig,
+        CaptureSource,
+        CreateDreamRunRequest,
+        GetDreamRunRequest,
+        InferenceConfig,
+        composition,
+    )
+    from powercontext.builtin.runtime.topic_memory_processing import (
+        TopicMemoryWorkerSpec,
+        _run_topic_memory_worker,
+    )
+    from powercontext.builtin.runtime.worker_observability import WorkerObservability, worker_observability
+    from powercontext.builtin.scope import ScopeDraft
+    from tests.e2e.dream_support import Controller, Handle, open_dream_runtime, process_pending
+    from tests.e2e.test_dream_usage import seed_target
+
+    tracing, exporter = _tracing(instrumented=True)
+
+    def respond(messages, _info):
+        value = next(
+            json.loads(part.content)
+            for message in reversed(messages)
+            for part in message.parts
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+        )
+        evidence_id = next(item["evidence_id"] for item in value["evidence"]["evidence"] if item["kind"] == "source")
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    json.dumps({
+                        "outcome": "proposed",
+                        "reason": "The dream corrects the pending topic.",
+                        "intent": "correct",
+                        "proposal": TopicMemoryContent(
+                            title="Replacement", summary="Issued", detail="# Progress\nIssued."
+                        ).model_dump(mode="json"),
+                        "evidence_ids": [evidence_id],
+                    })
+                )
+            ],
+            usage=RequestUsage(input_tokens=80, output_tokens=45),
+        )
+
+    async def open_model(*_args, **kwargs):
+        model = InstrumentedModel(FunctionModel(respond), kwargs["instrumentation"])
+        return model, model
+
+    monkeypatch.setattr(composition, "_open_pydantic_ai_model", open_model)
+
+    config = BuiltinConfig(
+        database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'topic-dream-trace.db'}"),
+        inference=InferenceConfig(generation_model="openai-chat:controlled-topic-dream"),
+    )
+
+    class WorkerHandle(Handle):
+        async def execute(self):
+            await self.ready.wait()
+            worker = partial(_run_topic_memory_worker, TopicMemoryWorkerSpec(config=config))
+            # Mirror the spawn entrypoint wrapper: only execution context crosses it.
+            token = worker_observability.set(WorkerObservability(tracing, tracing.instrumentation))
+            try:
+                return await worker(self.assignment)
+            finally:
+                worker_observability.reset(token)
+
+    class WorkerController(Controller):
+        async def start(self, assignment):
+            handle = WorkerHandle(self, assignment)
+            self.handles.append(handle)
+            return handle
+
+    async def scenario():
+        async with open_dream_runtime(config, controller=WorkerController()) as runtime:
+            scope = await runtime.scopes.create(
+                ScopeDraft(title="Topic dream", summary="Trace", idempotency_key="dream-trace")
+            )
+            source = await runtime.sources.for_scope(scope.scope_id).capture(
+                CaptureSource(
+                    source_id="progress",
+                    content="private topic dream Source sentinel: the user prefers terse updates",
+                    metadata={},
+                )
+            )
+            target, _proposal = await seed_target(runtime, scope.scope_id, source.source_ref, "topic-memory")
+            accepted = await runtime.dream.for_scope(scope.scope_id).create(
+                CreateDreamRunRequest(
+                    operation="revise_topic_memory",
+                    target=target,
+                    artifacts=(target,),
+                    sources=(source.source_ref,),
+                    idempotency_key="dream-trace",
+                )
+            )
+            await process_pending(runtime)
+            completed = await runtime.dream.for_scope(scope.scope_id).get(GetDreamRunRequest(run_id=accepted.run_id))
+            assert (completed.status, completed.outcome) == ("succeeded", "proposed"), completed
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    child = [span for span in spans if span.name.startswith("chat ")]
+    assert child, [span.name for span in spans]
+    for span in child:
+        assert span.events == ()
+        assert span.status.description in (None, "")
+        rendered = repr(span.attributes) + repr(span.events) + str(span.status.description)
+        assert "private topic dream Source sentinel" not in rendered
+    tracing.shutdown()
+
+
 def test_runtime_stage_records_attributes_and_inherits_current_span() -> None:
     tracing, exporter = _tracing()
     parent = tracing.start_span(
@@ -250,6 +445,28 @@ def test_runtime_stage_records_explicit_noop_and_failure_outcomes() -> None:
         if span.attributes is not None and span.attributes["powercontext.operation.outcome"] == "failure"
     )
     assert failed_span.status.status_code is StatusCode.ERROR
+
+
+@pytest.mark.parametrize("unit", ["stage", "background"])
+@pytest.mark.parametrize("outcome", ["success", "noop"])
+def test_runtime_exception_overrides_a_previously_successful_outcome(unit, outcome) -> None:
+    tracing, exporter = _tracing()
+    manager = (
+        tracing.stage("test.operation", attributes={})
+        if unit == "stage"
+        else tracing.background("test.operation", operation="test.operation", attributes={})
+    )
+    try:
+        with pytest.raises(RuntimeError), manager as span:
+            span.set_outcome(outcome)
+            raise RuntimeError
+        exported = exporter.get_finished_spans()
+        assert len(exported) == 1
+        assert (exported[0].attributes or {})["powercontext.operation.outcome"] == "failure"
+        assert (exported[0].attributes or {})["powercontext.error.category"] == "internal"
+        assert exported[0].status.status_code is StatusCode.ERROR
+    finally:
+        tracing.shutdown()
 
 
 def test_background_stage_starts_a_fresh_trace_outside_an_ambient_span() -> None:

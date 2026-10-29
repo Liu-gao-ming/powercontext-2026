@@ -48,6 +48,8 @@ class InvalidHandoffGenerationError(HandoffError, ValueError):
             "objective": "generated Handoff changed the caller-owned objective",
             "evidence": "generated Handoff cited evidence outside the preparation action",
             "budget": "generated Handoff exceeds the preparation byte budget",
+            "rollover_next_action": "rollover Handoff draft without a next action must use disposition complete",
+            "rollover_quality": "rollover Handoff draft contains transcript-dependent wording",
         }
         super().__init__(messages.get(code, f"invalid Handoff generation: {code}"))
 

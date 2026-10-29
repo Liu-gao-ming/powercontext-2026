@@ -67,18 +67,22 @@ def add_atomic_memory_routes(  # noqa: C901
         application: Annotated[Any, Depends(application_dependency)],
         if_none_match: Annotated[str | None, Header(alias="If-None-Match")] = None,
     ) -> models.AtomicMemoryStateResponse | Response:
-        record = await _scoped(application, scope_id).get(
-            artifact_id, context=execution_context(http_request, "get_atomic_memory_state")
-        )
-        etag = f'"revision:{record.artifact.revision}:state:{record.state.state_version}"'
+        scoped = _scoped(application, scope_id)
+        context = execution_context(http_request, "get_atomic_memory_state")
+        if (read_state := getattr(scoped, "state", None)) is None:
+            record = await scoped.get(artifact_id, context=context)
+            state = AtomicMemoryRead(ref=record.ref, **record.state.model_dump())
+        else:
+            state = await read_state(artifact_id, context=context)
+        etag = f'"revision:{state.ref.revision}:state:{state.state_version}"'
         if if_none_match is not None and any(
             item.strip().removeprefix("W/") in {etag, "*"} for item in if_none_match.split(",")
         ):
             return Response(status_code=304, headers={"ETag": etag})
         response.headers["ETag"] = etag
         return models.AtomicMemoryStateResponse.model_validate({
-            "artifact": record.ref.model_dump(mode="json"),
-            **record.state.model_dump(mode="json"),
+            "artifact": state.ref.model_dump(mode="json"),
+            **state.model_dump(mode="json", exclude={"ref"}),
         })
 
     async def list_atomic_memories(

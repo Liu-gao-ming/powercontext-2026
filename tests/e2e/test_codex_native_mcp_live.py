@@ -20,7 +20,7 @@ import sys
 
 import pytest
 
-from powercontext.cli.system import DiagnosticStatus, run_codex_diagnostics
+from powercontext.cli.system import CodexInstaller, DiagnosticStatus
 
 pytestmark = [pytest.mark.real_e2e, pytest.mark.skipif(sys.platform != "win32", reason="Windows Codex Desktop only")]
 
@@ -34,7 +34,7 @@ def test_codex_native_mcp_discovers_tools_without_process_authorization(
         pytest.skip("requires --run-real-e2e with configured Codex and a running PowerContext Server")
     monkeypatch.delenv("POWERCONTEXT_CODEX_AUTHORIZATION", raising=False)
 
-    diagnostics = run_codex_diagnostics()
+    diagnostics = CodexInstaller().verify()
 
     assert diagnostics["codex"].status is DiagnosticStatus.OK
     assert diagnostics["plugin"].status is DiagnosticStatus.OK

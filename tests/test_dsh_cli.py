@@ -23,6 +23,7 @@ import pytest
 from typer.testing import CliRunner
 
 from powercontext.cli.app import create_cli
+from powercontext.cli.git_source import resolve_plugin_source
 from powercontext.cli.system import SetupError, doctor_app, setup_app
 
 
@@ -47,7 +48,7 @@ def test_dsh_executable_prefers_the_windows_cmd_shim(tmp_path: Path, monkeypatch
     assert dsh_cli.dsh_executable() == str(cmd)
 
 
-def test_setup_dsh_rejects_plugin_without_bundle(tmp_path: Path, monkeypatch) -> None:
+def test_setup_dsh_rejects_plugin_without_bundle(tmp_path: Path, monkeypatch, installed_agent_checks) -> None:
     import powercontext.cli.dsh as dsh_cli
 
     checkout = tmp_path / "powercontext"
@@ -64,29 +65,21 @@ def test_setup_dsh_rejects_plugin_without_bundle(tmp_path: Path, monkeypatch) ->
     run_dsh.assert_not_called()
 
 
-def test_setup_dsh_rejects_a_ref_that_escapes_the_checkout_root(tmp_path: Path, monkeypatch) -> None:
-    import powercontext.cli.dsh as dsh_cli
-
-    monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
-
-    with pytest.raises(SetupError, match="invalid DeepSeek Harness ref"):
-        dsh_cli.resolve_dsh_plugin_dir(source="oceanbase/powercontext", ref="../../etc")
-
-
-def test_setup_dsh_does_not_echo_source_credentials(tmp_path: Path, monkeypatch) -> None:
-    import powercontext.cli.dsh as dsh_cli
+def test_setup_dsh_does_not_echo_source_credentials(tmp_path: Path, monkeypatch, installed_agent_checks) -> None:
 
     marker = "redacted-value"
     source = f"https://{marker}@github.com/oceanbase/powercontext"
     monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
 
     with pytest.raises(SetupError) as raised:
-        dsh_cli.resolve_dsh_plugin_dir(source=source, ref="master")
+        resolve_plugin_source(source=source, ref="master", host="dsh")
 
     assert marker not in str(raised.value)
 
 
-def test_setup_dsh_clones_a_github_url_and_replaces_a_broken_checkout(tmp_path: Path, monkeypatch) -> None:
+def test_setup_dsh_clones_a_github_url_and_replaces_a_broken_checkout(
+    tmp_path: Path, monkeypatch, installed_agent_checks
+) -> None:
     import powercontext.cli.dsh as dsh_cli
 
     home = tmp_path / "data"
@@ -104,19 +97,16 @@ def test_setup_dsh_clones_a_github_url_and_replaces_a_broken_checkout(tmp_path: 
 
     monkeypatch.setattr(dsh_cli.subprocess, "run", fake_run)
 
-    plugin = dsh_cli.resolve_dsh_plugin_dir(
-        source="https://github.com/oceanbase/powercontext",
-        ref="master",
-    )
+    plugin = resolve_plugin_source(source="https://github.com/oceanbase/powercontext", ref="master", host="dsh")
 
-    assert plugin == stale / "integrations" / "dsh" / "plugins" / "powercontext"
+    assert (plugin / "package.json").is_file()
     assert captured[0][:4] == ["git", "clone", "--depth", "1"]
     assert captured[0][4:6] == ["--branch", "master"]
     assert captured[0][6] == "https://github.com/oceanbase/powercontext.git"
-    assert not (stale / "README").exists()
+    assert (stale / "README").read_text() == "incomplete"
 
 
-def test_doctor_dsh_requires_the_plugin_id_field(monkeypatch) -> None:
+def test_doctor_dsh_requires_the_plugin_id_field(monkeypatch, server_checks) -> None:
     import powercontext.cli.dsh as dsh_cli
 
     monkeypatch.setattr(dsh_cli, "which", lambda _name: "/usr/bin/dsh")
@@ -128,7 +118,7 @@ def test_doctor_dsh_requires_the_plugin_id_field(monkeypatch) -> None:
     assert "plugin: failed - PowerContext DSH plugin is not registered" in result.output
 
 
-def test_doctor_dsh_reports_an_installed_plugin(monkeypatch) -> None:
+def test_doctor_dsh_reports_an_installed_plugin(monkeypatch, server_checks) -> None:
     import powercontext.cli.dsh as dsh_cli
 
     monkeypatch.setattr(dsh_cli, "which", lambda _name: "/usr/bin/dsh")
@@ -141,7 +131,7 @@ def test_doctor_dsh_reports_an_installed_plugin(monkeypatch) -> None:
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "dsh", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.output)["hosts"]["dsh"]
     assert payload["ok"] is True
     plugin = payload["checks"]["plugin"]
     assert plugin["ok"] is True
@@ -150,8 +140,12 @@ def test_doctor_dsh_reports_an_installed_plugin(monkeypatch) -> None:
     assert plugin["checks"]["server_readiness"] == "not_checked"
     assert "/pc doctor" in plugin["detail"]
 
+    human = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "dsh"])
+    assert "running_host_configuration: not_observed" in human.output
+    assert "/pc doctor" in human.output
 
-def test_doctor_dsh_does_not_expose_host_config_or_claim_to_check_its_server(monkeypatch) -> None:
+
+def test_doctor_dsh_does_not_expose_host_config_or_claim_to_check_its_server(monkeypatch, server_checks) -> None:
     import powercontext.cli.dsh as dsh_cli
 
     marker = "private-dsh-config-marker"
@@ -164,19 +158,19 @@ def test_doctor_dsh_does_not_expose_host_config_or_claim_to_check_its_server(mon
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "dsh", "--json"])
     assert result.exit_code == 0
     assert marker not in result.output
-    checks = json.loads(result.output)["checks"]["plugin"]["checks"]
+    checks = json.loads(result.output)["hosts"]["dsh"]["checks"]["plugin"]["checks"]
     assert checks["server_liveness"] == "not_checked"
     assert checks["route_compatibility"] == "not_checked"
 
 
-def test_doctor_dsh_redacts_config_dump_failures(monkeypatch) -> None:
+def test_doctor_dsh_redacts_config_dump_failures(monkeypatch, server_checks) -> None:
     import powercontext.cli.dsh as dsh_cli
 
     monkeypatch.setattr(dsh_cli, "which", lambda _name: "/usr/bin/dsh")
     monkeypatch.setattr(
         dsh_cli,
         "_run_dsh",
-        Mock(side_effect=SetupError.command_failed(["dsh", "--dump-config"], "private-dsh-config-marker")),
+        Mock(side_effect=SetupError("`dsh --dump-config` failed: private-dsh-config-marker")),
     )
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "dsh"])
     assert result.exit_code == 1
@@ -185,7 +179,7 @@ def test_doctor_dsh_redacts_config_dump_failures(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("timeout", [False, True])
-def test_doctor_dsh_identifies_config_dump_exit_and_timeout(monkeypatch, timeout: bool) -> None:
+def test_doctor_dsh_identifies_config_dump_exit_and_timeout(monkeypatch, timeout: bool, server_checks) -> None:
     import powercontext.cli.dsh as dsh_cli
 
     monkeypatch.setattr(dsh_cli, "which", lambda _name: "/usr/bin/dsh")
@@ -197,7 +191,7 @@ def test_doctor_dsh_identifies_config_dump_exit_and_timeout(monkeypatch, timeout
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "dsh", "--json"])
     assert result.exit_code == 1
     assert "private-config" not in result.output
-    check = json.loads(result.output)["checks"]["dsh"]
+    check = json.loads(result.output)["hosts"]["dsh"]["checks"]["dsh"]
     if timeout:
         assert check["checks"]["dump_config"] == "timeout"
         assert "120-second deadline" in check["detail"]

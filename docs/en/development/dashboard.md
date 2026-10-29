@@ -6,7 +6,7 @@ The Dashboard is a content viewer for personal use and demonstrations, disabled 
 
 A user may open the Dashboard to check an agreement, find an experience relevant to a similar problem, or resume interrupted work. The page needs to make the current scope clear, help them find the relevant record, and provide access to source material when they need to check it.
 
-The core experience for 1.0 is reading saved content. Memories, experiences, skills and handoffs can exist independently. A scope containing only memories should work normally, and an empty scope should still have a clear entry point and page structure. Existing tools and APIs handle generation, review and saving. Reading their results should not require generation configuration.
+The core experience for 1.0 is reading saved content. Existing pages also list revision history, compare two revisions, and roll an exact stored revision forward through the same conditional replace the API already uses. Each Atomic Memory shows its own revisions and comparison read-only. Restoring an Atomic Memory belongs to its restoration flow, which previews every affected memory before confirmation. Memories, experiences, skills and handoffs can exist independently. A scope containing only memories should work normally, and an empty scope should still have a clear entry point and page structure. Existing tools and APIs handle generation, review and saving. Reading their results should not require generation configuration.
 
 Scope names, summaries and saved content supply the business topic. A payment service, customer interviews and personal research can use the same interface without separate navigation for each domain. Before adding a section, explain which task it helps the user complete and whether the available data supports what it claims.
 
@@ -68,6 +68,22 @@ Sources appear after the record's text and can be opened directly from an experi
 
 Source text can be long. Size its reading area to the viewport, keep the heading and close control reachable, and let the text scroll within that area. Opening a source should not lengthen the whole page until the user loses their place. If one source fails to load, the open record remains readable.
 
+## Scope, authority, and read results
+
+Without an explicit Scope selection, the page uses the default Scope. Changing the default binding affects subsequent requests once the current request has selected its Scope. Viewing another Scope does not change the default. Default selection requires `server.observe`; reading its content still requires content authority. Observer authority alone does not grant content access.
+
+Scope read authority permits browsing that Scope's collections and usage. An Artifact-only grant permits the selected record's exact revision and references; the page does not expose the Scope title, neighboring records, or Scope usage. Valid grants remain effective when an owner relation is missing, while owner-derived authority requires the actual relation. Retrying a page does not restore revoked authority; see [Artifact ownership](../rfcs/1396_handoff_access_control.md#artifact-ownership).
+
+An exact link's body and references correspond to the requested Revision. The current revision and lifecycle state are shown separately; historical content must not be labeled as current. Content, state, and authorization in one response must agree. Subsequent requests evaluate the updated authority and content state.
+
+Home's memories, handoffs, experiences, and skills remain independently readable. A missing or unreadable content type does not hide other readable sections. Unavailable usage preserves authorized Scope information and readable content. Read failures appear as errors rather than empty collections or zero usage. Content and Scope metadata are exposed only after their required authorization and audit succeed.
+
+An empty browse or search result does not establish that an exact historical revision is absent. Existing exact references remain readable under current authority. Rebuilding browse or search data must preserve historical bodies, references, and revision identities. Page reads do not establish ownership or repair broken default bindings; recovery uses the corresponding maintenance operation.
+
+The Scope selector supports paging and search. The selected Scope remains readable while other Scopes are unloaded. Review shows a candidate directory, opens the selected record, and exposes history and evidence bodies when the reader requests them.
+
+Opening a record preserves its exact body and shows its paged revision history. Comparisons show the two requested revisions; an unavailable comparison does not replace the opened body. History, comparison, and rollback controls use current authority. A rollback creates a new revision with its source, reason, and actor; a concurrent head change requires the user to review the new current revision before retrying.
+
 ## Keeping layout and interaction consistent
 
 ### Content changes preserve page organization
@@ -92,42 +108,11 @@ Prefer Tabler's default typography, font weights, buttons and form states. Use r
 
 Chinese, English, light and dark settings apply across the Dashboard, including login and standalone source pages. Translations may wrap naturally, but should preserve navigation order, button groups and column proportions. Theme changes retain the information hierarchy and readability. Changing the interface language does not rewrite business content. Use existing brand assets for the full logo and only the graphic for the favicon.
 
-## Boundaries between design and implementation
+## Enablement and access
 
-### Page capabilities come from existing APIs
+Enable Dashboard with `POWERCONTEXT_SERVER_DASHBOARD_ENABLED=true`. Local `ACCESS_MODE=disabled` opens directly without a token. With `ACCESS_MODE=enforced`, it requires `AUTH_TOKEN` and uses the built-in static Bearer identity, with the same permissions for every token holder. Team deployments that inject authentication or authorization Providers must disable it. Pages follow the Server access mode and current authority, and provide no member or role management. See [Install and run](../docs/get-started/install-and-run.md) for personal setup.
 
-Pages show actual readable data, and actions correspond to existing capabilities. If one section fails, other independently readable content remains visible. Read errors, insufficient permissions and missing generation configuration have different meanings and must not collapse into an empty state.
-
-Enable Dashboard with `POWERCONTEXT_SERVER_DASHBOARD_ENABLED=true`. Local `ACCESS_MODE=disabled` opens directly without
-a token. With `ACCESS_MODE=enforced`, it requires `AUTH_TOKEN` and uses the built-in static Bearer identity, with the
-same permissions for every token holder. Team deployments that inject authentication or authorization Providers must
-disable it. Pages reuse the existing API and follow the Server access mode;
-they add no data endpoints or member and role management. See [Install and run](../docs/get-started/install-and-run.md)
-for personal setup.
-
-Collections can change as users save and revise content; exact references still identify their historical versions. Handle missing or inaccessible references explicitly, without substituting the current version or a similar record.
-
-### Frameworks provide common behavior; pages compose content
-
-Tabler provides common capabilities such as navigation, selectors, cards, pagination, drawers and charts. Reuse available components, including their default typography, spacing, focus and responsive behavior.
-
-Jinja2 organizes content and page structure; HTMX handles navigation and fragment replacement. When an essential interaction needs additional code, use Surreal to connect events and css-scope-inline to keep supplementary styles within the owning component. Global styles cover only the necessary theme adjustments.
-
-Define component boundaries around shared user behavior. Scope selection works the same way on every page, charts and summaries share statistical meaning, and source readers share opening, return and recovery behavior. Keep data interpretation separate from interface interaction so changing the presentation of one record type does not affect unrelated pages.
-
-Departures from framework defaults need a specific reason. For example, replacing a page fragment may remove a modal before it finishes closing, requiring cleanup through the component's public API. Additional code should address that side effect and have a corresponding behavior test. Routine menu positioning and visibility across breakpoints remain the framework's responsibility.
-
-## How to evaluate the design
-
-Start a review with the user's task. Can they tell which scope they are viewing, find the full content, check a source and continue reading after a failure? Those outcomes are more useful than the number of cards on the page.
-
-### Use ablation to check necessity
-
-Remove one piece of information, action or dependency at a time and observe which user task suffers. If a page remains clear without an explanation, reconsider whether that explanation is useful. Saved content should remain readable with generation configuration disabled, and collections should remain independently usable when another content type is absent.
-
-For content reduction, compare answers to the same question using the original text and prepared context at different budgets. Record missing constraints, next actions or references. A high reduction percentage alone does not show that the user still has the information needed to complete the task.
-
-### Check situations that can mislead users
+## Visible behavior acceptance
 
 | Scenario | Acceptance focus |
 | --- | --- |
@@ -138,56 +123,20 @@ For content reduction, compare answers to the same question using the original t
 | Unreported usage, incomparable data and partial read failures | Unknown values do not look like zero, and failures do not look like empty content |
 | Credential expiry, network interruptions and service recovery | Errors are clear, and signing in or retrying restores reading |
 
-Behavior tests exercise actual reading, lookup and navigation. Regression tests preserve cases where defects have occurred. Tests should allow internal refactoring when the visible behavior still holds. Buffer sizes, private call order and removed labels are not useful targets; current contracts such as access isolation still require tests for denied operations.
+## Appendix: Page APIs
 
-### Check presentation against real data
-
-Save and generate verification data through existing APIs, using the database only for read-only checks. Pages, API responses and database records should correspond to the same scope, record and version. Retain clear evidence of configuration errors, failed requests and writes with unknown outcomes, and check existing results before resuming.
-
-Consecutive-day replay checks whether content remains readable and available for recall in later work. Check the previous day's references before importing new content, then verify the day's generation, revisions and usage attribution. Exercise memory extraction, experience and skill generation, and handoff generation and saving through actual APIs. Record failed generation or the absence of new candidates as such. Reviews may use only material available at that point in time; a completion claim in the text does not replace verification.
-
-Run replays in isolation and retain the input window, requests and results. Store screenshots and conversation content outside the repository. Simulated dates can test historical reads and daily attribution, but a few sessions cannot establish recall quality for arbitrary questions or the long-term reliability of production scheduling.
-
-## Appendix: APIs and verification entry points
-
-Use this section to locate the implementation. The code and API specification define the exact fields, limits and component configuration.
+The HTTP API specification defines request fields and limits.
 
 ### Pages and APIs
 
 | Page capability | API | Boundary to preserve |
 | --- | --- | --- |
 | Scope selection | `GET /v1/scopes`, `GET /v1/scopes/default`, `GET /v1/scopes/{scope_id}` | Treat defaults, explicit selection, hierarchy and readable scopes separately |
-| Memory collection and text | `POST /v1/atomic-memory/list`, `POST /v1/memory/search`, exact Atomic Memory revision and state reads | Preserve Atomic Memory identities, lifecycle filters, the selected search mode and hit evidence; return up to 50 matches. The search compatibility route resolves `auto` and maps `fts` to Atomic Memory `text` |
+| Memory collection and text | `POST /v1/atomic-memory/list`, `POST /v1/memory/search`, exact Atomic Memory revision and state reads | Preserve Atomic Memory identities, lifecycle filters, the selected search mode and hit evidence; return up to 50 matches |
 | Handoff collection and text | `GET /v1/scopes/{scope_id}/artifacts/handoff` and exact revision reads | Retain cursors; list order does not imply chronological order |
-| Experience collection and text | `GET /v1/scopes/{scope_id}/artifacts/experience`, `POST /v1/experience/get` | Provide paged browsing; there is currently no public HTTP search endpoint |
+| Experience collection and text | `GET /v1/scopes/{scope_id}/artifacts/experience`, `POST /v1/experience/get`, `POST /v1/scopes/{scope_id}/artifacts/experience/search` | Dashboard provides paged browsing and Family relevance search; search covers approved active revisions only, returns up to 200 matches, and suggests a narrower query at that limit |
 | Skill collection and text | `POST /v1/skill/library`, `POST /v1/skill/get` | Library queries return up to 200 entries; suggest a narrower query at the limit and preserve source identities |
 | Source material | `GET /v1/scopes/{scope_id}/sources/{source_type}/{source_id}` | Verify the source's relationship to the record; `content` is currently the source type with readable text |
 | Usage | `POST /v1/stats` | Read the current scope with `exact` and use Server reporting periods and statistical definitions |
 
-Home combines these reads. When an API provides bounded results or a cursor, the page does not infer an unreported total. Preserve complete record and source identities rather than dropping or rewriting them to fit a response format.
-
-### Code and checks
-
-The API specification is in `openapi/powercontext.yaml`, the Dashboard implementation in `src/powercontext/server/dashboard/`, behavior tests in `tests/test_dashboard.py`, and browser acceptance checks in `scripts/dashboard_browser.cjs`. The Dashboard's `static/vendor/` directory contains pinned frontend assets and their licenses.
-
-Run the basic checks from the repository root:
-
-```bash
-make check
-uv run pytest tests/test_dashboard.py tests/test_server.py tests/test_access_http.py
-```
-
-Run browser acceptance checks against a configured, running Server:
-
-```bash
-npm install --prefix /tmp/dashboard-browser playwright@1.61.1
-/tmp/dashboard-browser/node_modules/.bin/playwright install chromium
-POWERCONTEXT_BROWSER_URL=http://127.0.0.1:8765 \
-POWERCONTEXT_BROWSER_OUTPUT=/tmp/dashboard-verification \
-NODE_PATH=/tmp/dashboard-browser/node_modules \
-node scripts/dashboard_browser.cjs
-```
-
-If authentication is required, supply the current user's credential through `POWERCONTEXT_REPLAY_TOKEN`. Keep the output directory outside the repository and apply the access restrictions appropriate to its work content.
-
-Use `scripts/dashboard_replay.py` for session replay and `scripts/dashboard_multiday.py` for consecutive-day verification. `scripts/dashboard_review.py` supports candidate review. Both replay scripts provide their arguments through `--help`. Replay configuration, operation logs and experiment results belong to individual verification records rather than page design principles.
+Home shows the selected Scope's memories, handoffs, experiences, skills, and usage summaries. Collections show readable entries and pagination without inferring an unreported total. Record and source references preserve their complete identities.

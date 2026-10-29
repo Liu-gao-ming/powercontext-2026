@@ -54,7 +54,8 @@ AUTHORIZATION = f"Bearer {AUTH_TOKEN}"
 
 
 @pytest.mark.parametrize("recall_gate_enabled", [False, True], ids=["default", "gate-enabled"])
-def test_execution_constraints_preserve_fts_facts_through_codex_hook(tmp_path, recall_gate_enabled):
+@pytest.mark.parametrize("answer_format", [False, True], ids=["tool-constraints", "answer-format"])
+def test_execution_constraints_preserve_fts_facts_through_codex_hook(tmp_path, recall_gate_enabled, answer_format):
     app = create_server_app(
         settings=ServerSettings(
             auth=BearerAuthConfig(token=SecretStr(AUTH_TOKEN)),
@@ -90,6 +91,11 @@ def test_execution_constraints_preserve_fts_facts_through_codex_hook(tmp_path, r
         " Use only the context already supplied to you. Do not call tools, read files, inspect old sessions, or delegate."
         " If the facts are absent, say unknown."
     )
+    if answer_format:
+        suffix = (
+            " Answer briefly and cite the artifact reference from the provided context."
+            " If no reliable context is present, say so."
+        )
     try:
         _wait_until_started(server, thread)
         scope_id = _create_scope(base_url, authorization=AUTHORIZATION)

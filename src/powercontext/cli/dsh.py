@@ -16,26 +16,15 @@
 
 from __future__ import annotations
 
-import json
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
 
 from powercontext.cli.dsh_runtime import DshProfile, DshTarget, dsh_home
-from powercontext.cli.git_source import (
-    InvalidGitHubSourceError,
-    clone_github_source,
-)
-from powercontext.cli.git_source import (
-    github_clone_url as _github_clone_url,
-)
-from powercontext.cli.git_source import (
-    is_local_source as _is_local_source,
-)
 from powercontext.cli.system import Diagnostic, DiagnosticStatus, SetupError
+from powercontext.cli.transport import configure_connection
 from powercontext.paths import powercontext_data_dir
 
 DSH_PLUGIN_NAME = "powercontext-dsh"
@@ -44,161 +33,11 @@ DSH_PROFILE = "web"
 DSH_BUNDLE = Path("lib") / "index.js"
 
 
-@dataclass(frozen=True, slots=True)
-class DshSetupResult:
-    plugin: str
-    plugin_path: str
-    data_dir: str
-    authorization_state: str = "not_attempted"
-    profile: str = "web"
-    profile_dir: str = ""
-
-
-def install_dsh_plugin(
-    *,
-    source: str,
-    ref: str,
-    server_url: str = "http://127.0.0.1:8000",
-    allow_insecure_http: bool = False,
-    target: DshTarget | None = None,
-) -> DshSetupResult:
-    """Install the plugin from a PowerContext checkout or Git source."""
-
-    profile = target.profile if target else DshProfile.WEB
-    executable = target.command if target and target.command else dsh_executable()
-    data_dir = powercontext_data_dir()
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise SetupError.data_directory(data_dir, error) from error
-    plugin_dir = resolve_dsh_plugin_dir(source=source, ref=ref)
-    require_built_plugin(plugin_dir)
-    from powercontext.cli.dsh_transport import read_dsh_settings, validate_dsh_setup_transport
-
-    try:
-        settings = read_dsh_settings(profile=profile, candidate=plugin_dir, prospective=True, executable=executable)
-        validate_dsh_setup_transport(settings, server_url, allow_insecure_http)
-    except ValueError as error:
-        raise SetupError(str(error)) from error
-    _run_dsh("plugin", "--profile", profile, "add", str(plugin_dir), **({"executable": executable} if target else {}))
-    try:
-        settings = read_dsh_settings(profile=profile, executable=executable, require_installed=True)
-        validate_dsh_setup_transport(settings, server_url, allow_insecure_http)
-    except ValueError as error:
-        raise SetupError(  # noqa: TRY003 - actionable host-specific readback failure.
-            f"DSH installation completed but its resulting configuration could not be validated: {error}. "
-            "Connection settings and credentials were not saved. Check the profile before restarting DSH."
-        ) from error
-    from powercontext.cli.authorization import (
-        configure_stored_authorization,
-        setup_authorization_value,
-    )
-
-    return DshSetupResult(
-        plugin=DSH_PLUGIN_NAME,
-        plugin_path=str(plugin_dir),
-        data_dir=str(data_dir),
-        profile=profile,
-        profile_dir=str(dsh_home() / "profiles" / profile),
-        authorization_state=configure_stored_authorization(
-            "dsh",
-            server_url=server_url,
-            value=setup_authorization_value("dsh"),
-        ),
-    )
-
-
-def resolve_dsh_plugin_dir(*, source: str, ref: str) -> Path:
-    """Return the plugin directory for a local checkout or a materialized Git ref."""
-
-    if _is_local_source(source):
-        return plugin_dir_from_checkout(Path(source).expanduser().resolve())
-    return plugin_dir_from_checkout(_materialize_remote_checkout(source, ref))
-
-
-def plugin_dir_from_checkout(root: Path) -> Path:
-    """Accept either the plugin directory or a PowerContext repository root."""
-
-    if _is_dsh_plugin(root):
-        return root
-    plugin = root / DSH_PLUGIN_RELATIVE
-    if _is_dsh_plugin(plugin):
-        return plugin
-    raise SetupError.missing_dsh_plugin(root)
-
-
 def require_built_plugin(path: Path) -> None:
     """Reject a plugin directory that cannot be loaded by DeepSeek Harness."""
 
     if not (path / DSH_BUNDLE).is_file():
-        raise SetupError.unbuilt_dsh_plugin(path)
-
-
-def run_dsh_diagnostics(*, target: DshTarget | None = None) -> dict[str, Diagnostic]:
-    """Collect diagnostics for the optional DeepSeek Harness integration."""
-
-    try:
-        executable = target.command if target and target.command else dsh_executable()
-    except SetupError:
-        return {
-            "dsh": Diagnostic(
-                status=DiagnosticStatus.FAILED,
-                detail="DeepSeek Harness CLI is not installed or is not on PATH",
-            ),
-            "plugin": Diagnostic(
-                status=DiagnosticStatus.SKIPPED,
-                detail="not checked because DeepSeek Harness CLI is unavailable",
-            ),
-        }
-    if target and target.profile == DshProfile.DESKTOP:
-        return _desktop_diagnostics(target)
-    try:
-        output = _run_dsh("--profile", DSH_PROFILE, "--dump-config", **({"executable": executable} if target else {}))
-    except SetupError as error:
-        cause = error.__cause__
-        checks = {"dump_config": "failed"}
-        detail = "dsh --profile web --dump-config failed"
-        if isinstance(cause, subprocess.TimeoutExpired):
-            checks["dump_config"] = "timeout"
-            detail = "dsh --profile web --dump-config exceeded the 120-second deadline"
-        elif isinstance(cause, subprocess.CalledProcessError):
-            checks["exit_code"] = str(cause.returncode)
-            detail = f"dsh --profile web --dump-config exited with code {cause.returncode}"
-        elif isinstance(cause, OSError):
-            checks["dump_config"] = "launch_failed"
-            detail = "could not launch dsh --profile web --dump-config; verify the executable and its permissions"
-        return {
-            "dsh": Diagnostic(
-                status=DiagnosticStatus.FAILED,
-                detail=(
-                    f"{detail}; inspect the Web profile locally for configuration "
-                    "or plugin-load errors. Raw host output is withheld because it can contain credentials."
-                ),
-                checks=checks,
-            ),
-            "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
-        }
-    installed = plugin_id_installed(output)
-    return {
-        "dsh": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
-        "plugin": Diagnostic(
-            status=DiagnosticStatus.OK if installed else DiagnosticStatus.FAILED,
-            detail=(
-                f"{DSH_PLUGIN_NAME} is registered in the Web profile. This standalone check cannot observe "
-                "the running DSH process environment or overrides; run /pc doctor inside that session."
-                if installed
-                else "PowerContext DSH plugin is not registered in the Web profile; run powercontext setup dsh."
-            ),
-            checks={
-                "registration": "present" if installed else "missing",
-                "running_host_configuration": "not_observed",
-                "server_liveness": "not_checked",
-                "server_readiness": "not_checked",
-                "route_compatibility": "not_checked",
-                "session_scope": "not_checked",
-            },
-        ),
-    }
+        raise SetupError(f"PowerContext DSH plugin at {path} is missing lib/index.js. Build the plugin before setup.")  # noqa: TRY003
 
 
 def _desktop_diagnostics(target: DshTarget) -> dict[str, Diagnostic]:
@@ -238,7 +77,7 @@ def dsh_executable() -> str:
             return cmd
     executable = which("dsh")
     if executable is None:
-        raise SetupError.dsh_unavailable()
+        raise SetupError("DeepSeek Harness CLI is not installed or is not on PATH.")  # noqa: TRY003
     return executable
 
 
@@ -251,64 +90,6 @@ def plugin_id_installed(output: str) -> bool:
         f"id: '{DSH_PLUGIN_NAME}'",
     }
     return any(raw.strip().lstrip("-").strip() in expected for raw in output.splitlines())
-
-
-def github_clone_url(source: str) -> str:
-    """Accept a GitHub slug or repository URL and return a clone URL."""
-
-    try:
-        return _github_clone_url(source)
-    except InvalidGitHubSourceError:
-        raise SetupError.invalid_dsh_source() from None
-
-
-def checkout_target(ref: str) -> Path:
-    """Resolve a Git ref to a directory that stays under the DSH checkout root."""
-
-    root = (powercontext_data_dir() / "checkouts" / "dsh").resolve()
-    if not ref or ref in {".", ".."} or "\x00" in ref:
-        raise SetupError.invalid_dsh_ref(ref)
-    target = (root / ref).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError as error:
-        raise SetupError.invalid_dsh_ref(ref) from error
-    if target == root:
-        raise SetupError.invalid_dsh_ref(ref)
-    return target
-
-
-def _is_dsh_plugin(path: Path) -> bool:
-    manifest = path / "package.json"
-    if not manifest.is_file():
-        return False
-    try:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return payload.get("name") == DSH_PLUGIN_NAME
-
-
-def _usable_checkout(target: Path) -> bool:
-    return _is_dsh_plugin(target) or _is_dsh_plugin(target / DSH_PLUGIN_RELATIVE)
-
-
-def _materialize_remote_checkout(source: str, ref: str) -> Path:
-    target = checkout_target(ref)
-    if _usable_checkout(target):
-        return target
-    if target.exists():
-        shutil.rmtree(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _clone_github_source(source, ref, target)
-    return target
-
-
-def _clone_github_source(source: str, ref: str, target: Path) -> None:
-    try:
-        clone_github_source(source, ref, target)
-    except InvalidGitHubSourceError:
-        raise SetupError.invalid_dsh_source() from None
 
 
 def _run_dsh(*arguments: str, executable: str | None = None) -> str:
@@ -324,27 +105,119 @@ def _run_dsh(*arguments: str, executable: str | None = None) -> str:
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise SetupError.command_unavailable(command, error) from error
+        raise SetupError(f"Cannot run {' '.join(command)}: {error}") from error  # noqa: TRY003
     if completed.returncode != 0:
         detail = (
             (completed.stderr or "").strip() or (completed.stdout or "").strip() or f"exit code {completed.returncode}"
         )
-        raise SetupError.command_failed(command, detail) from subprocess.CalledProcessError(
+        raise SetupError(f"`{' '.join(command)}` failed: {detail}") from subprocess.CalledProcessError(  # noqa: TRY003
             completed.returncode, command
         )
     return completed.stdout or ""
 
 
-__all__ = [
-    "DSH_PLUGIN_NAME",
-    "DshSetupResult",
-    "checkout_target",
-    "dsh_executable",
-    "github_clone_url",
-    "install_dsh_plugin",
-    "plugin_dir_from_checkout",
-    "plugin_id_installed",
-    "require_built_plugin",
-    "resolve_dsh_plugin_dir",
-    "run_dsh_diagnostics",
-]
+__all__ = ["DSH_PLUGIN_NAME", "dsh_executable", "plugin_id_installed", "require_built_plugin"]
+
+
+@dataclass
+class DshInstaller:
+    dsh_target: DshTarget | None = None
+
+    def install(self, source):
+        target = self.dsh_target
+        profile = target.profile if target else DshProfile.WEB
+        executable = target.command if target and target.command else dsh_executable()
+        with source.package("dsh", linked=True) as package:
+            require_built_plugin(package)
+            _run_dsh("plugin", "--profile", profile, "add", str(package), executable=executable)
+            return {
+                "plugin": DSH_PLUGIN_NAME,
+                "plugin_path": str(package),
+                "data_dir": str(powercontext_data_dir()),
+                "profile": profile,
+                "profile_dir": str(dsh_home() / "profiles" / profile),
+            }
+
+    def configure(self, connection):
+        from powercontext.cli.dsh_transport import read_dsh_settings, validate_dsh_setup_transport
+
+        settings = read_dsh_settings(
+            profile=self.dsh_target.profile if self.dsh_target else DshProfile.WEB,
+            executable=self.dsh_target.command if self.dsh_target else None,
+            require_installed=True,
+        )
+        validate_dsh_setup_transport(settings, connection.server_url, connection.allow_insecure_http)
+        return {
+            "authorization_state": configure_connection(
+                connection, dsh_target=self.dsh_target or DshTarget(DshProfile.WEB)
+            )
+        }
+
+    def verify(self) -> dict[str, Diagnostic]:
+        """Collect diagnostics for the optional DeepSeek Harness integration."""
+        target = self.dsh_target
+
+        try:
+            executable = target.command if target and target.command else dsh_executable()
+        except SetupError:
+            return {
+                "dsh": Diagnostic(
+                    status=DiagnosticStatus.FAILED,
+                    detail="DeepSeek Harness CLI is not installed or is not on PATH",
+                ),
+                "plugin": Diagnostic(
+                    status=DiagnosticStatus.SKIPPED,
+                    detail="not checked because DeepSeek Harness CLI is unavailable",
+                ),
+            }
+        if target and target.profile == DshProfile.DESKTOP:
+            return _desktop_diagnostics(target)
+        try:
+            output = _run_dsh(
+                "--profile", DSH_PROFILE, "--dump-config", **({"executable": executable} if target else {})
+            )
+        except SetupError as error:
+            cause = error.__cause__
+            checks = {"dump_config": "failed"}
+            detail = "dsh --profile web --dump-config failed"
+            if isinstance(cause, subprocess.TimeoutExpired):
+                checks["dump_config"] = "timeout"
+                detail = "dsh --profile web --dump-config exceeded the 120-second deadline"
+            elif isinstance(cause, subprocess.CalledProcessError):
+                checks["exit_code"] = str(cause.returncode)
+                detail = f"dsh --profile web --dump-config exited with code {cause.returncode}"
+            elif isinstance(cause, OSError):
+                checks["dump_config"] = "launch_failed"
+                detail = "could not launch dsh --profile web --dump-config; verify the executable and its permissions"
+            return {
+                "dsh": Diagnostic(
+                    status=DiagnosticStatus.FAILED,
+                    detail=(
+                        f"{detail}; inspect the Web profile locally for configuration "
+                        "or plugin-load errors. Raw host output is withheld because it can contain credentials."
+                    ),
+                    checks=checks,
+                ),
+                "plugin": Diagnostic(status=DiagnosticStatus.SKIPPED, detail="plugin list is unavailable"),
+            }
+        installed = plugin_id_installed(output)
+        return {
+            "dsh": Diagnostic(status=DiagnosticStatus.OK, detail=executable),
+            "plugin": Diagnostic(
+                status=DiagnosticStatus.OK if installed else DiagnosticStatus.FAILED,
+                detail=(
+                    f"{DSH_PLUGIN_NAME} is registered in the Web profile. This standalone check cannot observe "
+                    "the running DSH process environment or overrides; run /pc doctor inside that session."
+                    if installed
+                    else "PowerContext DSH plugin is not registered in the Web profile; run powercontext setup dsh."
+                ),
+                checks={
+                    "registration": "present" if installed else "missing",
+                    "running_host_configuration": "not_observed",
+                    "server_liveness": "not_checked",
+                    "server_readiness": "not_checked",
+                    "route_compatibility": "not_checked",
+                    "session_scope": "not_checked",
+                },
+            ),
+        }

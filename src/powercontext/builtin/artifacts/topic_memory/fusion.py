@@ -26,7 +26,7 @@ from powercontext.builtin.artifacts.search import (
     AdmissionFloor,
     InvalidSearchScore,
     admits_fts_text,
-    analyze_text,
+    analyze_fts_query,
     analyze_text_with_spans,
     lexical_search_score,
     unit_l2_cosine_similarity,
@@ -253,7 +253,7 @@ def _snippet(query: str, value: str, *, lexical: bool) -> str:
 
 def _lexical_focus(query: str, value: str) -> int:
     normalized, spans = _normalized_spans(value)
-    query_terms = set(analyze_text(query).split())
+    query_terms = set(analyze_fts_query(query).split())
     occurrences = sorted(
         (start, end - start, term) for term, start, end in analyze_text_with_spans(normalized) if term in query_terms
     )

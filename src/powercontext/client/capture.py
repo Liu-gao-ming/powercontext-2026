@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -137,12 +137,29 @@ def _capture_key(value: Any) -> str:
     return UNSERIALIZABLE
 
 
-def redact_known_secrets(value: str, *, codex_home: Path | None = None) -> str:
-    """Redact credential-like environment values and Codex auth values."""
+def known_secret_values(*, codex_home: Path | None = None) -> frozenset[str]:
+    """Return the known secret values used by all PowerContext redaction paths."""
 
     secrets = {secret for name, secret in os.environ.items() if secret and len(secret) >= 8 and is_sensitive_key(name)}
     secrets.update(_codex_auth_secrets(codex_home=codex_home))
-    for secret in secrets:
+    return frozenset(secrets)
+
+
+def redact_known_secrets(
+    value: str,
+    *,
+    codex_home: Path | None = None,
+    secrets: Iterable[str] | None = None,
+) -> str:
+    """Redact known environment and Codex-auth secret values.
+
+    When ``secrets`` is supplied it is treated as a complete, precomputed snapshot;
+    ``codex_home`` is intentionally ignored in that mode.
+    """
+
+    values = known_secret_values(codex_home=codex_home) if secrets is None else secrets
+    known: Iterable[str] = sorted(values, key=len, reverse=True)
+    for secret in known:
         value = value.replace(secret, REDACTED)
     return value
 

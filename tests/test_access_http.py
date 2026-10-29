@@ -79,12 +79,13 @@ class _ActingAuthenticationProvider:
         return ProviderReadiness(ready=True)
 
 
-def test_enforced_mode_cannot_silently_start_without_authentication_or_provider() -> None:
+def test_enforced_mode_cannot_silently_start_without_authentication_or_provider(tmp_path) -> None:
     with pytest.raises(ValueError, match="injected Authentication Provider or legacy AUTH_TOKEN"):
         create_server_app(settings=ServerSettings(access=AccessControlConfig(mode="enforced")))
 
     scheduled = create_server_app(
         settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'scheduled.db'}"),
             access=AccessControlConfig(mode="enforced"),
             runtime=RuntimeConfig(schedule_seconds=60),
         ),
@@ -973,7 +974,7 @@ def test_artifact_publication_requires_logical_share_and_target_scope_admin() ->
 
 
 @pytest.mark.parametrize("access_mode", ["enforced", "disabled"])
-def test_artifact_search_uses_path_scope_permission_and_waits_for_content_owners(access_mode) -> None:
+def test_artifact_search_uses_path_scope_permission_without_unrelated_owner_checks(access_mode) -> None:
     group = GroupRef(type="group", id="search-group")
 
     class Provider(_ActingAuthenticationProvider):
@@ -1033,18 +1034,8 @@ def test_artifact_search_uses_path_scope_permission_and_waits_for_content_owners
                 injected = await client.post(
                     path, headers=_auth("search-token"), json={"query": "x", "scope_id": "scope-b"}
                 )
-                pending = await client.post(path, headers=_auth("search-token"), json={"query": "x"})
                 assert denied.status_code == 403
                 assert injected.status_code == 422
-                assert pending.status_code == 503
-                assert pending.json()["error"]["code"] == "artifact_owner_pending"
-                assert application.reads == []
-                await service.establish_artifact_owner(
-                    ResourceRef.artifact("scope-a", family="skill", artifact_id="pending"),
-                    BOB,
-                    idempotency_key="search-owner",
-                    context=AUDIT,
-                )
                 ready = await client.post(path, headers=_auth("search-token"), json={"query": "x"})
                 assert ready.status_code == 200
                 assert ready.json() == {"results": []}

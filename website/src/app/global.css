@@ -28,6 +28,42 @@
   --color-fd-primary: #68adff;
 }
 
+.pc-search-dialog {
+  --pc-search-top: 1rem;
+  top: var(--pc-search-top);
+  max-height: calc(100dvh - var(--pc-search-top) - 1rem);
+}
+
+@media (min-width: 768px) {
+  .pc-search-dialog {
+    --pc-search-top: min(12vh, 120px);
+  }
+}
+
+.pc-search-results {
+  display: flex;
+  flex-direction: column;
+  height: auto;
+}
+
+.pc-search-results > div {
+  min-height: 0;
+  padding: 0 12px 16px;
+}
+
+.pc-search-snippet > div:last-child {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.pc-search-dialog button:focus-visible {
+  outline: 2px solid var(--color-fd-primary);
+  outline-offset: -2px;
+}
+
 .pc-github {
   position: relative;
   display: inline-flex;

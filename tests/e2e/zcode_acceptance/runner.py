@@ -53,6 +53,12 @@ from .workflows import candidate_review, memory_and_handoff
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 PLUGIN = REPOSITORY / "integrations/zcode/plugins/powercontext"
+_NATIVE_ASSERTIONS = {
+    "libuv_async_handle_closing": r"Assertion failed: !\(handle->flags & UV_HANDLE_CLOSING\), "
+    r"file (?:deps[/\\]uv[/\\])?src[/\\]win[/\\]async\.c, line [0-9]+",
+    "libuv_fs_event_path_mismatch": r"Assertion failed: !_wcsnicmp\(filename, dir, dirlen\), "
+    r"file (?:deps[/\\]uv[/\\])?src[/\\]win[/\\]fs-event\.c, line [0-9]+",
+}
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -64,6 +70,20 @@ def error_code(error: Exception) -> str:
     """Persist only a stable code, never an arbitrary exception message or request body."""
     code = str(error) if isinstance(error, AssertionError) else ""
     return code if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_/]{0,95}", code) else type(error).__name__
+
+
+def _cli_events(output: str, *, failed: bool) -> list[dict[str, Any]]:
+    """Decode CLI frames without hiding a process failure behind truncated output."""
+    events = []
+    for line in output.splitlines():
+        if not line.strip().startswith("{"):
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            if not failed:
+                raise
+    return events
 
 
 @contextmanager
@@ -111,7 +131,7 @@ class RestartableServer:
         server = self.server
         self.thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
         self.thread.start()
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 45
         while not self.server.started and self.thread.is_alive() and time.monotonic() < deadline:
             time.sleep(0.05)
         assert self.server.started, "server_restart_failed"
@@ -264,7 +284,7 @@ class AcceptanceRun:
         if resume:
             args.extend(["--resume", resume])
         completed = self.process(args, environment=environment)
-        events = [json.loads(line) for line in completed.stdout.splitlines() if line.strip().startswith("{")]
+        events = _cli_events(completed.stdout, failed=completed.returncode != 0)
         self.last_events = events
         if self.live:
             started = [
@@ -280,6 +300,19 @@ class AcceptanceRun:
                     "host_selected_different_model_from_requested"
                 )
         if completed.returncode:
+            self.summary["host_process_exit"] = {
+                "returncode": completed.returncode,
+                "result_event_count": sum(event.get("type") == "result" for event in events),
+                # Retain a fixed native signature without exposing stderr's paths, prompts or credentials.
+                "native_assertion": next(
+                    (
+                        code
+                        for code, pattern in _NATIVE_ASSERTIONS.items()
+                        if any(re.fullmatch(pattern, line) for line in completed.stderr.splitlines())
+                    ),
+                    None,
+                ),
+            }
             failures = [payload for event in events if (payload := event.get("payload", {})).get("errorCode")]
             codes = [
                 payload["errorCode"]
@@ -312,8 +345,8 @@ class AcceptanceRun:
         completed = self.process([
             sys.executable,
             "-c",
-            "from powercontext.cli.zcode import install_zcode_plugin; "
-            'import sys; install_zcode_plugin(source=sys.argv[1], ref="master", server_url=sys.argv[2])',
+            "from powercontext.cli.installation import setup; "
+            'import sys; setup("zcode", source=sys.argv[1], ref="master", server_url=sys.argv[2])',
             str(REPOSITORY),
             self.base_url,
         ])
@@ -464,12 +497,12 @@ class AcceptanceRun:
         self.summary["host_version"] = version.stdout.strip()
         approved_operations = [
             "remember_memory",
-            "revise_memory_entry",
+            "replace_artifact",
             "handoff_current_work",
             "commit_handoff",
             "acknowledge_handoff",
             "record_task_outcome",
-            "approve_artifact_candidate",
+            "approve_candidate",
         ]
         write_json(
             self.config_file,
@@ -575,21 +608,31 @@ class AcceptanceRun:
             source_ref = {"name": "content", "source_id": source["source_id"]}
             deadline = min(self.budget, time.monotonic() + (180 if self.live else 20))
             generated = None
-            inventory: dict[str, Any] = {}
+            published: dict[str, Any] = {}
             while time.monotonic() < deadline:
                 inventory = self.post("/v1/memory/entries/list", {"scope_id": self.scope_id})
                 generated = next(
-                    (
-                        item
-                        for item in inventory["entries"]
-                        if marker in item["text"] and source_ref in item["source_refs"]
-                    ),
+                    (item for item in inventory["entries"] if marker in item["text"] and item["state"] == "active"),
                     None,
                 )
                 if generated:
-                    break
+                    reference = generated["artifact"]
+                    assert reference["family"] == "atomic-memory" and reference["revision"] >= 1
+                    response = self.client.get(
+                        f"/v1/scopes/{self.scope_id}/artifacts/{reference['family']}/"
+                        f"{reference['artifact_id']}/revisions/{reference['revision']}"
+                    )
+                    response.raise_for_status()
+                    published = response.json()
+                    assert published["scope_id"] == self.scope_id
+                    assert {key: published[key] for key in reference} == reference
+                    assert published["content"]["text"] == generated["text"]
+                    if {"source_type": "content", "source_id": source["source_id"]} in published["sources"]:
+                        break
+                    generated = None
                 time.sleep(0.1)
-            assert generated and inventory["memory"], "scheduler_memory_timeout_or_missing_source_evidence"
+            assert generated and published, "scheduler_memory_timeout_or_missing_source_evidence"
+            assert isinstance(generated["state_version"], int) and generated["state_version"] >= 0
             assert not any(item["path"] == "/v1/memory/flush" for item in self.wire.records[start:])
             assert not self.wire.calls("remember_memory", start), "auto_chain_substituted_manual_memory"
             second = self.invoke(
@@ -616,9 +659,9 @@ class AcceptanceRun:
                         "scope_id": self.scope_id,
                         "source": source_ref,
                         "position": source["position"],
-                        "memory": inventory["memory"],
-                        "citation": generated["citation"],
-                        "source_refs": generated["source_refs"],
+                        "memory_artifact": generated["artifact"],
+                        "memory_state_version": generated["state_version"],
+                        "sources": published["sources"],
                         "independent_sessions": True,
                         "random_marker_recalled": True,
                         "prepare": "ready",

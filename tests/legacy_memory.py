@@ -19,7 +19,7 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-LEGACY_CITATION_TABLES = ("pc_artifacts", "pc_artifact_candidate_versions")
+LEGACY_CITATION_TABLES = ("pc_artifacts", "pc_candidate_versions")
 
 
 async def add_legacy_citation_columns(connection: AsyncConnection) -> None:

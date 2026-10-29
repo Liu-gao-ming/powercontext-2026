@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import rfc8785
@@ -28,9 +28,10 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from powercontext.artifacts import Artifact, ArtifactRef
+from powercontext.artifacts import Artifact, ArtifactRef, StableHandle
 from powercontext.builtin.artifacts.atomic_memory.errors import AtomicMemoryConflictError
-from powercontext.builtin.persistence.artifacts import ArtifactRepository
+from powercontext.builtin.persistence.artifact_handles import ArtifactHandleRepository
+from powercontext.builtin.persistence.artifacts import ArtifactRepository, with_artifact_content
 from powercontext.builtin.persistence.cursor_codec import SignedCursorCodec
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import (
@@ -44,6 +45,18 @@ from powercontext.builtin.persistence.family_management import (
     PreparingFamilyManagementWriter,
 )
 from powercontext.builtin.persistence.processing import ArtifactProcessingPendingRepository
+from powercontext.builtin.persistence.revision_meta import (
+    PendingRollback,
+    bind_rollback,
+    reset_rollback,
+    revision_meta,
+)
+from powercontext.builtin.persistence.rollback import (
+    merged_source_revision,
+    normalize_reason,
+    prepare_profile_command,
+    require_matching_source,
+)
 from powercontext.builtin.persistence.sources import SourceRepository, StoredSource
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
@@ -58,6 +71,7 @@ from powercontext.builtin.records import (
     ArtifactListReader,
     ArtifactRecord,
     ArtifactRecordPage,
+    ArtifactRevisionActor,
     ArtifactRevisionPage,
     ArtifactRevisionPreconditionError,
     ArtifactWrite,
@@ -119,6 +133,7 @@ class RelationalRecordService:
         cursor_ttl_seconds: int = _DEFAULT_CURSOR_TTL_SECONDS,
         processing_pending: ArtifactProcessingPendingRepository | None = None,
         source_processing_bindings: tuple[str, ...] = (),
+        tags: RelationalTagService | None = None,
         atomic_memory_tag_hook=None,
         atomic_memory_tag_authorizer=None,
         topic_memory_list_reader: ArtifactListReader | None = None,
@@ -138,7 +153,8 @@ class RelationalRecordService:
         self._processing_pending = processing_pending
         self._source_processing_bindings = source_processing_bindings
         self._topic_memory_list_reader = topic_memory_list_reader
-        self._tags = RelationalTagService(
+        self._artifact_handles = ArtifactHandleRepository(database)
+        self._tags = tags or RelationalTagService(
             database,
             artifacts,
             cursor_secret=self._cursor_secret,
@@ -147,6 +163,26 @@ class RelationalRecordService:
             projection_hook=atomic_memory_tag_hook,
             atomic_write_authorizer=atomic_memory_tag_authorizer,
         )
+
+    async def bind_artifact_handle(
+        self,
+        scope_id: str,
+        handle: StableHandle,
+        target: ArtifactRef,
+        /,
+    ) -> ArtifactRef:
+        try:
+            return await self._artifact_handles.bind(scope_id, handle, target)
+        except RepositoryNotFoundError as error:
+            raise BaseValueNotFoundError(error.kind, error.identity) from None
+        except StoredPayloadConflictError as error:
+            raise BaseValueConflictError(error.kind, error.identity) from None
+
+    async def resolve_artifact_handle(self, scope_id: str, handle: StableHandle, /) -> ArtifactRef:
+        try:
+            return await self._artifact_handles.resolve(scope_id, handle)
+        except RepositoryNotFoundError as error:
+            raise BaseValueNotFoundError(error.kind, error.identity) from None
 
     async def get_tags(self, scope_id: str, target: TagTarget) -> ArtifactTagSet:
         return await self._tags.get(scope_id, target)
@@ -169,14 +205,19 @@ class RelationalRecordService:
         /,
     ) -> SourceRecord:
         self._require_content_source(source_type)
+        content_text = _canonical_source_text(content)
+        if not content_text.strip():
+            # Blank text cannot be read back through the content Source adapter and
+            # would wedge every later generation window that admits it.
+            raise InvalidBaseAccessRequestError("content", "content text must not be blank")
         source = ContentSource(
             name=self._id_factory("source"),
             materialization=SourceMaterialization.CAPTURED,
-            content=_canonical_source_text(content),
+            content=content_text,
             wire_content=_JSON_VALUE.validate_python(content, strict=True),
             wire_content_present=True,
         )
-        return await self._store_source(scope_id, source_type, source)
+        return (await self._store_sources(scope_id, (source,)))[0]
 
     async def capture_source(
         self,
@@ -188,6 +229,7 @@ class RelationalRecordService:
         /,
         *,
         handoff_receipt: bool = False,
+        working_note: bool = False,
     ) -> SourceRecord:
         """Preserve the caller-stable identity used by the existing capture API."""
 
@@ -199,32 +241,33 @@ class RelationalRecordService:
             )
         except ValidationError as error:
             raise InvalidBaseAccessRequestError("content", "does not match the Source adapter") from error
-        return await self._store_source(
-            scope_id,
-            source_type,
-            (await CONTENT_SOURCE_ADAPTER.resolve(capture)).model_copy(update={"handoff_receipt": handoff_receipt}),
+        source = (await CONTENT_SOURCE_ADAPTER.resolve(capture)).model_copy(
+            update={"handoff_receipt": handoff_receipt, "working_note": working_note}
         )
+        return (await self._store_sources(scope_id, (source,)))[0]
 
-    async def _store_source(
-        self,
-        scope_id: str,
-        source_type: str,
-        source: ContentSource,
-    ) -> SourceRecord:
+    async def capture_sources(self, scope_id: str, captures: Sequence[ContentCapture], /) -> tuple[SourceRecord, ...]:
+        """Capture one ordered integration batch with a shared journal and pending transition."""
+
+        sources = tuple([await CONTENT_SOURCE_ADAPTER.resolve(capture) for capture in captures])
+        return await self._store_sources(scope_id, sources)
+
+    async def _store_sources(self, scope_id: str, sources: Sequence[ContentSource]) -> tuple[SourceRecord, ...]:
+        if not sources:
+            return ()
         try:
             async with self._database.transaction() as connection:
-                stored, created = await self._sources.add_with_status(connection, scope_id, source)
-                if created and self._processing_pending is not None:
+                stored = await self._sources.add_many_with_status(connection, scope_id, sources)
+                new_positions = [item.journal_position for item, created in stored if created]
+                if new_positions and self._processing_pending is not None:
                     for binding_name in self._source_processing_bindings:
-                        await self._processing_pending.raise_source(
-                            connection,
-                            scope_id,
-                            binding_name,
-                            stored.journal_position,
+                        await self._processing_pending.note_source(
+                            connection, scope_id, binding_name, max(new_positions)
                         )
         except StoredPayloadConflictError as error:
-            raise BaseValueConflictError("source", (scope_id, source_type, source.name)) from error
-        return _source_record(scope_id, stored)
+            scope, ref = cast(tuple[str, SourceRef], error.identity)
+            raise BaseValueConflictError("source", (scope, ref.source_type, ref.source_id)) from error
+        return tuple(_source_record(scope_id, item) for item, _ in stored)
 
     async def get_source(self, scope_id: str, source_type: str, source_id: str, /) -> SourceRecord:
         self._require_content_source(source_type)
@@ -302,6 +345,7 @@ class RelationalRecordService:
         /,
         *,
         execution_context=None,
+        on_commit=None,
     ) -> ArtifactCreated:
         if family == "memory":
             raise BaseOperationNotSupportedError("artifact_family", family, "collection writes")
@@ -349,6 +393,8 @@ class RelationalRecordService:
             async with self._database.transaction() as connection:
                 stored = await self._sources.add(connection, scope_id, source)
                 artifact = await writer.create(connection, scope_id, artifact_id, prepared, stored.ref)
+                if on_commit is not None:
+                    await on_commit(connection, _artifact_created(scope_id, artifact))
         except (StoredPayloadConflictError, RevisionConflictError) as error:
             raise BaseValueConflictError("artifact", (scope_id, family, artifact_id)) from error
         return _artifact_created(scope_id, artifact)
@@ -362,17 +408,20 @@ class RelationalRecordService:
         writer = self._family_writers.get("atomic-memory")
         if not isinstance(writer, AtomicMemoryManagementWriter):
             raise BaseOperationNotSupportedError("artifact_family", "atomic-memory", "batch creation")
-        prepared = []
+        commands = []
         for content in contents:
             command = writer.validate_create(content)
             artifact_id = self._id_factory("atomic-memory")
-            value = await writer.prepare_command(scope_id, artifact_id, command, execution_context=execution_context)
-            prepared.append((artifact_id, command, value))
-        created = []
-        async with self._database.transaction() as connection:
-            for artifact_id, command, value in prepared:
-                payload = cast(dict[str, JsonValue], command.model_dump(mode="json", by_alias=True, exclude_none=True))
-                source = ContentSource(
+            commands.append((artifact_id, command))
+        values = await writer.prepare_creates(scope_id, commands, execution_context=execution_context)
+        prepared = tuple(
+            (artifact_id, command, value) for (artifact_id, command), value in zip(commands, values, strict=True)
+        )
+        source_values = []
+        for artifact_id, command, _ in prepared:
+            payload = cast(dict[str, JsonValue], command.model_dump(mode="json", by_alias=True, exclude_none=True))
+            source_values.append(
+                ContentSource(
                     name=self._id_factory("source"),
                     materialization=SourceMaterialization.CAPTURED,
                     content=_canonical_source_text(payload),
@@ -389,13 +438,35 @@ class RelationalRecordService:
                         ),
                     ),
                 )
-                stored = await self._sources.add(connection, scope_id, source)
-                artifact = await writer.create(connection, scope_id, artifact_id, value, stored.ref)
-                created.append(_artifact_created(scope_id, artifact))
+            )
+        created = []
+        async with self._database.transaction() as connection:
+            stored_sources = await self._sources.add_many_with_status(connection, scope_id, source_values)
+            stored_values = tuple(stored for stored, _ in stored_sources)
+            source_read_set = await self._sources.preload(
+                connection,
+                scope_id,
+                tuple(stored.ref for stored in stored_values),
+                known=stored_values,
+            )
+            artifacts = await writer.create_many(
+                connection,
+                scope_id,
+                tuple(
+                    (artifact_id, value, stored.ref)
+                    for (artifact_id, _, value), stored in zip(prepared, stored_values, strict=True)
+                ),
+                source_read_set=source_read_set,
+            )
+            created.extend(_artifact_created(scope_id, artifact) for artifact in artifacts)
         return tuple(created)
 
-    async def get_artifact(self, scope_id: str, family: str, artifact_id: str, /) -> ArtifactRecord:
+    async def get_artifact(
+        self, scope_id: str, family: str, artifact_id: str, /, *, execution_context=None
+    ) -> ArtifactRecord:
         self._require_family(family)
+        if family == "atomic-memory" and execution_context is not None:
+            return await self._get_authorized_atomic_artifact(scope_id, artifact_id, None, execution_context)
         async with self._database.transaction() as connection:
             try:
                 artifact = await self._artifacts.latest(connection, scope_id, family, artifact_id)
@@ -410,8 +481,12 @@ class RelationalRecordService:
         artifact_id: str,
         revision: int,
         /,
+        *,
+        execution_context=None,
     ) -> ArtifactRecord:
         self._require_family(family)
+        if family == "atomic-memory" and execution_context is not None:
+            return await self._get_authorized_atomic_artifact(scope_id, artifact_id, revision, execution_context)
         async with self._database.transaction() as connection:
             try:
                 artifact = await self._artifacts.get(
@@ -423,6 +498,21 @@ class RelationalRecordService:
                 raise BaseValueNotFoundError("artifact", (scope_id, family, artifact_id, revision)) from None
             return _artifact_record(scope_id, artifact)
 
+    async def _get_authorized_atomic_artifact(
+        self, scope_id: str, artifact_id: str, revision: int | None, execution_context
+    ) -> ArtifactRecord:
+        writer = cast(AtomicMemoryManagementWriter, self._family_writers.get("atomic-memory"))
+        try:
+            record = await writer.application.for_scope(scope_id).get(
+                artifact_id, revision=revision, context=execution_context
+            )
+        except RepositoryNotFoundError:
+            identity = (scope_id, "atomic-memory", artifact_id)
+            if revision is not None:
+                identity = (*identity, revision)
+            raise BaseValueNotFoundError("artifact", identity) from None
+        return _artifact_record(scope_id, record.artifact)
+
     async def list_artifact_revisions(
         self,
         scope_id: str,
@@ -433,6 +523,16 @@ class RelationalRecordService:
         limit: int,
         cursor: str | None,
     ) -> ArtifactRevisionPage:
+        async with self._database.transaction() as connection:
+            rows, _, next_cursor = await self.revision_rows(
+                connection, scope_id, family, artifact_id, limit=limit, cursor=cursor
+            )
+            artifacts = await self._artifacts.decode_many(connection, scope_id, rows)
+            items = tuple(_artifact_collection_item(scope_id, artifact) for artifact in artifacts)
+        return ArtifactRevisionPage(items=items, next_cursor=next_cursor)
+
+    async def revision_rows(self, connection, scope_id, family, artifact_id, *, limit, cursor, columns=()):
+        """Read a bounded immutable revision page through a borrowed transaction."""
         self._require_family(family)
         _require_limit(limit)
         expected_cursor = {
@@ -445,50 +545,48 @@ class RelationalRecordService:
             "order": "revision:desc",
         }
         after_text = self._cursor_after_text(cursor, expected_cursor)
-        async with self._database.transaction() as connection:
+        current_revision = await connection.scalar(
+            select(ARTIFACT_HEADS_TABLE.c.revision).where(
+                ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                ARTIFACT_HEADS_TABLE.c.family == family,
+                ARTIFACT_HEADS_TABLE.c.artifact_id == artifact_id,
+            )
+        )
+        if current_revision is None:
+            raise BaseValueNotFoundError("artifact", (scope_id, family, artifact_id))
+        if after_text:
             try:
-                current = await self._artifacts.latest(connection, scope_id, family, artifact_id)
-            except RepositoryNotFoundError:
-                raise BaseValueNotFoundError("artifact", (scope_id, family, artifact_id)) from None
-            if after_text:
-                try:
-                    snapshot_text, revision_text = after_text.split(":")
-                    snapshot, after = int(snapshot_text), int(revision_text)
-                except ValueError:
-                    raise InvalidCursorError from None
-                if not 1 <= after <= snapshot <= current.revision:
-                    raise InvalidCursorError
-            else:
-                snapshot, after = current.revision, current.revision + 1
-            revisions = tuple(
-                (
-                    await connection.execute(
-                        select(ARTIFACTS_TABLE.c.revision)
-                        .where(
-                            ARTIFACTS_TABLE.c.scope_id == scope_id,
-                            ARTIFACTS_TABLE.c.family == family,
-                            ARTIFACTS_TABLE.c.artifact_id == artifact_id,
-                            ARTIFACTS_TABLE.c.revision <= snapshot,
-                            ARTIFACTS_TABLE.c.revision < after,
-                        )
-                        .order_by(ARTIFACTS_TABLE.c.revision.desc())
-                        .limit(limit + 1)
+                snapshot_text, revision_text = after_text.split(":")
+                snapshot, after = int(snapshot_text), int(revision_text)
+            except ValueError:
+                raise InvalidCursorError from None
+            if not 1 <= after <= snapshot <= current_revision:
+                raise InvalidCursorError
+        else:
+            snapshot, after = current_revision, current_revision + 1
+        revisions = tuple(
+            (
+                await connection.execute(
+                    select(*(columns or ARTIFACTS_TABLE.c))
+                    .where(
+                        ARTIFACTS_TABLE.c.scope_id == scope_id,
+                        ARTIFACTS_TABLE.c.family == family,
+                        ARTIFACTS_TABLE.c.artifact_id == artifact_id,
+                        ARTIFACTS_TABLE.c.revision <= snapshot,
+                        ARTIFACTS_TABLE.c.revision < after,
                     )
-                ).scalars()
-            )
-            selected = revisions[:limit]
-            artifacts = await self._artifacts.get_many(
-                connection,
-                scope_id,
-                tuple(ArtifactRef(family=family, artifact_id=artifact_id, revision=revision) for revision in selected),
-            )
-            items = tuple(_artifact_collection_item(scope_id, artifact) for artifact in artifacts)
+                    .order_by(ARTIFACTS_TABLE.c.revision.desc())
+                    .limit(limit + 1)
+                )
+            ).mappings()
+        )
+        selected = revisions[:limit]
         next_cursor = (
-            self._encode_cursor(expected_cursor, f"{snapshot}:{selected[-1]}")
+            self._encode_cursor(expected_cursor, f"{snapshot}:{selected[-1]['revision']}")
             if len(revisions) > limit and selected
             else None
         )
-        return ArtifactRevisionPage(items=items, next_cursor=next_cursor)
+        return selected, current_revision, next_cursor
 
     async def logical_artifacts(self, scope_id: str, /) -> tuple[LogicalArtifactRecord, ...]:
         """Catalog current logical identities."""
@@ -544,6 +642,8 @@ class RelationalRecordService:
         async with self._database.transaction() as connection:
             statement = (
                 select(
+                    ARTIFACT_HEADS_TABLE.c.scope_id,
+                    ARTIFACT_HEADS_TABLE.c.family,
                     ARTIFACT_HEADS_TABLE.c.artifact_id,
                     ARTIFACT_HEADS_TABLE.c.revision,
                 )
@@ -568,21 +668,19 @@ class RelationalRecordService:
                         tag_filter,
                     )
                 )
-            rows = (await connection.execute(statement)).all()
-            selected_rows = rows[:limit]
-            artifacts = await self._artifacts.get_many(
-                connection,
-                scope_id,
-                tuple(
-                    ArtifactRef(family=family, artifact_id=str(row.artifact_id), revision=int(row.revision))
-                    for row in selected_rows
-                ),
+            heads = statement.subquery("selected_artifact_heads")
+            rows = (
+                (await connection.execute(with_artifact_content(select(heads), heads).order_by(heads.c.artifact_id)))
+                .mappings()
+                .all()
             )
+            selected_rows = rows[:limit]
+            artifacts = await self._artifacts.decode_many(connection, scope_id, selected_rows)
             items = tuple(_artifact_collection_item(scope_id, artifact) for artifact in artifacts)
 
         next_cursor = None
         if len(rows) > limit and selected_rows:
-            next_cursor = self._encode_cursor(expected_cursor, str(selected_rows[-1].artifact_id))
+            next_cursor = self._encode_cursor(expected_cursor, str(selected_rows[-1]["artifact_id"]))
         return ArtifactRecordPage(
             items=items,
             next_cursor=next_cursor,
@@ -597,6 +695,8 @@ class RelationalRecordService:
         write: ArtifactWrite,
         /,
         *,
+        actor_type: str | None = None,
+        actor_id: str | None = None,
         execution_context=None,
     ) -> ArtifactRecord:
         if write.prompt_key is not None:
@@ -605,6 +705,9 @@ class RelationalRecordService:
             raise BaseOperationNotSupportedError("artifact_family", family, "collection writes")
         writer = self._family_writers.get(family)
         command = writer.validate_replace(write.content)
+        source_revision = merged_source_revision(family, write, command)
+        command = prepare_profile_command(command, source_revision)
+        reason = None if source_revision is None or write.reason is None else normalize_reason(write.reason)
         prepared = command
         if isinstance(writer, AtomicMemoryManagementWriter):
             record = await self.get_artifact(scope_id, family, artifact_id)
@@ -654,7 +757,26 @@ class RelationalRecordService:
                 )
                 try:
                     stored = await self._sources.add(connection, scope_id, source)
-                    revised = await writer.replace(connection, scope_id, current, prepared, stored.ref)
+                    token = await _bind_rollback(
+                        self._artifacts,
+                        connection,
+                        scope_id,
+                        family,
+                        artifact_id,
+                        current,
+                        command,
+                        source_revision,
+                        reason,
+                        writer,
+                        next_revision,
+                        actor_type,
+                        actor_id,
+                    )
+                    try:
+                        revised = await writer.replace(connection, scope_id, current, prepared, stored.ref)
+                    finally:
+                        if token is not None:
+                            reset_rollback(token)
                 except StoredPayloadConflictError as error:
                     raise BaseValueConflictError("source", (scope_id, CONTENT_SOURCE_NAME, source.name)) from error
                 except RevisionConflictError:
@@ -781,6 +903,7 @@ def _artifact_record(
         sources=artifact.lineage.sources,
         artifacts=artifact.lineage.artifacts,
         content_digest=_content_digest(content),
+        **_revision_fields(artifact),
     )
 
 
@@ -805,7 +928,66 @@ def _artifact_collection_item(scope_id: str, artifact: Artifact[Any]) -> Artifac
         sources=artifact.lineage.sources,
         artifacts=artifact.lineage.artifacts,
         content_digest=_content_digest(content),
+        content=content,
+        **_revision_fields(artifact),
     )
+
+
+async def _bind_rollback(
+    artifacts: ArtifactRepository,
+    connection: AsyncConnection,
+    scope_id: str,
+    family: str,
+    artifact_id: str,
+    current: Artifact[Any],
+    command: Any,
+    source_revision: int | None,
+    reason: str | None,
+    writer: object,
+    next_revision: int,
+    actor_type: str | None,
+    actor_id: str | None,
+) -> Any:
+    if source_revision is None or reason is None:
+        return None
+    await require_matching_source(
+        artifacts,
+        connection,
+        scope_id,
+        family,
+        artifact_id,
+        current,
+        command,
+        source_revision,
+        writer,
+    )
+    return bind_rollback(
+        PendingRollback(
+            family=family,
+            artifact_id=artifact_id,
+            revision=next_revision,
+            restored_from_revision=source_revision,
+            reason=reason,
+            created_by_type=actor_type,
+            created_by_id=actor_id,
+        )
+    )
+
+
+def _revision_fields(artifact: Artifact[Any]) -> dict[str, Any]:
+    meta = revision_meta(artifact)
+    actor = None
+    if meta.created_by_type in {"user", "service"} and meta.created_by_id is not None:
+        actor = ArtifactRevisionActor(
+            type=cast(Literal["user", "service"], meta.created_by_type),
+            id=meta.created_by_id,
+        )
+    return {
+        "created_at": meta.created_at,
+        "created_by": actor,
+        "restored_from_revision": meta.restored_from_revision,
+        "reason": meta.reason,
+    }
 
 
 def _artifact_etag(revision: int) -> str:

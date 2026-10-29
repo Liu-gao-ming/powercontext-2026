@@ -91,7 +91,7 @@ def test_new_requests_reject_legacy_memory_references_before_writing(
         for _ in range(2):
             response = transport.post(path.replace("{scope}", scope), json=payload)
             assert response.status_code == 422, response.text
-        candidates = transport.post("/v1/artifact-candidates/list", json={"scope_id": scope, "status": "pending"})
+        candidates = transport.post("/v1/candidates/list", json={"scope_id": scope, "status": "pending"})
         assert candidates.status_code == 200 and candidates.json()["candidates"] == []
         sources = transport.get(f"/v1/scopes/{scope}/sources")
         assert sources.status_code == 200 and "outcome-1" not in sources.text

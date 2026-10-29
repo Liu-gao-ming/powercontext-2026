@@ -21,8 +21,9 @@ import math
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import suppress
-from time import perf_counter
-from typing import Any
+from threading import RLock
+from time import perf_counter, time
+from typing import TYPE_CHECKING, Any, cast
 
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from prometheus_client import (
@@ -40,10 +41,74 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metri
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from typing_extensions import override
 
+from powercontext.builtin.runtime.processing_contracts import ArtifactProcessingModelUsageDelta
 from powercontext.limits import MAX_ARTIFACT_FAMILY_LENGTH
 from powercontext.server.context import is_internal_bridge
+from powercontext.server.operational_metrics import OperationalMetricsCollector
+
+if TYPE_CHECKING:
+    from powercontext.builtin.runtime.application import BuiltinRuntime
+
+if TYPE_CHECKING:
+    from typing import Protocol
+
+    class ArtifactProcessingSnapshotSource(Protocol):
+        """Structural source of one bounded processing family snapshot."""
+
+        @property
+        def family_status(self) -> Mapping[str, Mapping[str, int | float | str]]: ...
+
+
+_DEPENDENCY_NAMES = frozenset({
+    "database",
+    "runtime",
+    "inference.generation",
+    "inference.embedding",
+    "inference.rerank",
+    "inference.decision",
+    "artifact_processing_supervisor",
+    "access_provider",
+    "authentication_provider",
+})
+# Access and supervisor checks share the Runtime vocabulary plus their bounded policy states.
+_DEPENDENCY_STATES = (
+    "unobserved",
+    "ready",
+    "unavailable",
+    "timeout",
+    "misconfigured",
+    "not_ready",
+    "disabled",
+    "degraded",
+    "leader",
+    "standby",
+)
 
 _PROCESSING_INSTRUMENTS = (
+    (
+        "unacknowledged_observed_timestamp_seconds",
+        "Unix time of the unacknowledged snapshot; zero means unobserved.",
+        False,
+    ),
+    ("supervisor_alive", "Whether the owning supervisor task is running.", False),
+    ("leader", "Whether this process holds the supervisor fence.", False),
+    ("degraded", "Whether discovery is degraded.", False),
+    ("blocked", "Locally retained invocations blocked by domain policy.", False),
+    (
+        "discovered_timestamp_seconds",
+        "Unix time of the latest successful discovery pass; zero means unobserved.",
+        False,
+    ),
+    (
+        "last_success_timestamp_seconds",
+        "Unix time of the latest verified acknowledgement; zero means unobserved.",
+        False,
+    ),
+    (
+        "oldest_observed_pending_timestamp_seconds",
+        "Oldest locally observed unfinished admission; zero means none observed.",
+        False,
+    ),
     ("max_workers", "Configured Worker capacity for this Artifact Family.", False),
     ("available_workers", "Available Worker slots for this Artifact Family.", False),
     ("used_workers", "Worker slots currently in use for this Artifact Family.", False),
@@ -51,7 +116,7 @@ _PROCESSING_INSTRUMENTS = (
     ("retry_wait", "Scope invocations retained in this Artifact Family's bounded retry cache.", False),
     (
         "unacknowledged_requests",
-        "Snapshot of Scopes with unacknowledged requests at the latest requested-work discovery pass.",
+        "Snapshot of Scopes with unacknowledged requests at the latest background pending observation.",
         False,
     ),
     ("discovery_seconds", "Duration in seconds of this Artifact Family's most recent discovery pass.", False),
@@ -99,11 +164,45 @@ class _ProcessingMetricsCollector:
             yield instrument
 
 
+class _ModelUsageMetricsCollector:
+    """Render local queue gauges and local plus completed-worker loss counters."""
+
+    def __init__(self) -> None:
+        self.snapshot: tuple[int, int, int, int] | None = None
+        self.worker_losses: tuple[int, int] | None = None
+
+    def collect(self) -> Iterator[Metric]:
+        snapshot = self.snapshot
+        worker_losses = self.worker_losses
+        if snapshot is None and worker_losses is None:
+            return
+        if snapshot is not None:
+            for name, value, description in (
+                ("queue_depth", snapshot[0], "Local queued records, excluding in-flight writes and child queues."),
+                ("queue_capacity", snapshot[1], "Local recorder queue capacity, excluding child queues."),
+            ):
+                yield GaugeMetricFamily("powercontext_server_model_usage_" + name, description, value=value)
+        local_losses = (0, 0) if snapshot is None else snapshot[2:]
+        losses = tuple(local + worker for local, worker in zip(local_losses, worker_losses or (0, 0), strict=True))
+        for name, value, description in zip(
+            ("dropped_records", "write_failures"),
+            losses,
+            (
+                "Dropped records from the local recorder and received child reports; resets on restart.",
+                "Failed/indeterminate writes from the local recorder and received child reports; resets on restart.",
+            ),
+            strict=True,
+        ):
+            yield CounterMetricFamily("powercontext_server_model_usage_" + name, description, value=value)
+
+
 class ServerMetrics:
     """Own one Server instance's Prometheus registry and instruments."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, role: str = "server") -> None:
         self.registry = CollectorRegistry()
+        self.operational = OperationalMetricsCollector(role=role)
+        self._snapshot_lock = RLock()
         ProcessCollector(registry=self.registry)
         PlatformCollector(registry=self.registry)
         GCCollector(registry=self.registry)
@@ -154,8 +253,47 @@ class ServerMetrics:
             ("state",),
             registry=self.registry,
         )
+        self.readiness_states = Gauge(
+            "powercontext_server_readiness_state",
+            "Latest evaluated aggregate readiness, including access and authentication providers.",
+            ("state",),
+            registry=self.registry,
+        )
+        self.readiness_evaluated = Gauge(
+            "powercontext_server_readiness_evaluated_timestamp_seconds",
+            "Unix time readiness was evaluated (probes may be cached).",
+            registry=self.registry,
+        )
+        self.dependency_states = Gauge(
+            "powercontext_server_dependency_state",
+            "Latest evaluated state for exposed dependency checks; missing means not configured or not state-shaped.",
+            ("dependency", "state"),
+            # The passive collector owns the same metric family for dependency
+            # probes. Merge both views in collect() instead of registering twice.
+            registry=None,
+        )
+        self.processing_duration = Histogram(
+            "powercontext_server_artifact_processing_invocation_duration_seconds",
+            "One reaped invocation attempt, including launch, execution and acknowledgement; retries are separate samples.",
+            ("family", "outcome"),
+            buckets=(0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 600, 1800),
+            registry=self.registry,
+        )
+        self._usage = _ModelUsageMetricsCollector()
+        self.registry.register(self._usage)
+        self.worker_usage_reports = Counter(
+            "powercontext_server_model_usage_worker_reports_total",
+            "Worker attempts with a received recorder summary or missing observations; missing is not zero losses.",
+            ("outcome",),
+            registry=self.registry,
+        )
+        self.collection_failures = Counter(
+            "powercontext_server_metrics_collection_failures_total",
+            "Failed passive Runtime snapshot refreshes.",
+            registry=self.registry,
+        )
         self._processing = _ProcessingMetricsCollector()
-        self.registry.register(self._processing)
+        self.registry.register(self)
         self.set_runtime_scopes(0, 0)
 
     def start_transport(self, transport: str, operation: str) -> float:
@@ -195,16 +333,115 @@ class ServerMetrics:
         with suppress(Exception):
             self.runtime_ready.set(1 if ready else 0)
 
+    def observe_model_usage(self, queued: int, capacity: int, dropped: int, failed: int) -> None:
+        with suppress(Exception):
+            self._usage.snapshot = (queued, capacity, dropped, failed)
+
+    def observe_worker_model_usage(self, delta: ArtifactProcessingModelUsageDelta | None) -> None:
+        """Add one attempt's child counters once, independently of durable acknowledgement."""
+        with suppress(Exception):
+            if delta is None:
+                self.worker_usage_reports.labels(outcome="missing").inc()
+                return
+            dropped, failed = self._usage.worker_losses or (0, 0)
+            self._usage.worker_losses = (dropped + delta.dropped_records, failed + delta.write_failures)
+            self.worker_usage_reports.labels(outcome="received").inc()
+
+    def observe_readiness(self, state: str, checks: Mapping[str, str]) -> None:
+        """Publish the last evaluation without executing dependency probes at scrape time."""
+        with self._snapshot_lock, suppress(Exception):
+            for candidate in ("ready", "degraded", "not_ready"):
+                self.readiness_states.labels(state=candidate).set(int(state == candidate))
+            self.dependency_states.clear()
+            for dependency, result in checks.items():
+                if dependency not in _DEPENDENCY_NAMES and not dependency.startswith("artifact_processing."):
+                    continue
+                result = result.split(":", 1)[0]
+                if result not in _DEPENDENCY_STATES:
+                    result = "unavailable"
+                for candidate in _DEPENDENCY_STATES:
+                    self.dependency_states.labels(dependency=dependency, state=candidate).set(int(result == candidate))
+            self.readiness_evaluated.set(time())
+
+    def observe_processing(self, family: str, outcome: str, duration: float) -> None:
+        with suppress(Exception):
+            if len(family) > MAX_ARTIFACT_FAMILY_LENGTH or re.fullmatch(r"[a-z][a-z0-9-]*", family) is None:
+                return
+            if outcome not in {"success", "failure", "blocked", "cancelled", "conflict", "timeout", "leadership_lost"}:
+                return
+            if math.isfinite(duration) and duration >= 0:
+                self.processing_duration.labels(family=family, outcome=outcome).observe(duration)
+
     def set_runtime_scopes(self, cached: int, active: int) -> None:
         for state, value in (("active", active), ("cached", cached)):
             with suppress(Exception):
                 self.runtime_scopes.labels(state=state).set(value)
 
-    def set_processing_families(self, families: Mapping[str, Mapping[str, int | float | str]]) -> None:
-        """Refresh bounded scheduler observations using only registered Family labels."""
+    def set_processing_families(
+        self,
+        supervisor: ArtifactProcessingSnapshotSource | Mapping[str, Mapping[str, int | float | str]] | None,
+    ) -> None:
+        """Refresh a bounded snapshot or source without changing the last good observation on failure."""
 
-        with suppress(Exception):
-            self._processing.replace(families)
+        with self._snapshot_lock:
+            try:
+                if supervisor is None:
+                    families: Mapping[str, Mapping[str, int | float | str]] = {}
+                elif isinstance(supervisor, Mapping):
+                    families = cast(Mapping[str, Mapping[str, int | float | str]], supervisor)
+                else:
+                    families = supervisor.family_status
+                self._processing.replace(families)
+            except Exception:
+                with suppress(Exception):
+                    self.collection_failures.inc()
+
+    def refresh_runtime(self, runtime: BuiltinRuntime | None) -> None:
+        """Stage counts and freshness together; retain both on collection failure."""
+        with self._snapshot_lock:
+            try:
+                supervisor = None if runtime is None else runtime.artifact_processing_supervisor
+                families = {} if supervisor is None else supervisor.family_status
+                processing = _ProcessingMetricsCollector()
+                processing.replace(families)
+                operational = self.operational.prepare(runtime, families=families)
+            except Exception:
+                self.operational.collection_failed()
+                with suppress(Exception):
+                    self.collection_failures.inc()
+                return
+            self._processing = processing
+            self.operational.publish(operational)
+
+    def collect(self) -> Iterator[Metric]:
+        # Capture the pair before yielding: registry readers in other threads must
+        # never combine processing counts with a different freshness observation.
+        with self._snapshot_lock:
+            operational = tuple(self.operational.collect())
+            # Actual dependency probes own their passive states and freshness;
+            # the Server evaluation adds access/authentication and supervisor
+            # checks without emitting duplicate series for shared dependencies.
+            dependency_name = "powercontext_server_dependency_state"
+            states: dict[str, str] = {}
+            for metric in (*self.dependency_states.collect(), *operational):
+                if metric.name == dependency_name:
+                    for sample in metric.samples:
+                        if sample.value == 1:
+                            states[sample.labels["dependency"]] = sample.labels["state"]
+            dependencies = GaugeMetricFamily(
+                dependency_name,
+                "Latest observed dependency state; probe freshness is reported separately.",
+                labels=["dependency", "state"],
+            )
+            for dependency, state in states.items():
+                for candidate in _DEPENDENCY_STATES:
+                    dependencies.add_metric([dependency, candidate], float(state == candidate))
+            snapshot = (
+                *(metric for metric in operational if metric.name != dependency_name),
+                dependencies,
+                *self._processing.collect(),
+            )
+        yield from snapshot
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

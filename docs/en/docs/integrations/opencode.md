@@ -63,6 +63,19 @@ Set `POWERCONTEXT_OPENCODE_CAPTURE_PROMPTS=false` when prompts must not be persi
 
 ## Verify the installation
 
+### Recover a failed refresh
+
+If setup reports that it could not restore a target, keep the backup path named in the error. Restore that backup
+to the reported target before retrying. Setup refuses to treat a missing target with a retained backup as a fresh
+installation.
+
+If an active Skill or multiple backups exist, compare and reconcile their contents before choosing a version.
+Preserve personal files and notes outside managed regions; deleting backups just to bypass the check can discard
+them. After recovery, rerun setup and the checks below. Recovery covers caught filesystem failures; it does not
+guarantee recovery from process crashes or concurrent setups.
+
+### Check the plugin
+
 ```bash
 powercontext doctor
 powercontext doctor opencode
@@ -70,3 +83,7 @@ powercontext doctor opencode
 
 The integration-specific doctor checks the OpenCode version, resolved plugin configuration, and the owned Skill.
 An unavailable Server does not block OpenCode and is checked separately by the default doctor command.
+
+## Automatic input privacy
+
+See [Automatic prompt privacy](index.md#automatic-prompt-privacy) for this host's capture default, disable control, credential recognition limits and independent read-only query handling. Recognized inputs are skipped for capture; accepted Source content and event identity are not rewritten.

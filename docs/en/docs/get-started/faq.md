@@ -1,6 +1,6 @@
 ---
 title: FAQ
-description: Common questions about Memory, Handoff, Experience, Skill, and the knowledge lifecycle.
+description: Common questions about Artifact families, evidence, review, and Agent integrations.
 ---
 
 # Frequently asked questions
@@ -9,32 +9,36 @@ This page answers questions that often come up when learning PowerContext. For a
 underlying model, see [Core concepts](./core-concepts.md). For step-by-step procedures, follow the links to the
 relevant workflow guides.
 
-## The four Artifact families at a glance
+## Artifact families at a glance
 
-**Q: I keep seeing Memory, Handoff, Experience, and Skill. When should I use each?**
+**Q: How do the Artifact families differ, and when should I use each?**
 
-The four families play different roles in the same work loop. Imagine an Agent fixing a CSV parsing bug in
-`amount.py`:
+Imagine an Agent fixing a CSV amount-parsing bug in `amount.py`. Each Artifact family can capture or configure
+a different part of that work:
 
 | Family | Role in the bug-fix story | When to use it |
 | --- | --- | --- |
-| **Memory** | Stores the durable project constraint: "amounts are stored as integer cents; reject anything with more than two decimal places." | A fact, decision, or rule that should hold across many sessions and Agents. |
+| **Atomic Memory** | Stores a project constraint: "amounts are stored as integer cents; reject anything with more than two decimal places." | Store and update individual facts, preferences, decisions, or rules for retrieval in later sessions. |
+| **Topic Memory** | Organizes precision rules, edge cases, and supporting discussions under "CSV amount handling," with a summary and detailed content. | Keep related information together, search summaries first, and expand details as needed. |
+| **Profile** | Summarizes the current Scope's background and working preferences: "This is a financial data import project; the team prefers Chinese explanations and reproducible validation steps." | Provide overall background about a user, team, or project for later interactions. |
 | **Handoff** | Captures "I confirmed the bug is in `cents()`; tomorrow the next Agent should run the failing tests and patch it." | Transferring the current state of unfinished work to another Agent or session. |
 | **Experience** | Records the verified lesson: "Directly calling `int(Decimal(text) * 100)` silently truncated `1.999`; we now check precision before converting." | Preserving what was learned from a specific situation, with evidence. |
-| **Skill** | Packages the reusable procedure: "How to verify amount-conversion fixes — run the test fixture, check edge cases, record results." | A reusable, validated recipe other Agents can load and follow. |
+| **Skill** | Packages the reusable procedure: "How to verify amount-conversion fixes — run the test fixture, check edge cases, record results." | An operational procedure other Agents can load and follow. |
+| **Prompt** | Configures this Scope's memory extraction instructions, such as "preserve currency, precision, and applicable conditions when extracting amount constraints." | Customize supported operation prompts and retain configuration revisions. |
 
-A single bug fix often produces all four: the constraint it honors (Memory), the state it hands over (Handoff),
-the lesson it learned (Experience), and the procedure worth repeating (Skill).
+Choose what to save based on how it will be used later. Each family has its own write or generation workflow;
+capturing a Source does not automatically produce every Artifact in the table.
 
-For details, see [Memory and Handoff](../workflows/memory-and-handoff.md) and
-[Experience and Skill lifecycle](../workflows/experience-and-skill-lifecycle.md).
+For details, see [Atomic Memory](../workflows/atomic-memory.md), [Topic Memory](../workflows/topic-memory.md),
+[Scope Profiles](../workflows/use-profiles.md), [Memory and Handoff](../workflows/memory-and-handoff.md),
+[Experience and Skill lifecycle](../workflows/experience-and-skill-lifecycle.md), and [operation prompts](../workflows/manage-prompts.md).
 
 ## Sources, Candidates, and the knowledge pipeline
 
-**Q: Are Sources, Candidates, and approved Artifacts stages of one mandatory pipeline?**
+**Q: Are Sources, Candidates, and Artifacts stages of one mandatory pipeline?**
 
-No. They are independent values that *can* be combined, but capturing evidence does not by itself produce
-approved knowledge:
+Sources preserve input evidence, while Artifacts preserve versioned results. Workflows that require review
+propose changes through Candidates:
 
 ```text
 Source (evidence) ──┐
@@ -44,54 +48,67 @@ existing Artifact ──┘
 
 - A **Source** is raw evidence — a conversation turn, a tool result, a document.
 - A **Candidate** is a proposal derived from evidence and/or existing Artifacts. It is `pending` until reviewed.
-- An **Artifact** is what you get after approval — an immutable Revision with a stable reference.
+- An **Artifact** is a committed result; each Revision is immutable and has an exact reference.
 
-You can also write Memory directly with `remember_memory` without going through Source extraction or Candidate
-review.
+With generation models and processing configured, Atomic Memory and Topic Memory can be generated and committed
+directly from Sources. Profile generation either commits automatically or requires review, according to policy.
+Generated Experience and Skill proposals are committed after Candidate approval.
+
+Manual writes use the interfaces supported by each family. For example, `remember_memory` and the generic
+Artifact API can create Atomic Memory without model extraction or Candidate review.
 
 **Q: Can a pending Candidate be recalled into `PreparedContext`?**
 
-No. Pending Candidates are excluded from recall. Only approved, current Revisions participate in
-`PreparedContext`. This prevents unreviewed model output from silently becoming the Agent's working context.
+No. A pending Candidate has not been committed as a formal Artifact and is excluded from recall. `PreparedContext`
+selects committed Artifacts subject to authorization, lifecycle, and context configuration. For example, ordinary
+memory recall uses current active Atomic Memory revisions; Profile must be explicitly selected in the assembly
+configuration.
 
 **Q: I approved a Skill Candidate. Why can't my Agent use it yet?**
 
 Approval, installation, and execution are three separate steps:
 
 1. **Approval** creates an immutable Skill Revision in PowerContext.
-2. **Export / install** copies an exact Revision to the Agent host (for example via Remote Skill distribution or
-   manual `download_skill_package`).
-3. **Execution** happens when the Agent's host discovers and loads the installed `SKILL.md`.
+2. **Export / install** places the exact Revision in a directory the Agent host discovers. For Codex, follow
+   [Create and export a Skill](../workflows/create-and-export-skill.md) with `powercontext skill export --target codex`.
+   Downloading a package through `download_skill_package` alone does not establish host installation or discovery.
+3. **Discovery and use** happen on the Agent host. Verify that it discovers the exported `SKILL.md`; loading it does
+   not itself authorize execution of its instructions.
 
 Approving a Skill does not install it; installing it does not execute it. Each step is explicit so that you keep
 control over what runs where.
 
-## Memory
+## Atomic Memory
 
-**Q: What's the difference between Source and Memory?**
+**Q: What's the difference between Source and Atomic Memory?**
 
 - A **Source** is raw evidence: a chat message, a file, an HTTP trace. It is stored as-is.
-- **Memory** is refined knowledge: a decision, a constraint, a fact. It has been deliberately written (either by
-  the application or by an approved extraction pipeline).
+- **Atomic Memory** stores an individual reusable fact, preference, decision, or constraint. An application can
+  write it explicitly, or a model can extract it from Sources and compare it with related memories to decide
+  whether to create, update, or merge.
 
-Sources are inputs; Memory is the result of curation.
+Sources preserve the evidence; Atomic Memory preserves the distilled content and references its supporting evidence.
 
-**Q: I created a Memory through the generic Artifact API but it doesn't show up in `search_memory`. Why?**
+**Q: Can `search_memory` retrieve memories created through the generic Artifact API?**
 
-There are two write paths with different effects:
+Yes. Use `family=atomic-memory` when creating the Artifact. Both paths below create independent Atomic Memories
+in the specified Scope:
 
 | Path | Result |
 | --- | --- |
-| `POST /v1/scopes/{id}/artifacts` with `family=memory` | Creates a standalone Memory Artifact; **not** part of daily recall. |
-| `POST /v1/memory/remember` | Writes to the Scope's default Memory; **is** searched by `search_memory` and used in `prepare_context`. |
+| `POST /v1/scopes/{scope_id}/artifacts` with `family=atomic-memory` | Creates an active memory and updates its current search projection. |
+| `POST /v1/memory/remember` | Creates an active Atomic Memory through the compatibility endpoint and updates the same search projection. |
 
-Use `/v1/memory/remember` for facts you want the Agent to actually recall.
+Successfully committed active memories are eligible for `search_memory` and `prepare_context`; actual results
+still depend on the Scope, authorization, and query conditions. Generic creation with `family=memory` is no longer
+supported. Existing collection databases must first complete the [offline migration](../operate/atomic-memory-migration.md).
 
-**Q: When I revise a Memory, does the old version get deleted?**
+**Q: When I revise an Atomic Memory, does the old version get deleted?**
 
-No. Revisions are immutable. Revising a Memory creates a new Revision and retires the old one from active
-recall, but the old Revision remains readable through `GET .../revisions/{n}`. This gives you an audit trail and
-a way to recover earlier wording.
+No. Revising creates a new content Revision and advances the current head while preserving the memory's lifecycle
+state. Ordinary search uses the current content of active memories. Earlier versions remain readable through
+`GET /v1/scopes/{scope_id}/artifacts/atomic-memory/{id}/revisions/{n}`. Restoring historical content creates a new
+Revision and preserves existing history. See [Atomic Memory](../workflows/atomic-memory.md).
 
 ## Handoff
 

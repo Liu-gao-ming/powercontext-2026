@@ -14,6 +14,8 @@
 
 """Normalized dashboard read failures."""
 
+from __future__ import annotations
+
 
 class ReadError(Exception):
     def __init__(self, status: int, code: str, request_id: str | None = None) -> None:
@@ -21,3 +23,15 @@ class ReadError(Exception):
         self.code = code
         self.request_id = request_id
         super().__init__(code)
+
+    @classmethod
+    def from_exception(cls, error: Exception) -> ReadError:
+        from powercontext.server.app import _map_error
+        from powercontext.server.context import current_request_id
+
+        if isinstance(error, cls):
+            return error
+        if isinstance(error, TimeoutError):
+            return cls(503, "service_unavailable", current_request_id())
+        status, code, _, _ = _map_error(error)
+        return cls(status, code, current_request_id())

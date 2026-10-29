@@ -1,0 +1,57 @@
+{
+  "preparation_version": "xnli-reference-v1",
+  "source": {
+    "dataset": "xnli-1.0",
+    "archive_sha256": "4ba1d5e1afdb7161f0f23c66dc787802ccfa8a25a3ddd3b165a35e50df346ab1",
+    "source_url": "https://dl.fbaipublicfiles.com/XNLI/XNLI-1.0.zip",
+    "license": "CC-BY-NC-4.0",
+    "preparation_version": "xnli-reference-v1"
+  },
+  "manifest_hashes": {
+    "calibration": "d52407d61be9847c568dce63eaeba778ed41b51e81dd1904f84df5dc0c39aad5",
+    "held_out": "ea3735a786c9e5e17be4f7fed2c5602f71e608bd0244987ba6275cef00bcd0ab"
+  },
+  "excluded_groups": {
+    "within_split_repeated_text": 304
+  },
+  "splits": {
+    "calibration": {
+      "cases": 600,
+      "source_pairs": 300,
+      "labels_by_language": {
+        "en": {
+          "neutral": 100,
+          "contradiction": 100,
+          "entailment": 100
+        },
+        "zh": {
+          "neutral": 100,
+          "contradiction": 100,
+          "entailment": 100
+        }
+      }
+    },
+    "held_out": {
+      "cases": 1800,
+      "source_pairs": 900,
+      "labels_by_language": {
+        "en": {
+          "contradiction": 300,
+          "entailment": 300,
+          "neutral": 300
+        },
+        "zh": {
+          "contradiction": 300,
+          "entailment": 300,
+          "neutral": 300
+        }
+      }
+    }
+  },
+  "measurement_status": "not_run",
+  "limitations": [
+    "sentence_pair_benchmark",
+    "training_overlap_unknown",
+    "not_production_write_distribution"
+  ]
+}

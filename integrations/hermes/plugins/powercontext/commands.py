@@ -344,11 +344,11 @@ def group_command(provider: Any, group: str, args: list[str]) -> str:
             "import": "import_external_skill",
         },
         "review": {
-            "list": "list_artifact_candidates",
-            "get": "get_artifact_candidate",
-            "approve": "approve_artifact_candidate",
-            "reject": "reject_artifact_candidate",
-            "revise": "revise_artifact_candidate",
+            "list": "list_candidates",
+            "get": "get_candidate",
+            "approve": "approve_candidate",
+            "reject": "reject_candidate",
+            "revise": "revise_candidate",
         },
     }
     aliases = operation_aliases[group]
@@ -356,7 +356,7 @@ def group_command(provider: Any, group: str, args: list[str]) -> str:
     if action not in aliases:
         return f"Usage: /pc {group} {{" + "|".join(aliases) + "}} PAYLOAD_JSON"
     operation = aliases[action]
-    if operation in {"scan_external_skills", "list_artifact_candidates"} and not args[1:]:
+    if operation in {"scan_external_skills", "list_candidates"} and not args[1:]:
         payload = {} if operation == "scan_external_skills" else {"status": "pending"}
         return json.dumps(request_operation(provider, operation, payload), ensure_ascii=False, indent=2)
     return operation_command(provider, operation, args[1:])
@@ -614,6 +614,21 @@ def get_tool_schemas() -> list[dict[str, Any]]:
 
     json_object = {"type": "object", "additionalProperties": True}
     json_array = {"type": "array", "items": json_object}
+    handoff_rollover_reasons = {
+        "type": "array",
+        "items": {
+            "type": "string",
+            "enum": [
+                "user_requested",
+                "host_context_budget",
+                "host_compaction",
+                "context_quality",
+                "delegation",
+                "manual_checkpoint",
+            ],
+        },
+        "maxItems": 6,
+    }
     schemas.extend([
         _operation_schema(
             "powercontext_prepare_context",
@@ -760,6 +775,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 "boundary_source": json_object,
                 "objective": {"type": "string"},
                 "evidence": json_array,
+                "rollover_reasons": handoff_rollover_reasons,
                 "max_bytes": {"type": "integer", "minimum": 512, "maximum": 32768},
             },
             ("boundary_source", "objective"),
@@ -776,6 +792,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             {
                 "objective": {"type": "string"},
                 "evidence": json_array,
+                "rollover_reasons": handoff_rollover_reasons,
                 "max_bytes": {"type": "integer", "minimum": 512, "maximum": 32768},
             },
             ("objective", "evidence"),
@@ -945,7 +962,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             ("external_skill_id", "fingerprint", "mode"),
         ),
         _operation_schema(
-            "powercontext_list_artifact_candidates",
+            "powercontext_list_candidates",
             (
                 "List PowerContext artifact candidates when the user wants to inspect the review queue. This is not a "
                 "Memory inventory or historical search. Report pending, approved, or rejected status as returned; "
@@ -959,7 +976,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             },
         ),
         _operation_schema(
-            "powercontext_get_artifact_candidate",
+            "powercontext_get_candidate",
             (
                 "Inspect one PowerContext artifact candidate by candidate_id before discussing a requested review. "
                 "Read its proposal, evidence, status, and version. Inspection grants no approval authority; do not "
@@ -969,7 +986,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             ("candidate_id",),
         ),
         _operation_schema(
-            "powercontext_approve_artifact_candidate",
+            "powercontext_approve_candidate",
             (
                 "Approve an inspected pending candidate only on an explicit human decision for that exact candidate "
                 "and version, using the current authorization channel. A request to list, summarize, generate, or "
@@ -980,7 +997,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             ("candidate_id", "expected_version"),
         ),
         _operation_schema(
-            "powercontext_reject_artifact_candidate",
+            "powercontext_reject_candidate",
             (
                 "Reject an inspected pending candidate only when the user explicitly requests that decision. Supply "
                 "its exact current version and the requested reason. A negative assessment alone does not authorize a "
@@ -994,7 +1011,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             ("candidate_id", "expected_version", "reason"),
         ),
         _operation_schema(
-            "powercontext_revise_artifact_candidate",
+            "powercontext_revise_candidate",
             (
                 "Revise an inspected candidate proposal only when the user explicitly requests the change. Preserve "
                 "exact provenance and current version. Revision is not approval, publication, installation, or "

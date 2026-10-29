@@ -28,7 +28,12 @@ from powercontext.artifacts.search import ArtifactSearchExecutionContext
 from powercontext.builtin.artifacts.atomic_memory.errors import AtomicMemoryConflictError
 from powercontext.builtin.artifacts.experience import EXPERIENCE_INCUBATION_CURSOR_NAME
 from powercontext.builtin.artifacts.profile.models import PROFILE_SOURCE_WINDOW_BINDING
-from powercontext.builtin.dream.bindings import SKILL_DREAM_BINDING
+from powercontext.builtin.dream.bindings import (
+    HANDOFF_DREAM_BINDING,
+    PROMPT_DREAM_BINDING,
+    SKILL_DREAM_BINDING,
+    operations_for_binding,
+)
 from powercontext.builtin.dream.generation import DreamGenerator
 from powercontext.builtin.inference.usage import bind_usage_reporter
 from powercontext.builtin.persistence.dream import DreamRepository
@@ -40,6 +45,7 @@ from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkerOutcome,
 )
 from powercontext.builtin.runtime.processing_execution import InvocationAlreadyHandled, ScopeInvocation
+from powercontext.builtin.runtime.worker_observability import worker_observability
 from powercontext.builtin.sources import BUILTIN_SOURCE_REGISTRY
 from powercontext.builtin.statistics import ModelUsagePurpose
 from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
@@ -57,6 +63,8 @@ FAMILY_BINDINGS = {
     "experience": EXPERIENCE_INCUBATION_CURSOR_NAME,
     "profile": PROFILE_SOURCE_WINDOW_BINDING,
     "skill": SKILL_DREAM_BINDING,
+    "handoff": HANDOFF_DREAM_BINDING,
+    "prompt": PROMPT_DREAM_BINDING,
 }
 logger = logging.getLogger(__name__)
 
@@ -88,19 +96,22 @@ async def _run_family_worker(
         open_builtin_contexts,
     )
 
+    observation = worker_observability.get()
+    instrumentation = None if observation is None else observation.instrumentation
+    tracing = None if observation is None else observation.tracing
     config = spec.config
     async with AsyncExitStack() as resources:
         pipelines = await _generation_pipelines(
-            config.inference, config.runtime, resources, None, BUILTIN_SOURCE_REGISTRY
+            config.inference, config.runtime, resources, instrumentation, BUILTIN_SOURCE_REGISTRY
         )
         decision_model = _fail_open_decision_model(
             None,
             pipelines[7],
-            None,
+            tracing,
             timeout_seconds=config.inference.decision_timeout_seconds or config.inference.generation_timeout_seconds,
         )
         memory_write_gate = _configured_memory_write_gate(None, decision_model, config.runtime)
-        embedding, _ = await _embedding_models(config.inference, resources, None)
+        embedding, _ = await _embedding_models(config.inference, resources, instrumentation)
         contexts = await resources.enter_async_context(
             open_builtin_contexts(
                 config,
@@ -116,8 +127,18 @@ async def _run_family_worker(
                         ("atomic_memory.extract", None, pipelines[1]),
                         ("atomic_memory.reconcile", None, pipelines[1]),
                         ("experience.incubate", None, pipelines[2]),
+                        ("experience.generate", None, pipelines[3]),
+                        ("skill.generate", None, pipelines[4]),
+                        ("handoff.generate", None, pipelines[5]),
+                        ("memory.rerank", None, pipelines[6]),
+                        *(
+                            (f"topic_memory.{stage}", None, object())
+                            for stage in ("probe", "global", "planner", "evolve", "temporary", "reduce", "reconcile")
+                            if config.inference.generation_model is not None
+                        ),
                     ),
                 ),
+                tracing=tracing,
                 _topic_memory_worker=True,
             )
         )
@@ -132,17 +153,17 @@ async def _run_family_worker(
                 open_worker_security(spec.worker_security, contexts.database)
             )
         generator = None
-        if assignment.artifact_family in {"experience", "skill"} and config.runtime.dream_enabled:
+        operations = operations_for_binding(assignment.binding_name)
+        if operations and config.runtime.dream_enabled:
             async with contexts.database.transaction() as connection:
-                operation = "derive_skill" if assignment.artifact_family == "skill" else "refine_experience"
                 record = await DreamRepository().next_pending(
                     connection,
                     assignment.scope_id,
-                    operation,
+                    operations,
                     through_generation=assignment.claimed_request_generation,
                 )
             if record is not None:
-                generator = await _dream_generator(config.inference, record.run.budget, resources, None)
+                generator = await _dream_generator(config.inference, record.run.budget, resources, instrumentation)
         return await process_family_invocation(
             contexts, assignment, config=config, security=security, dream_generator=generator
         )
@@ -162,6 +183,9 @@ async def process_family_invocation(
         "memory": ModelUsagePurpose.MEMORY_EXTRACTION,
         "experience": ModelUsagePurpose.EXPERIENCE_GENERATION,
         "skill": ModelUsagePurpose.SKILL_GENERATION,
+        "handoff": ModelUsagePurpose.HANDOFF_GENERATION,
+        "profile": ModelUsagePurpose.PROFILE_GENERATION,
+        "prompt": ModelUsagePurpose.PROMPT_GENERATION,
     }.get(assignment.artifact_family)
     with bind_usage_reporter(
         # The runtime-owned recorder writes this window's usage, so the worker's
@@ -195,18 +219,18 @@ async def _process_family_invocation(  # noqa: C901 - one guarded dispatch per r
         authorize_transaction=None if security is None else partial(security.authorize_transaction, scope_id=scope),
     )
     try:
-        if assignment.artifact_family in {"experience", "skill"}:
+        if operations_for_binding(assignment.binding_name):
             from powercontext.builtin.runtime.dream_processing import process_dream_invocation
 
             if await process_dream_invocation(
                 contexts, assignment, config=config, generator=dream_generator, security=security
             ):
                 return ArtifactProcessingWorkerCompletion()
-            if assignment.artifact_family == "skill":
+            if assignment.artifact_family in {"skill", "handoff", "prompt"}:
                 async with contexts.database.transaction() as connection:
                     await invocation.start(connection)
                     await invocation.complete(connection, remaining_work=False)
-                return ArtifactProcessingWorkerCompletion()
+                return ArtifactProcessingWorkerCompletion(noop=True)
         if assignment.artifact_family == "memory":
             atomic_context = (
                 None
@@ -223,13 +247,15 @@ async def _process_family_invocation(  # noqa: C901 - one guarded dispatch per r
             )
             if result.held_count:
                 return ArtifactProcessingWorkerCompletion(held_count=result.held_count, hold_codes=result.hold_codes)
+            return ArtifactProcessingWorkerCompletion(noop=not result.processed)
         elif assignment.artifact_family == "experience":
-            await contexts.incubate_experience(
+            experience_result = await contexts.incubate_experience(
                 scope,
                 config.runtime.source_window_limit,
                 processing=invocation,
                 on_commit=None if security is None else partial(security.experience_commit, scope_id=scope),
             )
+            return ArtifactProcessingWorkerCompletion(noop=not experience_result.processed)
         else:
             result = await contexts.profiles.flush(
                 scope,
@@ -242,8 +268,9 @@ async def _process_family_invocation(  # noqa: C901 - one guarded dispatch per r
             )
             if result.status == "conflict":
                 return ArtifactProcessingWorkerCompletion(ArtifactProcessingWorkerOutcome.HEAD_CONFLICT)
+            return ArtifactProcessingWorkerCompletion(noop=result.status in {"noop", "disabled"})
     except InvocationAlreadyHandled:
-        return ArtifactProcessingWorkerCompletion()
+        return ArtifactProcessingWorkerCompletion(noop=True)
     except GenerationConflictError:
         return ArtifactProcessingWorkerCompletion(ArtifactProcessingWorkerOutcome.CURSOR_CONFLICT)
     except RevisionConflictError:

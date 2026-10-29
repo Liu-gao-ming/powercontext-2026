@@ -131,14 +131,14 @@ boundary flushing fail open; explicit durable writes require interactive confirm
 Set `POWERCONTEXT_SCOPE_ID` to an existing ID returned by `create_scope` before running scoped content commands.
 
 ```text
-powercontext setup <host>
-powercontext setup select --host codex --host dsh
+powercontext setup [agents...]
+powercontext setup codex dsh
+powercontext config agent codex dsh --server-url https://memory.example
 powercontext config init --output .env
 powercontext config show --env-file .env
 powercontext config validate --env-file .env
 powercontext doctor
-powercontext doctor <host>
-powercontext doctor integrations
+powercontext doctor codex dsh
 powercontext server run
 powercontext server run --env-file .env
 powercontext ready
@@ -165,15 +165,23 @@ The `config` group creates, redacts, and validates an explicit environment file.
 current directory; pass `--env-file` to select another file or `--no-env-file` to disable discovery. See
 [Configuration](../operate/configuration.md) for precedence and credential-handling rules.
 
-Use `codex`, `claude-code`, `dsh`, `hermes`, `openclaw`, `opencode`, `pi`, or `workbuddy` for `<host>`.
-The first-class catalog used by `setup select` and `doctor integrations` contains every listed host except WorkBuddy.
-WorkBuddy remains available through the explicit `setup workbuddy` and `doctor workbuddy` commands.
+Use `codex`, `claude-code`, `dsh`, `hermes`, `kimi-code`, `openclaw`, `opencode`, `pi`, `workbuddy`, or `zcode` for agents.
+`powercontext setup` offers interactive selection; explicit agent names support non-interactive and multi-agent setup.
+Setup installs, configures, activates where supported, and runs doctor. Failures remain isolated per agent; completed installation is reported even when diagnostics fail.
 
-`powercontext doctor` checks the package and Server without requiring an integration. `powercontext doctor integrations`
-prints a read-only matrix for every first-class host; a missing CLI is `missing` and does not fail the command.
-Each `powercontext doctor <host>` command still fails when that host CLI is missing. The matrix preserves every
-host-specific integration check, including OpenCode's separate `plugin` and `skill` results. DSH checks that
-`dump-config` lists `powercontext-dsh`; Pi checks that the CLI lists the PowerContext package.
+`powercontext config agent [agents...]` updates installed connections without reinstalling or enabling plugins.
+`powercontext doctor [agents...]` checks the selected agents, or saved connections when none are selected.
+With no saved connections, doctor checks the package and Server. Selected agents with a missing required CLI fail their own checks.
+Doctor preserves host-specific checks, including OpenCode's separate `plugin` and `skill` results. DSH checks its native registration; Pi checks its registered package.
+
+The unified HTTP review routes are `/v1/candidates/list`, `get`, `history`, `revise`, `approve`, and `reject` (all POST).
+`candidate_kind=artifact|tag` distinguishes proposals. Old Artifact Candidate routes are removed; callers must upgrade together.
+Artifact approval returns a real revision; Tag approval returns committed tags and ETag without creating a content revision.
+
+Review decisions remain available through MCP. With access control enforced, Server authorization requires
+`scope.review`; it does not prohibit an authorized proposer from approving its own Candidate. MCP tool annotations let
+hosts apply confirmation policies but do not require human confirmation. See
+[Review authority](../workflows/review-candidates.md#review-authority) for access modes and reviewer separation.
 
 The `candidate` command group exposes the human Review Inbox. See [Review Candidates](../workflows/review-candidates.md)
 for the ordered workflow to list, inspect, revise, approve, or reject Candidates.
@@ -206,13 +214,24 @@ sets `target`. Managed Skill generation also declares its provenance shape:
 
 These generation operations require `POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL`. The lower-level `propose_*`
 operations remain available for a human or integration that already has complete typed content and exact evidence.
-Neither path approves its own Candidate. After Review approval, deterministic `searchable_text` is stored on the
-existing generic Artifact head and enters the backend's rebuildable FTS index, making the Experience eligible for
+Both paths return pending content; approval is a separate operation. After Review approval, deterministic
+`searchable_text` is stored on the existing generic Artifact head and enters the backend's rebuildable FTS index, making the Experience eligible for
 `PreparedContext` recall in the same scope. Pending and rejected Candidates, all managed Skills, and historical
 Experience revisions remain excluded.
 
 For the relationship between evidence, Candidate versions, approved Revisions, recall, and export, see
 [Experience and Skill lifecycle](../workflows/experience-and-skill-lifecycle.md).
+
+## Scheduled Atomic Memory processing
+
+The built-in Source-window schedule compares journal positions with its own persisted consumption cursor before
+activating a Scope. Fully consumed journals skip scoped processing, while buffered windows remain eligible on later
+ticks without requiring another captured Source. Discovery is advisory: authorization and cursor/window checks
+still run in the selected Scope's processing operation, and captures committed after discovery remain visible to
+subsequent ticks.
+
+This selection applies to the built-in Source-window policy. A directly assembled Runtime with a custom Scope
+selector retains that selector, and Experience incubation uses its independent cursor and schedule.
 
 ## Scheduled Experience incubation
 
@@ -290,13 +309,19 @@ contract. The Server publishes a Scalar API reference at `/docs`, its OpenAPI do
 `/health/ready`, capabilities at `/v1/capabilities`, and Streamable HTTP MCP at `/mcp` by default. The Scalar reference
 remains public when bearer authentication is enabled, but the operations it describes retain their normal authentication
 requirements. HTTP is the complete application contract. MCP is a curated Agent-facing projection of Source capture,
-Memory maintenance, work continuity, scope Handoff Report lookup, and Candidate Review. The five Candidate Review
+Memory maintenance, work continuity, scope Handoff Report lookup, and Candidate Review. The six Candidate Review
 operations use the same validation, `expected_version` concurrency checks, and approval transaction over HTTP and MCP.
 Readiness is `ready` with HTTP 200 when all checks pass, `degraded` with HTTP 200 when only configured inference checks
 fail, and `not_ready` with HTTP 503 when the Runtime or database fails. Dependency checks use `ready`, `unavailable`,
 `timeout`, or `misconfigured`; an intentionally unbound Runtime reports `not_ready` for the `runtime` check.
 Experience and Skill generation, exact reads, external Registry operations, and low-level proposal operations remain
 HTTP-only.
+
+MCP uses stateless Streamable HTTP and does not issue MCP session IDs. When authentication is enabled, each
+request uses its own verified identity and current group membership. Scopes, Memory, and Handoffs remain
+persisted in the Runtime. Reconnect MCP clients after upgrading; cross-request SSE stream resumption is
+unavailable.
+
 `POST /v1/context/prepare` and the matching Python Client method expose final ephemeral `PreparedContext` over HTTP;
 the Runtime recalls active Memory and approved Experience heads, owns their shared selection and total output budget,
 and intentionally does not project the operation as an MCP tool. The public schema remains

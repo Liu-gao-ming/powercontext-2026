@@ -26,6 +26,8 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import URL
 
+from powercontext._logging import log_context
+
 PROFILE_JOB_ID = "powercontext.profile.source-window.v1"
 SOURCE_WINDOW_JOB_ID = "powercontext.memory.source-window.v1"
 EXPERIENCE_INCUBATION_JOB_ID = "powercontext.experience.incubation.v1"
@@ -103,13 +105,15 @@ def unregister_processor(runtime_key: str) -> None:
 async def dispatch_source_windows(runtime_key: str) -> None:
     """Dispatch a persisted job to the live runtime owning its database."""
 
-    await _processor(runtime_key, _SOURCE_WINDOW_PROCESSOR)()
+    with log_context({"request_id": None}):
+        await _processor(runtime_key, _SOURCE_WINDOW_PROCESSOR)()
 
 
 async def dispatch_experience_incubation(runtime_key: str) -> None:
     """Dispatch persisted Experience incubation to its live Runtime."""
 
-    await _processor(runtime_key, _EXPERIENCE_INCUBATION_PROCESSOR)()
+    with log_context({"request_id": None}):
+        await _processor(runtime_key, _EXPERIENCE_INCUBATION_PROCESSOR)()
 
 
 def _processor(runtime_key: str, name: str) -> Processor:
@@ -213,7 +217,8 @@ def _configure_interval_job(
 
 
 async def dispatch_profile_windows(runtime_key: str) -> None:
-    await _processor(runtime_key, "profile")()
+    with log_context({"request_id": None}):
+        await _processor(runtime_key, "profile")()
 
 
 def configure_profile_job(scheduler, *, runtime_key: str, cron: str | None, timezone: str) -> None:

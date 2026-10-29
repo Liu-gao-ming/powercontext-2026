@@ -135,7 +135,7 @@ def test_subject_dual_write_rejects_revoked_target_contribution(tmp_path, explic
             first = await client.post(path, json=payload)
             assert first.status_code == 201, first.text
             target = first.json()["subject_scope_id"]
-            # Materialize the static preset before revoking every contribution grant.
+            # Creation initializes the preset; revocation must survive later reads and writes.
             scope = await client.get(f"/v1/scopes/{target}")
             assert scope.status_code == 200, scope.text
             bindings = await client.post(
@@ -227,15 +227,13 @@ def test_profile_http_policy_crud_review_and_rollback(tmp_path, enforced):
             assert pending.status_code == 200, pending.text
             candidate_id = pending.json()["candidate_id"]
             assert candidate_id
-            candidate = await client.post(
-                "/v1/artifact-candidates/get", json={"scope_id": sid, "candidate_id": candidate_id}
-            )
+            candidate = await client.post("/v1/candidates/get", json={"scope_id": sid, "candidate_id": candidate_id})
             assert {ref["name"] for ref in candidate.json()["source_refs"]} == {"note", "content"}
             assert {ref["source_id"] for ref in candidate.json()["source_refs"] if ref["name"] == "note"} == set(
                 remote_ids
             )
             approved = await client.post(
-                "/v1/artifact-candidates/approve",
+                "/v1/candidates/approve",
                 json={
                     "scope_id": sid,
                     "candidate_id": candidate_id,
@@ -294,11 +292,15 @@ def test_profile_http_policy_crud_review_and_rollback(tmp_path, enforced):
                 headers={"If-Match": replaced.headers["ETag"]},
                 json={
                     "content": {"content": first.json()["content"]["content"], "restored_from_revision": 1},
+                    "reason": "Restore the approved profile",
                 },
             )
             assert rollback.status_code == 200, rollback.text
             assert rollback.json()["revision"] == 3
             assert rollback.json()["content"]["generation"]["mode"] == "rollback"
+            assert rollback.json()["restored_from_revision"] == 1
+            assert rollback.json()["reason"] == "Restore the approved profile"
+            assert rollback.json()["created_at"]
             assert (await client.get(artifact_path + "/revisions/1")).json()["content"] == first.json()["content"]
 
     asyncio.run(run())

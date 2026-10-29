@@ -35,7 +35,7 @@ const COMPATIBILITY_OR_AVAILABILITY_PATHS = new Set([
 
 // Only public protocol codes may cross the diagnostic/model boundary.
 const PUBLIC_ERROR_CODES = new Set([
-  'not_found', 'scope_not_found', 'memory_not_found', 'artifact_not_found',
+  'not_found', 'scope_not_found', 'memory_not_found', 'artifact_not_found', 'artifact_handle_not_found',
   'candidate_not_found', 'handoff_evidence_not_found', 'source_definition_not_found',
   'external_skill_not_found', 'conflict', 'revision_conflict', 'memory_entry_inactive',
   'memory_capacity_exceeded', 'tag_precondition_failed',

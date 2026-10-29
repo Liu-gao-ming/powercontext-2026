@@ -17,14 +17,15 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from sqlalchemy import update
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
-from powercontext.builtin.artifacts.experience import ExperienceContent, ExperienceDraft, ExperienceSearchOutcome
+from powercontext.builtin.artifacts.experience import ExperienceContent, ExperienceDraft
 from powercontext.builtin.persistence.artifacts import ArtifactRepository
-from powercontext.builtin.persistence.errors import RepositoryNotFoundError
+from powercontext.builtin.persistence.errors import InvalidPublicationLineageError, RepositoryNotFoundError
 from powercontext.builtin.persistence.experience_index import NoExperienceIndex
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
-from powercontext.builtin.persistence.tables import BUILTIN_TABLES
+from powercontext.builtin.persistence.tables import ARTIFACT_PUBLICATIONS_TABLE, BUILTIN_TABLES
 from powercontext.builtin.publication import (
     ArtifactPublicationApplication,
     ArtifactPublicationConflictError,
@@ -41,7 +42,7 @@ class _IndexUnavailableError(RuntimeError):
     pass
 
 
-class _FailingExperienceIndex:
+class _FailingExperienceIndex(NoExperienceIndex):
     async def initialize(self, _connection, /) -> None:
         pass
 
@@ -51,18 +52,8 @@ class _FailingExperienceIndex:
     async def replace(self, _connection, _scope_id, _experience, /) -> None:
         raise _IndexUnavailableError
 
-    async def search(
-        self, _connection, _scope_id, _query, _limit, /, *, admission=None, min_score=None, require_scores=False
-    ):
-        return ExperienceSearchOutcome()
-
     async def replace_skill(self, _connection, _scope_id, _skill, _package, /) -> None:
         pass
-
-    async def search_skills(
-        self, _connection, _scope_id, _query, _limit, /, *, admission=None, min_score=None, require_scores=False
-    ):
-        return ()
 
 
 def test_publication_copies_one_exact_revision_with_original_provenance(tmp_path) -> None:
@@ -137,6 +128,27 @@ def test_publication_copies_one_exact_revision_with_original_provenance(tmp_path
 
             assert relay_copy.lineage.publication_source == request.source
             assert relay_copy.lineage.publication_digest == published.content_digest
+            for source, digest in (
+                (relayed.target, published.content_digest),
+                (published.target, "0" * 64),
+            ):
+                async with profile.database.transaction() as connection:
+                    await connection.execute(
+                        update(ARTIFACT_PUBLICATIONS_TABLE)
+                        .where(
+                            ARTIFACT_PUBLICATIONS_TABLE.c.target_scope_id == relayed.target.scope_id,
+                            ARTIFACT_PUBLICATIONS_TABLE.c.target_artifact_id == relayed.target.artifact.artifact_id,
+                        )
+                        .values(
+                            source_scope_id=source.scope_id,
+                            source_family=source.artifact.family,
+                            source_artifact_id=source.artifact.artifact_id,
+                            source_revision=source.artifact.revision,
+                            content_digest=digest,
+                        )
+                    )
+                    with pytest.raises(InvalidPublicationLineageError):
+                        await artifacts.get(connection, relayed.target.scope_id, relayed.target.artifact)
 
     asyncio.run(scenario())
 

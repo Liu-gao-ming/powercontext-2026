@@ -180,16 +180,21 @@ Principal，并注入 Authorization Provider。HTTP 与 MCP 使用同一个策�
 | --- | --- | --- |
 | 健康与能力 | `/health/*`、`/v1/capabilities` | 探测部署状态并查看已启用的 Runtime 行为 |
 | Access Control | `/v1/access/*` | 查看身份、检查决策，并管理 role、Binding 和审计事件 |
-| Source 与 Context | `/v1/sources/content`、`/v1/context/prepare` | 采集证据并准备有界 Context |
+| Source 与 Context | `/v1/sources/content`、`/v1/scopes/{scope_id}/subject-sources`、`/v1/context/prepare` | 采集证据、向业务与主体 Scope 写入 Source，并准备有界 Context |
 | 工作连续性 | `/v1/work/*` | 创建 Work Contract、准备或确认 Handoff、记录 Outcome |
 | 底层 Handoff | `/v1/handoff/*` | activate、prepare、finalize、commit 或 continue Handoff |
-| Atomic Memory | `/v1/atomic-memory/*`、通用 Artifact 路由 | 检索、管理列表、状态、合并、遗忘和恢复；内容通过通用 Artifact 接口读写 |
+| Atomic Memory | `/v1/atomic-memory/*`、`/v1/scopes/{scope_id}/artifacts/*`（`family=atomic-memory`） | 检索、管理列表、状态、合并、遗忘和恢复；创建、读取、修订正文及查询历史 |
 | Memory 兼容入口 | `/v1/memory/*` | 保留 flush、remember、search、list 和旧身份读取；旧集合修改返回明确的不支持错误 |
+| Topic Memory | `/v1/topic-memory/*`、`/v1/scopes/{scope_id}/artifacts/*`（`family=topic-memory`） | 请求后台处理、检索和展开主题；创建、读取、修订正文及查询历史 |
+| Profile | `/v1/profile/*`、`/v1/scopes/{scope_id}/profile-policy`、`/v1/scopes/{scope_id}/artifacts/*`（`family=profile`） | 处理画像生成、配置生成策略、读写画像及查询历史 |
 | Experience 与 Skill | `/v1/experience/*`、`/v1/skill/*`、`/v1/skills/*` | propose、review、打包、治理、分发并读取 managed Skill Revision |
-| 审核 | `/v1/artifact-candidates/*` | 列出、检查、修订、批准或拒绝 pending Candidate |
+| 审核 | `/v1/candidates/*` | 列出、检查、修订、批准或拒绝 pending Candidate |
 | 外部 Skill | `/v1/external-skills/*` | 扫描已配置 target，解析或导入 package |
 | Handoff Report | `/v1/handoff-reports/*` | 按 Scope selection 生成只读报告 |
 | 统计 | `/v1/stats` | 读取指定 scope 的使用统计 |
+
+创建 Artifact 使用 `POST /v1/scopes/{scope_id}/artifacts`，在请求体中指定 `family`。
+Profile 的候选审核复用 `/v1/candidates/*`。
 
 完整路径、schema、限制和状态码以 OpenAPI 契约为准。高层工作流和 Python 示例见[接口](interfaces.md)。
 

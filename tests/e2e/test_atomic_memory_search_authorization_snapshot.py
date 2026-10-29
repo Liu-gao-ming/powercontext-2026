@@ -30,11 +30,13 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 
+from powercontext.artifacts import ArtifactSearchExecutionContext
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
 from powercontext.builtin.inference import EmbeddingResult
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.seekdb import SeekDBConfig
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
+from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
 from powercontext.builtin.runtime.atomic_memory import AtomicMemoryAccess
 from powercontext.builtin.runtime.config import DatabaseConfig, RuntimeConfig
 from powercontext.client import ForbiddenResponseError, PowerContextClient
@@ -51,10 +53,19 @@ from powercontext.server.authentication import (
     AuthenticationResult,
     ProviderReadiness,
 )
-from powercontext.server.authz import PrincipalRef
+from powercontext.server.authz import (
+    AccessAuditContext,
+    AccessDeniedError,
+    AccessRole,
+    CreateBinding,
+    PrincipalRef,
+    ResourceRef,
+)
 from powercontext.server.authz.composition import open_builtin_access_control, open_casbin_access_control
+from powercontext.server.authz.service import AccessControlService
 from powercontext.server.factory import create_server_app
 from powercontext.server.settings import AccessControlConfig, McpConfig, MetricsConfig, ServerSettings
+from tests.e2e.server_storage import prepare_server_database
 
 ADMIN = PrincipalRef(type="service", id="admin")
 VIEWER = PrincipalRef(type="user", id="viewer")
@@ -101,7 +112,7 @@ async def _isolated_database(backend: str, tmp_path: Path) -> AsyncIterator[Data
         if importlib.util.find_spec("pylibseekdb") is None:
             pytest.skip("install powercontext[seekdb] for the real embedded backend")
         # Keep the embedded engine's Unix socket within sockaddr_un's limit.
-        with TemporaryDirectory(prefix="pc-search-", dir="/tmp") as directory:
+        with TemporaryDirectory(prefix="pc-search-", dir="/var/tmp") as directory:
             yield SeekDBConfig(path=Path(directory) / "db")
         return
     configured_url = os.environ.get("POWERCONTEXT_TEST_OCEANBASE_URL")
@@ -121,16 +132,23 @@ async def _isolated_database(backend: str, tmp_path: Path) -> AsyncIterator[Data
 
 @asynccontextmanager
 async def _server(database: DatabaseConfig, provider: str, tmp_path: Path, embedding: _Embedding):
+    settings = ServerSettings(
+        database=database,
+        runtime=RuntimeConfig(artifact_processing_families=()),
+        access=AccessControlConfig(mode="enforced", deployment_id=DEPLOYMENT_ID),
+        metrics=MetricsConfig(enabled=False),
+        mcp=McpConfig(enabled=False),
+    )
+    await asyncio.to_thread(
+        prepare_server_database,
+        settings,
+        evidence_dir=tmp_path / "migration-evidence",
+        embedding_profile=embedding.profile,
+    )
     open_access = open_builtin_access_control if provider == "builtin" else open_casbin_access_control
     async with open_access(database, bootstrap_administrators=(ADMIN,), deployment_id=DEPLOYMENT_ID) as access:
         app = create_server_app(
-            settings=ServerSettings(
-                database=database,
-                runtime=RuntimeConfig(artifact_processing_families=()),
-                access=AccessControlConfig(mode="enforced", deployment_id=DEPLOYMENT_ID),
-                metrics=MetricsConfig(enabled=False),
-                mcp=McpConfig(enabled=False),
-            ),
+            settings=settings,
             scheduler_path=tmp_path / "scheduler.db",
             access_control=access,
             authentication_provider=_Authentication(),
@@ -215,6 +233,160 @@ def test_search_rechecks_access_after_query_embedding(backend: str, provider: st
                 with pytest.raises(ForbiddenResponseError):
                     await asyncio.wait_for(pending, timeout=20)
             await _assert_current_access_revoked(viewer, scope_id, created)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["builtin", "casbin"])
+@pytest.mark.parametrize("revision", [None, 2])
+def test_artifact_get_rechecks_access_after_route_authorization(tmp_path, monkeypatch, provider, revision):
+    async def scenario():
+        database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'artifact-get.db'}")
+        async with _server(database, provider, tmp_path, _Embedding()) as (app, admin, _):
+            scope_id, original, binding = await _seed(admin)
+            path = f"/v1/scopes/{scope_id}/artifacts/atomic-memory/{original.artifact.artifact_id}"
+            if revision is not None:
+                path += f"/revisions/{revision}"
+            authorized, resume = asyncio.Event(), asyncio.Event()
+            check = AccessControlService.check
+
+            async def pause_route(self, principal, *args, **kwargs):
+                result = await check(self, principal, *args, **kwargs)
+                if principal == VIEWER and not authorized.is_set():
+                    authorized.set()
+                    await resume.wait()
+                return result
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                with monkeypatch.context() as patch:
+                    patch.setattr(AccessControlService, "check", pause_route)
+                    pending = asyncio.create_task(client.get(path, headers={"Authorization": "Bearer viewer"}))
+                    try:
+                        await asyncio.wait_for(authorized.wait(), timeout=20)
+                        await admin.revoke_access_binding(
+                            RevokeAccessBindingRequest(
+                                binding_id=binding.binding_id,
+                                expected_version=binding.version,
+                                idempotency_key="revoke-get",
+                            )
+                        )
+                        revised = await client.put(
+                            f"/v1/scopes/{scope_id}/artifacts/atomic-memory/{original.artifact.artifact_id}",
+                            headers={"Authorization": "Bearer admin", "If-Match": '"revision:1"'},
+                            json={"content": {"kind": "fact", "text": "New private revision after revocation."}},
+                        )
+                        assert revised.status_code == 200, revised.text
+                        assert revised.json()["revision"] == 2
+                    finally:
+                        resume.set()
+                        result = await asyncio.wait_for(pending, timeout=20)
+                assert result.status_code == 403, result.text
+                assert "New private revision" not in result.text
+                fresh = await client.get(path, headers={"Authorization": "Bearer viewer"})
+                assert fresh.status_code == 403
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["builtin", "casbin"])
+@pytest.mark.parametrize("mode", ["text", "hybrid"])
+def test_separate_policy_database_pins_content_before_allow(tmp_path, monkeypatch, provider, mode):
+    async def scenario():
+        content_database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'content.db'}")
+        policy_database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'policy.db'}")
+        open_access = open_builtin_access_control if provider == "builtin" else open_casbin_access_control
+        audit = AccessAuditContext(transport="local", operation="atomic-search", request_id="separate-databases")
+        async with (
+            open_builtin_contexts(BuiltinConfig(database=content_database), embedding_model=_Embedding()) as contexts,
+            open_access(policy_database, bootstrap_administrators=(ADMIN,), deployment_id=DEPLOYMENT_ID) as access,
+        ):
+            await contexts.get("project")
+            (original,) = await contexts.records.create_atomic_memories(
+                "project", ({"kind": "fact", "text": "Alpha original body."},)
+            )
+            binding = await access.create_binding(
+                ADMIN,
+                CreateBinding(
+                    subject=VIEWER,
+                    resource=ResourceRef.scope("project"),
+                    role=AccessRole.SCOPE_VIEWER,
+                    idempotency_key="separate-viewer",
+                ),
+                context=audit,
+            )
+            context = ArtifactSearchExecutionContext(VIEWER, access, audit)
+            memory = contexts.atomic_memory.for_scope("project")
+            filters = AtomicMemoryAccess.filters
+            authorized, resume = asyncio.Event(), asyncio.Event()
+
+            async def pause_after_allow(*args, **kwargs):
+                result = await filters(*args, **kwargs)
+                authorized.set()
+                await resume.wait()
+                return result
+
+            with monkeypatch.context() as patch:
+                patch.setattr(AtomicMemoryAccess, "filters", pause_after_allow)
+                pending = asyncio.create_task(memory.search("alpha", mode=mode, context=context))
+                try:
+                    await asyncio.wait_for(authorized.wait(), timeout=20)
+                    await access.revoke_binding(
+                        ADMIN,
+                        binding.binding_id,
+                        expected_version=binding.version,
+                        idempotency_key="separate-revoke",
+                        context=audit,
+                    )
+                    await contexts.records.create_atomic_memories(
+                        "project", ({"kind": "fact", "text": "Alpha new private body."},)
+                    )
+                finally:
+                    resume.set()
+                    result = await asyncio.wait_for(pending, timeout=20)
+            assert [hit.hit.artifact_ref.artifact_id for hit in result.hits] == [original.artifact_id]
+            assert [hit.text for hit in result.hits] == ["Alpha original body."]
+            with pytest.raises(AccessDeniedError):
+                await memory.search("alpha", mode=mode, context=context)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["builtin", "casbin"])
+def test_authorized_artifact_reads_preserve_exact_revision_digest_and_etags(tmp_path, provider):
+    async def scenario():
+        database = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'exact-read.db'}")
+        async with _server(database, provider, tmp_path, _Embedding()) as (app, admin, _):
+            scope_id, original, _ = await _seed(admin)
+            path = f"/v1/scopes/{scope_id}/artifacts/atomic-memory/{original.artifact.artifact_id}"
+            headers = {"Authorization": "Bearer viewer"}
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                head = await client.get(path, headers=headers)
+                exact = await client.get(f"{path}/revisions/1", headers=headers)
+                assert head.status_code == exact.status_code == 200
+                assert head.headers["ETag"] == '"revision:1"'
+                assert "ETag" not in exact.headers
+                assert exact.json() == head.json()
+                unchanged = await client.get(path, headers={**headers, "If-None-Match": head.headers["ETag"]})
+                assert unchanged.status_code == 304 and unchanged.content == b""
+                revised = await client.put(
+                    path,
+                    headers={"Authorization": "Bearer admin", "If-Match": head.headers["ETag"]},
+                    json={"content": {"kind": "fact", "text": "Alpha revised body."}},
+                )
+                assert revised.status_code == 200, revised.text
+                new_head = await client.get(path, headers={**headers, "If-None-Match": head.headers["ETag"]})
+                assert new_head.status_code == 200
+                assert new_head.headers["ETag"] == '"revision:2"'
+                assert new_head.json() == revised.json()
+                assert new_head.json()["content_digest"] != head.json()["content_digest"]
+                historical = await client.get(f"{path}/revisions/1", headers=headers)
+                assert historical.status_code == 200 and historical.json() == head.json()
+                missing = await client.get(f"{path}/revisions/99", headers=headers)
+                assert missing.status_code == 404
 
     asyncio.run(scenario())
 

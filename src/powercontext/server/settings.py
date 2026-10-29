@@ -37,7 +37,7 @@ from powercontext.builtin.runtime.config import (
     InferenceConfig,
     RuntimeConfig,
 )
-from powercontext.paths import default_database_path, default_seekdb_path, sqlite_url
+from powercontext.paths import default_database_path, default_seekdb_path, powercontext_data_dir, sqlite_url
 from powercontext.transport import is_loopback_host
 
 _UNSAFE_BIND_MESSAGE = (
@@ -110,10 +110,12 @@ def is_unauthenticated_non_loopback_bind(
 
 
 class HttpConfig(BaseModel):
-    """HTTP listener configuration."""
+    """HTTP listener and process-local admission configuration."""
 
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
+    max_request_body_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    max_concurrent_requests: int = Field(default=64, gt=0)
 
 
 class McpConfig(BaseModel):
@@ -165,6 +167,16 @@ class ServerLoggingConfig(BaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     format: Literal["console", "json"] = "console"
     access: bool = True
+    file: bool = False
+    directory: Path = Field(default_factory=lambda: powercontext_data_dir() / "logs")
+    max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    backup_count: int = Field(default=10, ge=1)
+    compression: Literal["none", "gzip"] = "gzip"
+
+    @field_validator("directory")
+    @classmethod
+    def resolve_directory(cls, value: Path) -> Path:
+        return value.expanduser().resolve()
 
     @field_validator("level", mode="before")
     @classmethod
@@ -176,6 +188,7 @@ class MetricsConfig(BaseModel):
     """Prometheus metrics exposed by the Server."""
 
     enabled: bool = True
+    background_port: int = Field(default=8001, ge=1, le=65535)
 
 
 class TracingConfig(BaseModel):
@@ -320,7 +333,9 @@ class ServerSettings(BaseSettings):
             raise ValueError("AUTH_TOKEN requires ACCESS_MODE=enforced or legacy AUTH_ENABLED=true")  # noqa: TRY003
         if self.access.mode == "disabled" and self.access.background_principal_id is not None:
             raise ValueError("ACCESS_MODE=disabled cannot configure a background Principal")  # noqa: TRY003
-        if self.runtime.artifact_processing_role != "background" and is_unauthenticated_non_loopback_bind(
+        if (
+            self.runtime.artifact_processing_role != "background" or self.metrics.enabled
+        ) and is_unauthenticated_non_loopback_bind(
             host=self.http.host,
             auth_enabled=self.access.mode != "disabled",
             allow_unauthenticated_non_loopback=self.allow_unauthenticated_non_loopback,

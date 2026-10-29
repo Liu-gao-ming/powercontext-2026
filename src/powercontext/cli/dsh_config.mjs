@@ -64,7 +64,7 @@ function installation(executable) {
   fail('Cannot locate the installed DSH package from its CLI; use a supported npm/pnpm DSH installation')
 }
 
-async function inspect(executable, home, profile, candidate, prospective, desktopAnchor, requireInstalled) {
+async function inspect(executable, home, profile, prospective, desktopAnchor, requireInstalled) {
   const anchor = desktopAnchor || installation(executable)
   if (desktopAnchor) {
     const manifest = read(anchor, () => JSON.parse(readFileSync(anchor, 'utf8')))
@@ -88,60 +88,11 @@ async function inspect(executable, home, profile, candidate, prospective, deskto
     ? read(manifestPath, () => boot.readProfileManifest('powercontext', dir))
     : undefined
   const template = boot.PROFILE_TEMPLATES?.[profile]
-  let bundles = manifest?.dsh?.profile?.bundles ?? (manifest ? [] : template?.bundles ?? template)
+  const bundles = manifest?.dsh?.profile?.bundles ?? (manifest ? [] : template?.bundles ?? template)
   if (!Array.isArray(bundles) || bundles.some(name => typeof name !== 'string')) {
     fail('Cannot determine the DSH profile bundle list', manifestPath)
   }
   if (requireInstalled && !bundles.includes(plugin)) fail('PowerContext is not enabled in this profile', manifestPath)
-  let candidateBundle = candidate
-  if (candidate) {
-    // Both native reconciliation and composition prefer installation-owned
-    // packages. The native resolver also handles packages hiding package.json.
-    try { candidateBundle = boot.resolveBundleDir('powercontext', plugin, anchor, dirname(anchor)) }
-    catch { /* The candidate supplies the profile-owned package. */ }
-  }
-  // With a materialized candidate, project the same direct-dependency
-  // reconciliation performed by the selected CLI. Doctor reads current bundles.
-  if (candidate) {
-    const dependencies = manifest?.dependencies ?? {}
-    if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
-      fail('Cannot determine the DSH profile dependencies', manifestPath)
-    }
-    const before = new Set(Object.keys(dependencies))
-    const after = [...new Set([...before, plugin])]
-    // pnpm sorts dependency keys when saving a changed manifest. A no-op add
-    // leaves its original bytes and ordering intact.
-    const spec = 'link:' + resolve(candidate).replaceAll('\\', '/')
-    if (dependencies[plugin] !== spec) after.sort()
-    const cli = read(anchor, () => JSON.parse(readFileSync(anchor, 'utf8')))
-    const preservesInactive = !!cli.dependencies?.['@deepseek-ai/dsh-plugin-manager']
-    const declarations = new Map()
-    function declaresBundle(name) {
-      if (declarations.has(name)) return declarations.get(name)
-      let packageDir
-      if (name === plugin) packageDir = candidateBundle
-      else {
-        try { packageDir = boot.resolveBundleDir('powercontext', name, anchor, dir) }
-        catch { declarations.set(name, false); return false }
-      }
-      const file = join(packageDir, 'package.json')
-      const metadata = read(file, () => boot.readProfileManifest('powercontext', packageDir))
-      const declared = metadata.dsh?.bundle?.patch !== undefined
-      declarations.set(name, declared)
-      return declared
-    }
-    const managed = new Set(after)
-    bundles = bundles.filter(name => !managed.has(name) || declaresBundle(name))
-    for (const name of after) {
-      // Newer CLI operations preserve an already-installed inactive dependency;
-      // legacy CLI reconciliation enables every dependency declaring a patch.
-      if (preservesInactive && before.has(name)) continue
-      if (!bundles.includes(name) && declaresBundle(name)) bundles.push(name)
-    }
-    if (!bundles.includes(plugin)) {
-      fail('DSH installation would leave PowerContext disabled; enable its bundle in this profile before setup', manifestPath)
-    }
-  }
   const exemptions = typeof boot.readProfileVersionExemptions === 'function'
     ? read(dir, () => boot.readProfileVersionExemptions(dir)) : {}
   const skippedBundles = []
@@ -170,16 +121,11 @@ async function inspect(executable, home, profile, candidate, prospective, deskto
     return files.flatMap(path => read(path, () => boot.loadOverlayPatches('powercontext', path)))
   }
   const layers = bundles.map(name => {
-    if (name === plugin && candidate) return bundle(name, candidateBundle)
     const packageDir = read(manifestPath, () => boot.resolveBundleDir('powercontext', name, anchor, dir))
     return bundle(name, packageDir)
   })
-  if (!bundles.includes(plugin)) {
-    if (candidate) layers.push(bundle(plugin, candidate))
-    // Before materializing the source, expose the future plugin id to user
-    // patches. The installer rechecks with the actual candidate before add.
-    else if (prospective) layers.push([{ insert: [{ id: plugin, name: plugin, config: {} }] }])
-  }
+  // Expose the future plugin id to user patches before native installation.
+  if (!bundles.includes(plugin) && prospective) layers.push([{ insert: [{ id: plugin, name: plugin, config: {} }] }])
   const userFiles = [join(dir, 'cordis.patch.yml'), join(home, 'cordis.patch.yml')]
   for (const file of userFiles) {
     if (existsSync(file)) layers.push(read(file, () => boot.loadOverlayPatches('powercontext', file)))
@@ -273,7 +219,7 @@ async function inspect(executable, home, profile, candidate, prospective, deskto
   }
   await visit(rows)
   if (matches.length > 1) fail('Multiple PowerContext entries make the DSH transport ambiguous', dir)
-  if (!matches.length && (requireInstalled || candidate || prospective || bundles.includes(plugin))) {
+  if (!matches.length && (requireInstalled || prospective || bundles.includes(plugin))) {
     fail('The composed DSH profile does not contain PowerContext', dir)
   }
   const config = matches[0]?.config ?? {}
@@ -292,8 +238,8 @@ async function inspect(executable, home, profile, candidate, prospective, deskto
 }
 
 try {
-  const [executable, home, profile, candidate, prospective, desktopAnchor, requireInstalled] = process.argv.slice(2)
-  const result = await inspect(resolve(executable), resolve(home), profile, candidate || undefined, prospective === 'true', desktopAnchor, requireInstalled === 'true')
+  const [executable, home, profile, prospective, desktopAnchor, requireInstalled] = process.argv.slice(2)
+  const result = await inspect(resolve(executable), resolve(home), profile, prospective === 'true', desktopAnchor, requireInstalled === 'true')
   process.stdout.write(JSON.stringify(result))
 } catch (error) {
   // Native parser messages and stacks can include credentials or whole YAML rows.

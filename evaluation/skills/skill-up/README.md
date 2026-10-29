@@ -101,7 +101,7 @@ All relative config paths start at this project root, not at `evals/`.
 
 Both arms receive the same `evals/fixtures/repos/powercontext-tool-contract/CLAUDE.md`: required/optional top-level
 argument names, types and defaults derived from OpenAPI and its MCP specialization, including content CAS headers.
-The mock catalog contains the Server's complete declared MCP tool subset (54 operations), verified against
+The mock catalog contains the Server's complete declared MCP tool subset (55 operations), verified against
 `src/powercontext/server/mcp.py` and the generated operation IDs. The successful save reply contains Atomic
 `records`; empty search returns the current `text` mode and an empty `hits` list.
 This fills the generic mock schemas' parameter information gap
@@ -114,7 +114,7 @@ claim about body consumption; ordinary coding does not require a Skill invocatio
 
 ## Pinning a Skill revision
 
-`vendor/powercontext-project-context` contains the four unchanged packaged Skill files. `skill-lock.json` identifies
+`vendor/powercontext-project-context` contains the packaged Skill files and its managed-refresh metadata. `skill-lock.json` identifies
 their source commit, individual SHA-256 hashes and an aggregate hash of sorted `<sha256>  <relative-path>\n` lines.
 Vendoring reads immutable Git blobs, and `.gitattributes` keeps the vendor bytes in LF form across platforms.
 
@@ -149,10 +149,11 @@ CRLF to Git LF. CI fails if the packaged Skill drifts without updating the pin. 
 - **C6 — Lifecycle.** `environment.type: none` starts no PowerContext Server. The current runner starts its mock itself.
   The unused HTTP reference is not a ready-to-run real suite: it requires a separately started Server, an authenticated
   readiness/tool-catalog check, dedicated Scopes and explicit cleanup before any real case is admitted.
-- **C7 — Plugin boundary.** The packaged Skill references `${CLAUDE_PLUGIN_ROOT}/scripts/workspace_scope.py`, outside its
-  Skill directory. The wrapper deliberately provides `harness/plugin-root/scripts/workspace_scope.py`, a fixture that
-  returns only the fictional Scope and rejects bind/clear operations. The Skill text is unchanged. This evaluates the
-  guidance after controlled Scope resolution; it does not qualify the actual plugin helper or standalone packaging.
+- **C7 — Plugin boundary.** The packaged Skill resolves `scripts/workspace_scope.py` from the host-provided plugin root
+  when available, with an installed-Skill fallback. The wrapper deliberately sets `CLAUDE_PLUGIN_ROOT` to
+  `harness/plugin-root`, whose fixture returns only the fictional Scope and rejects bind/clear operations. The pinned
+  Skill is unchanged by the harness. This evaluates guidance after controlled Scope resolution; it does not qualify
+  the actual plugin helper, the fallback path, or standalone packaging.
 - **C8 — Host boundary.** Only Claude Code + MCP is covered. Results do not qualify Codex, Hermes, WorkBuddy, OpenCode,
   Pi, OpenClaw, or the portable Agent Plugin.
 

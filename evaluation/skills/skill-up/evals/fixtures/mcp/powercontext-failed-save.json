@@ -6,10 +6,13 @@
     "activate_handoff": {
       "error": "unexpected"
     },
-    "approve_artifact_candidate": {
+    "approve_candidate": {
       "error": "unexpected"
     },
     "capture_content_source": {
+      "error": "unexpected"
+    },
+    "capture_working_note": {
       "error": "unexpected"
     },
     "change_atomic_memory_lifecycle": {
@@ -45,7 +48,13 @@
     "get_artifact": {
       "error": "unexpected"
     },
-    "get_artifact_candidate": {
+    "get_artifact_revision": {
+      "error": "unexpected"
+    },
+    "get_atomic_memory_state": {
+      "error": "unexpected"
+    },
+    "get_candidate": {
       "default": {
         "candidate_id": "fixture-candidate-001",
         "version": 1,
@@ -70,10 +79,7 @@
         "decision_reason": null
       }
     },
-    "get_artifact_revision": {
-      "error": "unexpected"
-    },
-    "get_atomic_memory_state": {
+    "get_candidate_history": {
       "error": "unexpected"
     },
     "get_dream_run": {
@@ -106,7 +112,10 @@
     "import_external_skill": {
       "error": "unexpected"
     },
-    "list_artifact_candidates": {
+    "list_atomic_memories": {
+      "error": "unexpected"
+    },
+    "list_candidates": {
       "default": {
         "candidates": [
           {
@@ -135,9 +144,6 @@
         ],
         "next_cursor": null
       }
-    },
-    "list_atomic_memories": {
-      "error": "unexpected"
     },
     "list_dream_runs": {
       "error": "unexpected"
@@ -178,7 +184,7 @@
     "record_task_outcome": {
       "error": "unexpected"
     },
-    "reject_artifact_candidate": {
+    "reject_candidate": {
       "error": "unexpected"
     },
     "remember_memory": {
@@ -209,7 +215,7 @@
     "restore_atomic_memory": {
       "error": "unexpected"
     },
-    "revise_artifact_candidate": {
+    "revise_candidate": {
       "error": "unexpected"
     },
     "scan_external_skills": {

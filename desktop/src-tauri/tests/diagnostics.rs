@@ -38,9 +38,11 @@ fn unhealthy_service_json_survives_exit_one_without_leaking_private_details() {
 }
 #[test]
 fn integration_status_is_projected_without_details_or_checks_text() {
-    let result = project(DiagnosticKind::Integrations, br#"{"ok":false,"status":"failed","hosts":{"codex":{"presence":"present","codex":{"ok":true,"status":"ok","detail":"private-path"},"mcp":{"ok":false,"status":"failed","detail":"secret","checks":{"token":"secret"}}}}}"#, 1).unwrap();
+    let result = project(DiagnosticKind::Integrations, br#"{"ok":false,"hosts":{"codex":{"status":"failed","ok":false,"checks":{"codex":{"ok":true,"status":"ok","detail":"private-path"},"mcp":{"ok":false,"status":"failed","detail":"secret","checks":{"token":"secret"}}}},"kimi-code":{"status":"failed","ok":false,"error":"private-path secret-token"}}}"#, 1).unwrap();
     assert_eq!(result.hosts[0].host, "codex");
     assert_eq!(result.hosts[0].checks.len(), 2);
+    assert_eq!(result.hosts[1].status, "failed");
+    assert!(result.hosts[1].checks.is_empty());
     let output = serde_json::to_string(&result).unwrap();
     assert!(!output.contains("private"));
     assert!(!output.contains("secret"));
@@ -50,8 +52,8 @@ fn malformed_unknown_and_oversized_diagnostics_are_rejected() {
     for output in [
         b"not json".as_slice(),
         br#"{}"#,
-        br#"{"ok":true,"status":"secret","hosts":{}}"#,
-        br#"{"ok":false,"status":"ok","hosts":{}}"#,
+        br#"{"ok":true,"hosts":{"codex":{"status":"secret","ok":true,"checks":{}}}}"#,
+        br#"{"ok":false,"hosts":{"codex":{"status":"ok","ok":false,"checks":{}}}}"#,
     ] {
         assert_eq!(
             project(DiagnosticKind::Integrations, output, 1).unwrap_err(),
@@ -77,7 +79,7 @@ async fn missing_or_mismatched_cli_registration_never_runs_a_program() {
     );
     let executable = directory.path().join("powercontext.exe");
     std::fs::write(&executable, b"not executable").unwrap();
-    let value = serde_json::json!({"executable":executable,"sha256":"0".repeat(64),"version":"1.0.1.dev61+g63f918b7e.d20260919","source":"explicit_local_installation"});
+    let value = serde_json::json!({"executable":executable,"sha256":"0".repeat(64),"source":"explicit_local_installation"});
     std::fs::write(&registration, serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(
         diagnostics.run(DiagnosticKind::Service).await.unwrap_err(),

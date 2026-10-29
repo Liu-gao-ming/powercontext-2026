@@ -8,6 +8,20 @@ description: Inspect, revise, approve, or reject pending Experience and Skill Ca
 Use the Review Inbox to decide whether a generated or submitted Experience or managed Skill should become an Artifact
 Revision. Approval writes an immutable Revision. Rejection closes the Candidate without writing an Artifact.
 
+## Unified API and upgrade
+
+Candidate management uses six POST endpoints: `/v1/candidates/list`, `get`, `history`, `revise`, `approve`, and `reject`.
+`candidate_kind=artifact|tag` distinguishes content proposals from tag changes; family still identifies the owning Artifact.
+List supports kind filtering and includes both kinds when omitted. Artifact approval returns a real `result_artifact`;
+Tag approval returns its target, committed tags, and ETag without creating a content revision. Tag review checks candidate
+version, content baseline, ETag, and permission. The Experience/Skill examples below concern artifact candidates.
+
+The old `/v1/artifact-candidates/*` routes are removed without aliases or redirects. Upgrade Clients and integrations together.
+Stop old Servers/Workers and back up the database before starting the new release. First initialization automatically renames
+the existing Candidate tables to `pc_candidate_heads` and `pc_candidate_versions`, backfills kind, and preserves historical data
+and references before readiness. Failed migration blocks startup with an actionable error; retries resume without clearing data.
+Mixed old/new binaries are unsupported. Downgrade requires restoring the pre-upgrade backup.
+
 ## Before you begin
 
 Start the Server and confirm that it is ready:
@@ -18,6 +32,67 @@ powercontext ready
 
 Set `POWERCONTEXT_SCOPE_ID` to the existing Scope ID that contains the Candidate. This guide starts after an
 Experience or Skill operation has created a pending Candidate.
+
+## Review authority
+
+Review is a state transition: pending content becomes an immutable Artifact Revision only after an explicit approval.
+It does not by itself prove that a person reviewed the content or that the reviewer differs from the proposer.
+
+| Server access mode | Who can approve |
+| --- | --- |
+| `disabled` (default) | Any caller that can reach the review operation; no reviewer identity is enforced |
+| `enforced` | An authenticated Principal with `scope.review`, subject to the Candidate's evidence and target permissions |
+
+HTTP, the Python Client, CLI, and MCP use the same Server authorization. A Principal with submission and review
+permissions can approve its own Candidate. The built-in static bearer token represents one shared administrator
+identity; sharing that token does not separate an Agent from a reviewer.
+
+MCP exposes `approve_candidate`, `reject_candidate`, and `revise_candidate`. Their tool annotations describe side
+effects so a host can apply its confirmation policy. Annotations do not force a prompt or prove human confirmation.
+Approval also does not install, publish, or authorize execution of a Skill.
+
+## Separate Agent submission from review
+
+For a workflow where an Agent submits new Experience or Skill Candidates and a person decides whether to approve:
+
+1. Enable `POWERCONTEXT_SERVER_ACCESS_MODE=enforced` and configure an Authentication Provider that establishes distinct
+   identities. See [Scopes and access](scopes-and-access.md#enable-access-control). A shared static token is insufficient.
+2. Have an administrator grant the Agent `scope.contributor` and the reviewer `scope.reviewer` on the exact Scope.
+   Do not give the Agent review or role-management authority, including through groups or additional credentials.
+3. Keep the reviewer's credentials outside the Agent's tools and process environment. Use an authenticated Client or
+   integration for review. The Dashboard supports personal and demonstration deployments, not team RBAC.
+4. Submit a Candidate as the Agent, then read it as each identity. The Agent must receive a denial when attempting
+   approval through HTTP or MCP; the reviewer can approve the exact pending version.
+5. If changes are needed, reject with a reason and submit a corrected new Candidate. Rejection is terminal. Revising
+   an existing Candidate requires both `scope.review` and the original proposer identity, so neither of these separate
+   roles can use `revise` in this setup. Do not grant review authority to the Agent just to edit a proposal.
+
+With the built-in writable Access Provider, an administrator can send these requests to
+`POST /v1/access/bindings/create`. Replace the IDs with identities established by the Authentication Provider and the
+existing Scope ID; request bodies assign roles and do not authenticate the named subjects.
+
+```json
+{
+  "subject": {"type": "service", "id": "coding-agent"},
+  "resource": {"type": "scope", "scope_id": "scope-project"},
+  "role": "scope.contributor",
+  "idempotency_key": "project-agent-contributor"
+}
+```
+
+```json
+{
+  "subject": {"type": "user", "id": "reviewer"},
+  "resource": {"type": "scope", "scope_id": "scope-project"},
+  "role": "scope.reviewer",
+  "idempotency_key": "project-human-reviewer"
+}
+```
+
+These assignments cover new Artifact identities. A proposal that revises an existing Artifact also requires the
+applicable target permissions; the two Scope roles alone do not authorize every replacement. This workflow separates
+authority through role assignments, without a Server rule prohibiting all self-approval. If one identity later receives
+both permissions, it can submit and approve its own Candidate.
 
 ## Start a Dream from existing evidence
 
@@ -50,7 +125,7 @@ request. Reusing a key with the same normalized selection returns the same run; 
 Use the Candidate ID in a `proposed` result with the review commands below. A run does not approve or install its result.
 
 To produce a Skill, set `operation` to `derive_skill` and place approved Experience references in `artifacts`.
-Atomic Memory references are accepted only by `refine_experience`. To propose a replacement Experience, include its
+Atomic Memory references can support revision operations; `derive_skill` requires approved Experience references. To propose a replacement Experience, include its
 current exact reference in both `artifacts` and `target`.
 
 A selection contains 1–20 Atomic Memory and Experience references after deduplication, with at most 32 references
@@ -59,8 +134,8 @@ items, 64 KiB of model input, two model calls, 4,096 output tokens per call, and
 Each Scope admits at most 32 queued or running requests by default. Restarted workers resume persisted requests under
 a lease; they keep the same evidence snapshot and execution deadline.
 
-Use the Candidate commands below or `POST /v1/artifact-candidates/get` to read the current version and its
-`source_refs` and `artifact_refs`, then inspect reference bodies through exact Source and Artifact revision reads.
+Use the Candidate commands below or `POST /v1/candidates/get` to read the current version and its
+`artifact_refs`, then inspect their bodies through exact Source/Artifact revision reads.
 The Dream run's `input_manifest` retains generation-time root Source groups and independence annotations. Repeated
 citations to one root do not count as independent observations; unknown independence remains unknown. Review revalidates
 evidence against the current Candidate version and reviewer permissions; an unavailable reference blocks approval.
@@ -71,8 +146,7 @@ It displays approved Experiences and
 Skills, with exact references linking to the cited Atomic Memory revisions. Dream creation, Run inspection, and Candidate review
 use the CLI, Client, or HTTP API. See [Install and run](../get-started/install-and-run.md) to enable personal access.
 
-The Runtime creates `pc_dream_runs` on startup. No copy of Memory bodies is stored in the run table. Back up existing
-databases before deploying a schema change.
+Dream uses `pc_dream_runs` and the unified `pc_candidate_heads` / `pc_candidate_versions` tables. Existing databases require coordinated maintenance through the shared migration framework, after the Atomic Memory conversion. Ordinary startup only checks readiness; it does not rename Candidate tables or restore legacy citation columns.
 
 ## 1. List pending Candidates
 
@@ -196,7 +270,7 @@ If a write reports that the Candidate version is stale, show the Candidate again
 change `--expected-version` without inspecting the replacement. A terminal Candidate cannot be approved, rejected, or
 revised again.
 
-The HTTP API, Python Client, and MCP expose the same five Review operations and concurrency rules. See
+The HTTP API, Python Client, and MCP expose the same six Review operations and concurrency rules. See
 [Interfaces](../develop/interfaces.md) for their contract and availability.
 
 ## 5. Use Dream experience in a later task

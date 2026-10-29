@@ -27,7 +27,7 @@ powercontext setup claude-code --server-url http://192.0.2.10:8000 --allow-insec
 ```
 
 `claude-code` 可替换为 `codex`、`dsh`、`openclaw`、`opencode`、`pi`、`hermes` 或 `workbuddy`。
-`setup select --host ...` 也支持这两个选项，覆盖其目录中的 Agent；WorkBuddy 使用独立 setup 命令。
+`setup codex dsh` 和 `config agent codex dsh` 也支持这两个选项，分别用于多 Agent 安装和已安装连接配置。
 拒绝或未提供同意时，在安装操作前退出。风险警告写入 stderr，不污染 stdout 的 JSON。
 安装成功后保存地址及同意状态，新会话无需重复手贴这两项配置；鉴权凭据仍需单独配置。
 

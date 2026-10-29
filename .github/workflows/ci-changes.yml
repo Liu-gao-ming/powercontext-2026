@@ -1,0 +1,30 @@
+name: Detect CI scope
+
+on:
+  workflow_call:
+    outputs:
+      suites:
+        description: JSON object of suites selected for this event
+        value: ${{ jobs.detect.outputs.suites }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      suites: ${{ steps.select.outputs.suites }}
+    steps:
+      - name: Check out the complete PR history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select checks
+        id: select
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci_changes.py

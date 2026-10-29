@@ -19,6 +19,7 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from powercontext.builtin.artifacts.search import lexical_query_words
 from powercontext.builtin.artifacts.topic_memory import TopicMemoryContent
 from powercontext.builtin.artifacts.topic_memory.generation import (
     BudgetedTopicMemoryGenerator,
@@ -162,7 +163,7 @@ def test_full_content_signature_scans_tail_and_remains_bounded() -> None:
 
     signature = topic_memory_lexical_signature(content)
 
-    assert "tailwinner" in signature.split()
+    assert "tailwinner" in lexical_query_words(signature)
     assert len(signature) <= 8_192
     assert len(signature.split()) <= 64
 
@@ -170,9 +171,7 @@ def test_full_content_signature_scans_tail_and_remains_bounded() -> None:
         "front",
         " ".join(f"frequent{index} frequent{index}" for index in range(70)) + " unique-low-weight-tail",
     )
-    assert "unique-low-weight-tail" not in topic_memory_lexical_signature(low_weight_tail).split()
-    with pytest.raises(ValueError, match="no bounded lexical signature"):
-        topic_memory_lexical_signature(TopicMemoryContent(title="---", summary="***", detail="###"))
+    assert "unique-low-weight-tail" not in lexical_query_words(topic_memory_lexical_signature(low_weight_tail))
 
 
 def test_related_components_share_lexical_and_vector_admission() -> None:

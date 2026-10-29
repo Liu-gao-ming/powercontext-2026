@@ -94,6 +94,7 @@ describe('Pi native tool surface', () => {
       'pc_memory_retire',
       'pc_prepare_context',
       'pc_capture_source',
+      'pc_capture_working_note',
       'pc_handoff_activate',
       'pc_work_contract',
       'pc_handoff_current',
@@ -182,6 +183,52 @@ describe('Pi native tool surface', () => {
       ['http://127.0.0.1:8000/v1/scopes/project%3Ademo/artifacts/atomic-memory/atomic-7/state', {}],
       ['http://127.0.0.1:8000/v1/stats', { period: '7d', selection: { mode: 'exact', scope_ids: ['project:demo'] } }],
     ])
+  })
+
+  it('routes Working Note capture as a scoped, confirmed write', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => (
+      new Response(JSON.stringify({ status: 'accepted', source: { name: 'content', source_id: 'note-1' }, position: 1 }), { status: 202 })
+    ))
+    registerTools(
+      { registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never,
+      createRuntime(fetch),
+    )
+    const confirm = vi.fn(async () => true)
+
+    const result = await registeredTool<{
+      source_id: string
+      content: string
+      session_id: string
+      note_kind: string
+      expires_at?: string
+    }>(registered, 'pc_capture_working_note').execute(
+      'call-note',
+      {
+        source_id: 'note-1',
+        content: 'Parser validation is still in progress.',
+        session_id: 'session-1',
+        note_kind: 'validation',
+        expires_at: '2030-01-02T00:00:00Z',
+      },
+      new AbortController().signal,
+      () => undefined,
+      { cwd: '/workspace/repo', hasUI: true, ui: { confirm } },
+    )
+
+    expect(result.details).toMatchObject({ ok: true })
+    expect(confirm).toHaveBeenCalled()
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([[
+      'http://127.0.0.1:8000/v1/sources/working-notes',
+      {
+        source_id: 'note-1',
+        content: 'Parser validation is still in progress.',
+        session_id: 'session-1',
+        note_kind: 'validation',
+        expires_at: '2030-01-02T00:00:00Z',
+        scope_id: 'project:demo',
+      },
+    ]])
   })
 
   it('keeps the read-only tool schemas within the API contract', () => {
@@ -507,9 +554,9 @@ describe('Pi native tool surface', () => {
 
     expect(context.ui.confirm).toHaveBeenCalledTimes(3)
     expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
-      ['http://127.0.0.1:8000/v1/artifact-candidates/approve', { ...common, scope_id: 'project:demo' }],
-      ['http://127.0.0.1:8000/v1/artifact-candidates/reject', { ...common, reason: 'not applicable', scope_id: 'project:demo' }],
-      ['http://127.0.0.1:8000/v1/artifact-candidates/revise', {
+      ['http://127.0.0.1:8000/v1/candidates/approve', { ...common, scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/candidates/reject', { ...common, reason: 'not applicable', scope_id: 'project:demo' }],
+      ['http://127.0.0.1:8000/v1/candidates/revise', {
         ...common, proposal, source_refs: [], artifact_refs: [], target: null, reason: 'clarify', scope_id: 'project:demo',
       }],
     ])
@@ -614,6 +661,57 @@ describe('Pi native tool surface', () => {
     ])
   })
 
+  it('accepts and forwards advisory rollover reasons for Handoff preparation', async () => {
+    const registered: Array<Record<string, unknown>> = []
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true })))
+    const runtime = createRuntime(fetch)
+    registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, runtime)
+    const activate = registeredTool<Record<string, unknown>>(registered, 'pc_handoff_activate')
+    const prepare = registeredTool<Record<string, unknown>>(registered, 'pc_handoff_prepare')
+    const boundarySource = { name: 'content', source_id: 'turn-1' }
+    const reasons = ['host_context_budget', 'context_quality']
+    const context = { cwd: '/workspace/repo', hasUI: true, ui: { confirm: vi.fn(async () => true) } }
+    const signal = new AbortController().signal
+
+    expect(Value.Check(activate.parameters!, {
+      boundary_source: boundarySource,
+      objective: 'Continue in a fresh session.',
+      rollover_reasons: reasons,
+    })).toBe(true)
+    expect(Value.Check(prepare.parameters!, {
+      objective: 'Continue in a fresh session.',
+      evidence: [{ kind: 'source', source_ref: boundarySource }],
+      rollover_reasons: reasons,
+    })).toBe(true)
+
+    await activate.execute('call-activate', {
+      boundary_source: boundarySource,
+      objective: 'Continue in a fresh session.',
+      rollover_reasons: reasons,
+    }, signal, () => undefined, context)
+    await prepare.execute('call-prepare', {
+      objective: 'Continue in a fresh session.',
+      evidence: [{ kind: 'source', source_ref: boundarySource }],
+      rollover_reasons: reasons,
+    }, signal, () => undefined, context)
+
+    expect(fetch.mock.calls.map(([url, init]) => [url, JSON.parse(String(init?.body))])).toEqual([
+      ['http://127.0.0.1:8000/v1/handoff/activate', {
+        boundary_source: boundarySource,
+        objective: 'Continue in a fresh session.',
+        evidence: [],
+        rollover_reasons: reasons,
+        scope_id: 'project:demo',
+      }],
+      ['http://127.0.0.1:8000/v1/handoff/prepare', {
+        objective: 'Continue in a fresh session.',
+        evidence: [{ kind: 'source', source_ref: boundarySource }],
+        rollover_reasons: reasons,
+        scope_id: 'project:demo',
+      }],
+    ])
+  })
+
   it('accepts the check results the OpenAPI contract marks optional', () => {
     const registered: Array<Record<string, unknown>> = []
     registerTools({ registerTool: (tool: Record<string, unknown>) => registered.push(tool) } as never, createRuntime(vi.fn()))
@@ -688,10 +786,10 @@ describe('Pi native tool surface', () => {
         artifact: { family: 'skill', artifact_id: 'skill-1', revision: 3 },
         scope_id: 'project:demo',
       }],
-      ['http://127.0.0.1:8000/v1/artifact-candidates/list', {
+      ['http://127.0.0.1:8000/v1/candidates/list', {
         status: 'approved', family: 'skill', cursor: 'next-page', limit: 100, scope_id: 'project:demo',
       }],
-      ['http://127.0.0.1:8000/v1/artifact-candidates/get', {
+      ['http://127.0.0.1:8000/v1/candidates/get', {
         candidate_id: 'candidate-1', scope_id: 'project:demo',
       }],
     ])

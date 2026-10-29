@@ -21,9 +21,19 @@ import asyncio
 import pytest
 
 from powercontext.artifacts import ArtifactLineage
+from powercontext.builtin.persistence.artifacts import ArtifactRepository
+from powercontext.builtin.persistence.errors import RepositoryNotFoundError
 from powercontext.builtin.persistence.sources import SourceRepository
+from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
+from powercontext.builtin.persistence.tables import SHARED_TABLES
 from powercontext.builtin.sources.content import CONTENT_SOURCE_ADAPTER
-from tests.builtin.persistence.contract import HandoffContent, HandoffDraft, repository_profile
+from powercontext.errors import RevisionConflictError
+from tests.builtin.persistence.contract import (
+    ARTIFACT_TYPES,
+    HandoffContent,
+    HandoffDraft,
+    repository_profile,
+)
 
 
 class _LocalSecurity:
@@ -39,7 +49,11 @@ class _LocalSecurity:
     async def authorize_sources(self, connection, scope_id, context, sources):
         pass
 
-    async def establish_owner(self, connection, scope_id, artifact_id, context):
+    async def authorize_creates(self, connection, scope_id, context, refs):
+        for ref in refs:
+            await self.authorize(connection, scope_id, context, "create", ref)
+
+    async def establish_owners(self, connection, scope_id, artifact_ids, context):
         pass
 
 
@@ -60,12 +74,44 @@ class _HandoffAdapter:
     async def publish(self, connection, scope_id, record, prepared, execution_context):
         pass
 
+    async def publish_many(self, connection, scope_id, records, execution_context):
+        pass
+
     async def remove(self, connection, scope_id, artifact_id):
         pass
 
 
 async def _merge_tags(connection, scope_id, artifact_id, inputs):
     pass
+
+
+def test_new_identity_collision_is_reported_by_atomic_commit() -> None:
+    async def scenario() -> None:
+        from powercontext.builtin.artifacts.merge import ArtifactMergeService
+
+        async with repository_profile() as (profile, repositories):
+            service = ArtifactMergeService(
+                artifacts=repositories.artifacts,
+                adapter=_HandoffAdapter(),
+                security=_LocalSecurity(),
+                merge_tags=_merge_tags,
+            )
+            async with profile.database.transaction() as connection:
+                winner = await repositories.artifacts.create(
+                    connection, "project", "collision", HandoffDraft(content=HandoffContent(summary="winner"))
+                )
+                plan = await service.inspect_change(
+                    connection, "project", "collision", HandoffContent(summary="loser"), "owner"
+                )
+            prepared = await service.prepare_change(plan)
+            with pytest.raises(RevisionConflictError) as error:
+                async with profile.database.transaction() as connection:
+                    await service.commit(connection, prepared, "owner")
+            assert error.value.current == winner
+            async with profile.database.transaction() as connection:
+                assert await repositories.artifacts.latest(connection, "project", "handoff", "collision") == winner
+
+    asyncio.run(scenario())
 
 
 def test_shared_family_cascade_restores_selected_inputs_and_preserves_ordinary_references() -> None:
@@ -288,5 +334,143 @@ def test_shared_ordinary_deprecated_revision_preserves_replacement_until_explici
                 assert (
                     await repositories.artifacts.get(connection, "project", result.primary.ref)
                 ) == result.primary.artifact
+
+    asyncio.run(scenario())
+
+
+class _Revoked(RuntimeError):
+    """Stands in for the fresh denial a revoked reader must receive."""
+
+
+def test_target_specific_create_denial_is_rechecked_before_publication() -> None:
+    async def scenario() -> None:
+        from powercontext.builtin.artifacts.merge import ArtifactMergeService
+        from powercontext.builtin.runtime.artifact_merge import ArtifactMergeAccess
+
+        class TargetPolicy(ArtifactMergeAccess):
+            def __init__(self):
+                super().__init__("handoff")
+                self.denied = False
+
+            async def authorize(self, connection, scope_id, context, action, ref=None):
+                if self.denied and action == "create" and ref is not None and ref.artifact_id == "target":
+                    raise _Revoked
+                await super().authorize(connection, scope_id, context, action, ref)
+
+        async with repository_profile() as (profile, repositories):
+            policy = TargetPolicy()
+            service = ArtifactMergeService(
+                artifacts=repositories.artifacts,
+                adapter=_HandoffAdapter(),
+                security=policy,
+                merge_tags=_merge_tags,
+            )
+            async with profile.database.transaction() as connection:
+                plan = await service.inspect_change(
+                    connection, "project", "target", HandoffContent(summary="Protected result"), None
+                )
+            prepared = await service.prepare_change(plan)
+            policy.denied = True
+            with pytest.raises(_Revoked):
+                async with profile.database.transaction() as connection:
+                    await service.commit(connection, prepared, None)
+            async with profile.database.transaction() as connection:
+                with pytest.raises(RepositoryNotFoundError):
+                    await repositories.artifacts.latest(connection, "project", "handoff", "target")
+
+    asyncio.run(scenario())
+
+
+class _RevokingProvider:
+    """A custom provider that never reads the caller's content connection.
+
+    While ``armed``, the first decision is captured as allowed and the subject's
+    access is then revoked by replacing the head with a new revision through a
+    connection of the provider's own. The caller's read is still in flight: it
+    has not read Artifact content yet.
+    """
+
+    def __init__(self, database, artifacts, scope_id: str, artifact_id: str) -> None:
+        self.database = database
+        self.artifacts = artifacts
+        self.scope_id = scope_id
+        self.artifact_id = artifact_id
+        self.armed = False
+        self.decisions = 0
+
+    def subject(self, context):
+        return context
+
+    async def lock_transaction(self, connection, scope_id, context) -> None:
+        pass
+
+    async def authorize_sources(self, connection, scope_id, context, sources) -> None:
+        pass
+
+    async def authorize_creates(self, connection, scope_id, context, refs) -> None:
+        for ref in refs:
+            await self.authorize(connection, scope_id, context, "create", ref)
+
+    async def establish_owners(self, connection, scope_id, artifact_ids, context) -> None:
+        pass
+
+    async def authorize(self, connection, scope_id, context, action, ref=None) -> None:
+        if not self.armed:
+            return
+        self.decisions += 1
+        if self.decisions > 1:
+            raise _Revoked
+        async with self.database.transaction() as writer:
+            head = await self.artifacts.latest(writer, self.scope_id, "handoff", self.artifact_id)
+            await self.artifacts.revise(
+                writer,
+                self.scope_id,
+                head,
+                HandoffDraft(content=HandoffContent(summary="written-after-revocation")),
+            )
+
+
+def test_decision_captured_before_revocation_cannot_return_later_content(tmp_path) -> None:
+    """An allowed decision must not be combined with content committed after it.
+
+    The runtime authorizes before :meth:`ArtifactMergeService.get` reads Artifact
+    content, and a configured custom provider need not read the caller's
+    connection. The transaction therefore has to hold a snapshot from the moment
+    it opens: otherwise an in-flight read returns the revision written after the
+    revocation, and only a fresh read is denied.
+    """
+
+    async def scenario() -> None:
+        from powercontext.builtin.artifacts.merge import ArtifactMergeService
+        from powercontext.builtin.runtime.artifact_merge import ArtifactMergeApplication
+
+        database_url = f"sqlite+aiosqlite:///{(tmp_path / 'merge-snapshot.db').as_posix()}"
+        async with SQLiteProfile.open(SQLiteConfig(url=database_url), tables=SHARED_TABLES) as profile:
+            artifacts = ArtifactRepository(ARTIFACT_TYPES)
+            provider = _RevokingProvider(profile.database, artifacts, "project", "subject")
+            service = ArtifactMergeService(
+                artifacts=artifacts,
+                sources=SourceRepository((CONTENT_SOURCE_ADAPTER,)),
+                adapter=_HandoffAdapter(),
+                security=provider,
+                merge_tags=_merge_tags,
+            )
+            scoped = ArtifactMergeApplication(profile.database, (service,), default_context="owner").for_scope(
+                "project", "handoff"
+            )
+            async with profile.database.transaction() as connection:
+                await artifacts.create(
+                    connection,
+                    "project",
+                    "subject",
+                    HandoffDraft(content=HandoffContent(summary="before-revocation")),
+                )
+
+            provider.armed = True
+            in_flight = await scoped.get("subject")
+            assert in_flight.artifact.revision == 1
+            assert in_flight.artifact.content.summary == "before-revocation"
+            with pytest.raises(_Revoked):
+                await scoped.get("subject")
 
     asyncio.run(scenario())

@@ -1,3 +1,5 @@
+
+<!-- POWERCONTEXT-GUIDANCE:START -->
 # Scope and Memory
 
 ## Scope binding
@@ -152,3 +154,4 @@ chain. Legacy `revise_memory_entry` and `retire_memory_entry` are not current MC
 
 
 Automatic hooks attempt bounded context and Source capture; neither substitutes for an explicit Memory save.
+<!-- POWERCONTEXT-GUIDANCE:END -->

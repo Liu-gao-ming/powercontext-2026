@@ -5,6 +5,8 @@ does not embed storage or start the server.
 
 The integration uses each public surface for the job it fits:
 
+- the opt-in `SessionStart` hook injects one bounded, curated bootstrap package
+  before the first prompt and records a content-free delivery receipt;
 - the `UserPromptSubmit` hook first calls `POST /v1/context/prepare`, then
   independently captures the current prompt with `POST /v1/sources/content`;
 - Streamable HTTP MCP at `http://127.0.0.1:8000/mcp` gives Codex the curated
@@ -33,12 +35,15 @@ proxy, not provider-verified or billable savings. Positive reductions use
 The `powercontext-project-context` skill uses four high-level work operations instead of
 assembling the low-level Handoff lifecycle manually: `create_work_contract`,
 `handoff_current_work`, `acknowledge_handoff`, and `record_task_outcome`.
-When the user says `交接`, `交接当前工作`, `handoff this work`, or an equivalent
-imperative, the Skill inspects the current conversation and repository, calls
-`handoff_current_work`, and immediately commits the returned `handoff` member
-through the artifact-level `commit_handoff` operation. The imperative itself
-is the explicit authorization
-for that durable milestone; preview or design requests remain read-only.
+For ordinary `交接`, `交接当前工作`, or `handoff this work` requests, the Skill
+inspects the current conversation and repository, calls `handoff_current_work`,
+and returns its complete `handoff` member as a temporary carrier. This records
+the boundary Source but does not commit a durable Handoff Revision. The receiver
+can use `continue_handoff` with `selection: "prepared"` and that exact carrier.
+Only an explicit durable request, such as `commit a durable handoff` or
+`保存持久交接里程碑`, authorizes passing the returned `handoff` unchanged to
+`commit_handoff`. Report a committed milestone only after it returns an exact
+Revision. Preview or design requests remain read-only.
 Acknowledgements and historical authorization notes never grant Codex new
 execution authority, and the prompt hook does not infer completion from Stop or
 SessionEnd.
@@ -78,6 +83,16 @@ default Scope. `UserPromptSubmit` uses that binding for recall and capture.
 `PreToolUse` injects the same binding into PowerContext data-plane tools, so an
 Agent-supplied `scope_id` cannot redirect a write. Repository and directory
 identities are binding lookup inputs only; they never generate a Scope ID.
+
+Bootstrap context is disabled by default. Set
+`POWERCONTEXT_CODEX_BOOTSTRAP_CONTEXT=true` to include active Atomic Memory
+Artifacts explicitly tagged `bootstrap-context`; use
+`POWERCONTEXT_CODEX_BOOTSTRAP_MAX_BYTES` for the 512–8192-byte budget and
+`POWERCONTEXT_CODEX_BOOTSTRAP_HANDOFF` for one exact committed Handoff identity.
+The first ordinary recall carries the successful receipt so fully delivered
+exact Atomic Memory revisions are not repeated; truncated Artifacts remain eligible.
+Invalid configuration or another failure before a new package is established
+clears any stale saved receipt and injects nothing.
 
 Set `POWERCONTEXT_CODEX_SCOPE_ID` only when the host must explicitly bind every
 request to one known Scope.

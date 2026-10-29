@@ -58,6 +58,13 @@ def isolated_client_connection_settings(tmp_path, monkeypatch, request):
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
+    continuity = parser.getgroup("powercontext-cross-host")
+    continuity.addoption(
+        "--cross-host-acceptance-output",
+        type=Path,
+        default=Path(".powercontext/cross-host-acceptance"),
+        help="Selected evidence from actual Pi to ZCode Work Continuity acceptance.",
+    )
     dsh = parser.getgroup("powercontext-dsh")
     dsh.addoption(
         "--require-dsh-runtime",
@@ -70,6 +77,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Require native DSH configuration APIs without requiring the DSH CLI.",
+    )
+    claude_code = parser.getgroup("powercontext-claude-code")
+    claude_code.addoption(
+        "--require-claude-code-python-floor",
+        action="store_true",
+        default=False,
+        help="Require Python 3.9 for the Claude Code plugin entry point test instead of skipping it.",
     )
     zcode = parser.getgroup("zcode-host-acceptance")
     zcode.addoption("--run-zcode-acceptance", action="store_true", help="Run real ZCode CLI acceptance.")
@@ -143,12 +157,21 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         if item.get_closest_marker("zcode_host_acceptance")
         and (not selected or (item.get_closest_marker("zcode_live_model") is not None) != live)
     ]
+    cross_requested = marker_expression.evaluate(lambda name, **kwargs: name == "cross_host_acceptance" and not kwargs)
+    cross_selected = (cross_requested and not without_host) or any(
+        "test_cross_host_work_continuity.py" in str(argument) for argument in config.args
+    )
+    deselected.extend(item for item in items if item.get_closest_marker("cross_host_acceptance") and not cross_selected)
     if deselected:
         config.hook.pytest_deselected(items=deselected)
         items[:] = [item for item in items if item not in deselected]
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    # Installed-release suites run only through the mandatory artifact gate.
+    # The gate uses --confcutdir to exclude this repository conftest entirely.
+    if collection_path.resolve() == (Path(__file__).parent / "release_upgrades").resolve():
+        return True
     # Alembic executes env.py as migration configuration; doctest collection
     # must not import it as a test module.
     if collection_path.resolve() == _DATABASE_MIGRATION_ENV.resolve():
@@ -160,3 +183,49 @@ def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool 
     except ValueError:
         return None
     return True
+
+
+@pytest.fixture
+def installed_agent_checks(monkeypatch):
+    """Isolate native installation behavior from separately exercised runtime probes."""
+    from powercontext.cli import hosts
+    from powercontext.cli.system import Diagnostic, DiagnosticStatus
+
+    monkeypatch.setattr(
+        hosts, "doctor_checks", lambda *args, **kwargs: {"integration": Diagnostic(DiagnosticStatus.OK, "available")}
+    )
+
+
+@pytest.fixture
+def server_checks(monkeypatch):
+    """Exercise native agent diagnostics without contacting an external Server."""
+    from powercontext.cli import system
+
+    monkeypatch.setattr(system, "server_diagnostics", lambda **kwargs: {})
+
+
+@pytest.fixture
+def hermes_activation(monkeypatch):
+    """Model Hermes' native config writes for filesystem installation scenarios."""
+    from subprocess import CompletedProcess
+
+    import yaml
+
+    from powercontext.cli import hermes
+
+    run = hermes._run_hermes_command
+
+    def native(command):
+        if command[1:3] not in (["plugins", "enable"], ["memory", "setup"]):
+            return run(command)
+        path = hermes.hermes_home() / "config.yaml"
+        config = yaml.safe_load(path.read_text()) if path.exists() else {}
+        if command[1] == "plugins":
+            config.setdefault("plugins", {}).setdefault("enabled", []).append("powercontext-command")
+        else:
+            config.setdefault("memory", {})["provider"] = "powercontext"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.safe_dump(config))
+        return CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(hermes, "_run_hermes_command", native)

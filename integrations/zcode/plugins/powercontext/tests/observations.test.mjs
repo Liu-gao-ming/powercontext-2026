@@ -41,27 +41,36 @@ test('runtime observations preserve opaque Scope IDs exactly', async () => {
 
 test('Hook observations preserve latest-attempt order, unknown writes and content-free status', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pc-zcode-runtime-'))
-  let slowStarted
+  let slowStarted, newerCaptured
   const slowReady = new Promise(resolve => { slowStarted = resolve })
+  const newerCapture = new Promise(resolve => { newerCaptured = resolve })
+  const captureOrder = []
   let captures = 0, protectedStatus = 200, captureStatus = 202, receiptValid = true, empty = false
   const server = createServer(async (req, res) => {
     let raw = ''
     for await (const chunk of req) raw += chunk
     const body = raw ? JSON.parse(raw) : {}
     res.setHeader('Content-Type', 'application/json')
-    if (req.url === '/health/ready') res.end('{}')
+    if (req.url === '/health/ready') res.end('{"status":"ready","checks":{}}')
     else if (req.url === '/v1/capabilities') { res.statusCode = protectedStatus; res.end('{}') }
     else if (req.url === '/v1/scope-bindings/resolve') res.end('{"scope_id":"scope-runtime"}')
     else if (req.url === '/v1/context/prepare') {
       if (body.query === 'older private prompt') {
         slowStarted()
-        await new Promise(resolve => setTimeout(resolve, 700))
+        // Answer the older prompt only once the newer one is captured. The hook's own 1 s request timeout bounds
+        // the wait: the older hook then captures anyway. The timer only keeps this handler from hanging.
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 10_000)
+          newerCapture.then(() => { clearTimeout(timer); resolve() })
+        })
       }
       const content = 'Private returned history marker.'
       res.end(JSON.stringify({ schema: 'powercontext.prepared-context.v1', status: empty ? 'empty' : 'ready',
         content: empty ? null : content, content_bytes: empty ? 0 : Buffer.byteLength(content) }))
     } else if (req.url === '/v1/sources/content') {
       const position = ++captures
+      captureOrder.push(body.content)
+      if (body.content === 'newer private prompt') newerCaptured()
       if (body.content === 'unknown capture private prompt') await new Promise(resolve => setTimeout(resolve, 1300))
       res.statusCode = captureStatus
       res.end(JSON.stringify({ status: 'accepted', source: { name: 'content', source_id: receiptValid ? body.source_id : 'incorrect' }, position }))
@@ -87,21 +96,38 @@ test('Hook observations preserve latest-attempt order, unknown writes and conten
         child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk })
         child.on('error', reject)
         child.on('close', code => resolve({ code, stdout, stderr, result: JSON.parse(stdout) }))
-        child.stdin.end(input ? JSON.stringify(input) : '')
+        // A hook starts its attempt only after reading its input, so a caller can start the process before supplying it.
+        Promise.resolve(input).then(value => child.stdin.end(value ? JSON.stringify(value) : ''), reject)
       })
     }
     const hook = (prompt, extra = {}) => run('hooks/user_prompt_submit.mjs', [], {
       hookEventName: 'UserPromptSubmit', cwd, sessionId: 'session-runtime', prompt,
     }, extra)
     const status = () => run('scripts/status.mjs', ['--cwd', cwd, '--session-id', 'session-runtime'])
+    // Start the newer hook's process first, so that process startup on a slow runner cannot outlast the older
+    // prompt's held request, and begin its attempt only after the older attempt has started.
+    let submitNewer
+    const newerPrompt = new Promise(resolve => { submitNewer = resolve })
+    const newerHook = run('hooks/user_prompt_submit.mjs', [], newerPrompt)
     const older = hook('older private prompt')
     await slowReady
-    const newer = await hook('newer private prompt')
+    submitNewer({ hookEventName: 'UserPromptSubmit', cwd, sessionId: 'session-runtime', prompt: 'newer private prompt' })
+    const newer = await newerHook
     assert.equal(newer.code, 0)
     await older
     const latest = await status()
     assert.equal(latest.result.status, 'observed')
-    assert.equal(latest.result.observation.stages.capture.source_position, 1)
+    const position = latest.result.observation.stages.capture.source_position
+    if (position !== 1) {
+      // The newer hook still has to capture within the older prepare request's 1 s timeout, so report both attempts.
+      const runtime = join(data, 'runtime')
+      const attempts = await Promise.all((await readdir(runtime)).filter(name => name.startsWith('attempt-')).map(async name => {
+        const { attempt_id, started_at, completed_at, stages } = JSON.parse(await readFile(join(runtime, name), 'utf8'))
+        return { attempt_id, started_at, completed_at, stages }
+      }))
+      assert.fail(`The newer capture received position ${position}. Captures arrived as ${JSON.stringify(captureOrder)}; ` +
+        `attempts: ${JSON.stringify(attempts)}`)
+    }
     assert.equal(latest.result.observation.stages.context_output.state, 'emitted')
     assert.equal(latest.result.observation.scope_id, 'scope-runtime')
     assert.doesNotMatch(latest.stdout, /private prompt|Private returned|synthetic-test-only|session-runtime/)

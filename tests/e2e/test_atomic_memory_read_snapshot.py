@@ -31,6 +31,7 @@ from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBas
 from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.records import ArtifactWrite
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
+from tests.e2e.atomic_memory_migration_backend import MigrationBackend
 
 
 class _Embedding:
@@ -135,7 +136,11 @@ def test_atomic_reads_do_not_commit_the_in_memory_writer() -> None:
 
 
 @pytest.mark.parametrize("operation", ["get", "list"])
-def test_atomic_read_keeps_content_and_state_in_one_snapshot(database, operation: str, monkeypatch) -> None:
+def test_atomic_read_keeps_content_and_state_in_one_snapshot(
+    migration_backend: MigrationBackend, operation: str, monkeypatch
+) -> None:
+    database = migration_backend.config
+
     async def scenario() -> None:
         async with open_builtin_contexts(BuiltinConfig(database=database)) as contexts:
             await contexts.get("project")
@@ -144,13 +149,14 @@ def test_atomic_read_keeps_content_and_state_in_one_snapshot(database, operation
                 "project", ({"kind": "fact", "text": "Original body."},)
             )
             repository = contexts.atomic_memory.service.artifacts
-            latest = repository.latest
+            read_method = "latest" if operation == "get" else "decode_many"
+            load = getattr(repository, read_method)
             changed = False
 
-            async def interleaved_latest(connection, scope_id, family, artifact_id, **kwargs):
+            async def interleaved_read(*args, **kwargs):
                 nonlocal changed
-                value = await latest(connection, scope_id, family, artifact_id, **kwargs)
-                if not changed and artifact_id == created.artifact_id:
+                value = await load(*args, **kwargs)
+                if not changed:
                     changed = True
 
                     async def publish() -> None:
@@ -167,7 +173,7 @@ def test_atomic_read_keeps_content_and_state_in_one_snapshot(database, operation
                 return value
 
             with monkeypatch.context() as patch:
-                patch.setattr(repository, "latest", interleaved_latest)
+                patch.setattr(repository, read_method, interleaved_read)
                 if operation == "get":
                     first = await asyncio.wait_for(memory.get(created.artifact_id), timeout=20)
                 else:

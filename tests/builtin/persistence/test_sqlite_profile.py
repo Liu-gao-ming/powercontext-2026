@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from functools import partial
 from threading import Event as ThreadEvent
 from typing import cast
@@ -23,12 +24,14 @@ import aiosqlite
 import anyio
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, insert, select
+from sqlalchemy import Connection as SyncConnection
+from sqlalchemy import event, func, insert, select
 from sqlalchemy.exc import IntegrityError, PendingRollbackError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import QueuePool
 
 from powercontext.builtin.persistence.database import AsyncDatabase
+from powercontext.builtin.persistence.errors import PersistenceError
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.persistence.sqlite import profile as sqlite_profile
 from powercontext.builtin.persistence.tables import (
@@ -36,6 +39,29 @@ from powercontext.builtin.persistence.tables import (
     ARTIFACTS_TABLE,
     SHARED_TABLES,
 )
+
+
+@pytest.mark.parametrize("existing", (False, True))
+@pytest.mark.parametrize("version", ((3, 34, 1), (3, 37, 2)))
+def test_unsupported_sqlite_is_rejected_without_changing_storage(tmp_path, monkeypatch, existing, version) -> None:
+    database = tmp_path / "legacy.db"
+    if existing:
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE preserved (value TEXT)")
+            connection.execute("INSERT INTO preserved VALUES ('keep')")
+    before = database.read_bytes() if existing else None
+    # Simulate the linked-library version; the test host still runs its installed SQLite.
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", version)
+    monkeypatch.setattr(sqlite3, "sqlite_version", ".".join(map(str, version)))
+
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{database}")
+        with pytest.raises(PersistenceError, match=r"SQLite 3\.38\.0.*this Python uses SQLite"):
+            async with SQLiteProfile.open(config, tables=SHARED_TABLES):
+                pytest.fail("Unsupported SQLite must not accept database operations")
+
+    asyncio.run(scenario())
+    assert (database.read_bytes() if database.exists() else None) == before
 
 
 def test_sqlite_stop_waiters_finish_when_another_waiter_is_cancelled(tmp_path) -> None:
@@ -380,6 +406,71 @@ def test_invalidated_connection_still_reaches_transaction_cleanup() -> None:
             await asyncio.wait_for(database.close(), 5)
         finally:
             await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_invalidated_connection_preserves_the_original_cancellation() -> None:
+    """A cancelled statement must still surface as cancellation.
+
+    Once the connection is invalidated, reading ``connection.info`` raises
+    PendingRollbackError. Cleanup must not turn that into the caller's error:
+    the operation was cancelled, and the caller has to see that.
+    """
+
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        database = AsyncDatabase.attach(engine)
+        try:
+            async with database.transaction() as connection:
+                await connection.exec_driver_sql("CREATE TABLE probe (value INTEGER)")
+
+            async def operation() -> None:
+                async with database.transaction() as connection:
+                    await connection.invalidate()
+                    raise asyncio.CancelledError
+
+            task = asyncio.create_task(operation())
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert database._active_transactions == 0
+            await asyncio.wait_for(database.close(), 5)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_marker_recorded_during_commit_does_not_survive_the_transaction(tmp_path) -> None:
+    """The interruption check runs before COMMIT.
+
+    A mark recorded while the commit is still in flight therefore lands after
+    that check, and has to be cleared on the way out -- otherwise the next
+    borrower of this pooled connection inherits an interrupt that was never
+    theirs.
+    """
+
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'commit-mark.db'}")
+        async with SQLiteProfile.open(config, tables=()) as profile:
+            database = profile.database
+
+            def plant_mark(connection: SyncConnection) -> None:
+                connection.info["_powercontext_sqlite_interrupted"] = True
+
+            event.listen(database.engine.sync_engine, "commit", plant_mark)
+            try:
+                async with database.transaction() as connection:
+                    await connection.exec_driver_sql("CREATE TABLE probe (value INTEGER)")
+            finally:
+                event.remove(database.engine.sync_engine, "commit", plant_mark)
+
+            async with database.engine.connect() as connection:
+                assert "_powercontext_sqlite_interrupted" not in connection.info
+
+            async with database.transaction() as connection:
+                await connection.exec_driver_sql("INSERT INTO probe VALUES (1)")
 
     asyncio.run(scenario())
 

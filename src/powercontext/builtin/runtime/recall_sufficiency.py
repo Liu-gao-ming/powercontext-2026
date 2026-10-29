@@ -173,10 +173,9 @@ class RecallSufficiencyPolicy:
     means "use this module's historical constants" and is therefore bit-identical to a
     disabled lookup; a separate ``base_admission`` field would only duplicate that default.
 
-    ``rerank_enabled`` is read from Runtime configuration, not from whether a reranker
-    instance exists, because the gate must decide *before* searching whether expansion is
-    allowed at all. If configuration and reality ever diverge, the cost column stays honest
-    separately: ``added_generation_calls`` is filled from the search-reported rerank counts.
+    Runtime assembly supplies the effective rerank strategy, including injected rerankers,
+    so the gate decides before searching whether expansion is allowed. Cost accounting
+    uses the search-reported rerank counts independently.
     """
 
     policy_id: str = POLICY_ID
@@ -456,8 +455,13 @@ def build_recall_candidates(
 def _normalize_memory_score(hit: AtomicMemorySearchHit) -> float:
     """Normalize fused RRF ranking against its per-channel upper bound, not a probability."""
 
-    channels = max(1, len(hit.matched_by))
-    upper_bound = channels / (_RRF_CONSTANT + 1)
+    upper_bound = hit.score_upper_bound
+    if upper_bound is None:
+        # Compatibility fallback for unweighted or externally reconstructed hits.
+        # The internal weighted bound is excluded from serialization, so an in-process
+        # weighted fusion must supply it; the exact weighted scale cannot be recovered here.
+        channels = max(1, len(hit.matched_by))
+        upper_bound = channels / (_RRF_CONSTANT + 1)
     if upper_bound <= 0.0:
         return 0.0
     return max(0.0, min(1.0, hit.hit.score / upper_bound))

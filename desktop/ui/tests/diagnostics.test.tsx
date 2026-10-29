@@ -47,5 +47,21 @@ test("valid unhealthy results retain their exit code and diagnostic states", asy
   await user.click(screen.getByRole("button", { name: "检查本机服务" }));
   expect(screen.getByText("未运行")).toBeTruthy();
   expect(screen.getByText(/退出码: 1/)).toBeTruthy();
+  expect(screen.getByText("CLI 版本: 未知")).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("the observed CLI version is displayed as diagnostic information", async () => {
+  const user = userEvent.setup();
+  vi.mocked(desktopApi.diagnostics).mockResolvedValue({
+    checkedAt: 1,
+    exitCode: 0,
+    cliVersion: "1.3.1.dev2+g338dfa00d",
+    items: [],
+    hosts: [],
+  });
+  render(<Diagnostics language="en" />);
+  await user.click(screen.getByRole("button", { name: "Check local service" }));
+  expect(screen.getByText("CLI version: 1.3.1.dev2+g338dfa00d")).toBeTruthy();
   expect(screen.queryByRole("alert")).toBeNull();
 });

@@ -17,13 +17,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from subprocess import CompletedProcess
-from unittest.mock import Mock
 
+import pytest
 from typer.testing import CliRunner
 
 import powercontext.cli.hermes as hermes_cli
 from powercontext.cli.app import create_cli
-from powercontext.cli.system import SetupError, doctor_app, setup_app
+from powercontext.cli.system import doctor_app, setup_app
 
 
 def _write_plugin(root: Path) -> Path:
@@ -63,12 +63,12 @@ def _successful_hermes_run(command: list[str], **_kwargs) -> CompletedProcess[st
         return CompletedProcess(command, 0, stdout="Hermes Agent v0.20.4 (2026.8.18)\n", stderr="")
     if command[1:3] == ["plugins", "doctor"]:
         return CompletedProcess(command, 0, stdout="Plugin Doctor: OK\n", stderr="")
-    if command[1:3] == ["plugins", "enable"]:
-        return CompletedProcess(command, 0, stdout="Plugin enabled\n", stderr="")
     raise AssertionError(command)
 
 
-def test_setup_hermes_copies_provider_from_a_local_checkout(tmp_path: Path, monkeypatch) -> None:
+def test_setup_hermes_copies_provider_from_a_local_checkout(
+    tmp_path: Path, monkeypatch, installed_agent_checks, hermes_activation
+) -> None:
     checkout = tmp_path / "powercontext"
     _write_plugin(checkout)
     hermes_home = tmp_path / "hermes"
@@ -89,7 +89,7 @@ def test_setup_hermes_copies_provider_from_a_local_checkout(tmp_path: Path, monk
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.output) == {
+    assert json.loads(result.output)["hosts"]["hermes"]["result"] == {
         "plugin": "powercontext",
         "plugin_path": str(hermes_home / "plugins" / "powercontext"),
         "hermes_home": str(hermes_home),
@@ -102,7 +102,33 @@ def test_setup_hermes_copies_provider_from_a_local_checkout(tmp_path: Path, monk
     assert (unrelated_plugin / "keep.txt").read_text(encoding="utf-8") == "keep\n"
 
 
-def test_setup_hermes_restores_both_plugins_when_second_replace_fails(tmp_path: Path, monkeypatch) -> None:
+def test_setup_hermes_refuses_package_omitting_installed_guidance(
+    tmp_path: Path, monkeypatch, installed_agent_checks, hermes_activation
+) -> None:
+    checkout = tmp_path / "powercontext"
+    _write_plugin(checkout)
+    home = tmp_path / "hermes"
+    installed = _write_installed_plugins(home)
+    guidance = installed / "skills/powercontext-project-context/SKILL.md"
+    guidance.parent.mkdir(parents=True)
+    original = b"Preserve these installed instructions and notes.\r\n"
+    guidance.write_bytes(original)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
+    monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
+    monkeypatch.setattr(hermes_cli.subprocess, "run", _successful_hermes_run)
+
+    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "hermes", "--source", str(checkout)])
+
+    assert result.exit_code == 1
+    assert "omits existing guidance" in result.output
+    assert guidance.read_bytes() == original
+    assert sorted(path.name for path in (home / "plugins").iterdir()) == ["powercontext", "powercontext-command"]
+
+
+def test_setup_hermes_restores_both_plugins_when_second_replace_fails(
+    tmp_path: Path, monkeypatch, installed_agent_checks, hermes_activation
+) -> None:
     checkout = tmp_path / "powercontext"
     _write_plugin(checkout)
     hermes_home = tmp_path / "hermes"
@@ -123,7 +149,7 @@ def test_setup_hermes_restores_both_plugins_when_second_replace_fails(tmp_path: 
 
     def fail_second_replace(source, destination):
         nonlocal failed
-        if not failed and Path(destination) == old_command and Path(source).name.startswith(f".{old_command.name}-"):
+        if not failed and Path(destination) == old_command and Path(source).name == old_command.name:
             failed = True
             raise OSError
         original_replace(source, destination)
@@ -143,7 +169,9 @@ def test_setup_hermes_restores_both_plugins_when_second_replace_fails(tmp_path: 
     assert not list((hermes_home / "plugins").glob(".powercontext*"))
 
 
-def test_setup_hermes_restores_both_plugins_when_enable_fails(tmp_path: Path, monkeypatch) -> None:
+def test_setup_hermes_keeps_both_plugins_when_validation_fails(
+    tmp_path: Path, monkeypatch, installed_agent_checks, hermes_activation
+) -> None:
     checkout = tmp_path / "powercontext"
     _write_plugin(checkout)
     hermes_home = tmp_path / "hermes"
@@ -159,14 +187,7 @@ def test_setup_hermes_restores_both_plugins_when_enable_fails(tmp_path: Path, mo
     monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
     monkeypatch.setattr(hermes_cli.subprocess, "run", _successful_hermes_run)
 
-    enabled = False
-
-    def fail_enable(_executable: str, _name: str) -> None:
-        nonlocal enabled
-        enabled = True
-        raise SetupError
-
-    monkeypatch.setattr(hermes_cli, "_enable_hermes_plugin", fail_enable)
+    (checkout / "integrations/hermes/plugins/powercontext-command/plugin.yaml").unlink()
 
     result = CliRunner().invoke(
         create_cli([setup_app]),
@@ -174,14 +195,15 @@ def test_setup_hermes_restores_both_plugins_when_enable_fails(tmp_path: Path, mo
     )
 
     assert result.exit_code == 1
-    assert enabled
     assert (old_provider / "version.txt").read_text(encoding="utf-8") == "old provider\n"
     assert (old_command / "version.txt").read_text(encoding="utf-8") == "old command\n"
     assert (unrelated_plugin / "keep.txt").read_text(encoding="utf-8") == "keep\n"
     assert not list((hermes_home / "plugins").glob(".powercontext*"))
 
 
-def test_setup_hermes_reports_missing_cli(tmp_path: Path, monkeypatch) -> None:
+def test_setup_hermes_reports_missing_cli(
+    tmp_path: Path, monkeypatch, installed_agent_checks, hermes_activation
+) -> None:
     monkeypatch.setattr(hermes_cli, "which", lambda _name: None)
 
     result = CliRunner().invoke(
@@ -193,9 +215,12 @@ def test_setup_hermes_reports_missing_cli(tmp_path: Path, monkeypatch) -> None:
     assert "Hermes CLI is not installed" in result.output
 
 
-def test_doctor_hermes_reports_an_installed_provider(tmp_path: Path, monkeypatch) -> None:
+def test_doctor_hermes_reports_an_installed_provider(tmp_path: Path, monkeypatch, server_checks) -> None:
     hermes_home = tmp_path / "hermes"
     _write_installed_plugins(hermes_home)
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n  provider: powercontext\nplugins:\n  enabled: [powercontext-command]\n"
+    )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
     monkeypatch.setattr(hermes_cli.subprocess, "run", _successful_hermes_run)
@@ -203,7 +228,7 @@ def test_doctor_hermes_reports_an_installed_provider(tmp_path: Path, monkeypatch
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "hermes", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.output)["hosts"]["hermes"]
     assert payload["ok"] is True
     assert payload["checks"]["hermes"] == {
         "ok": True,
@@ -222,7 +247,7 @@ def test_doctor_hermes_reports_an_installed_provider(tmp_path: Path, monkeypatch
     }
 
 
-def test_doctor_hermes_reports_missing_provider(tmp_path: Path, monkeypatch) -> None:
+def test_doctor_hermes_reports_missing_provider(tmp_path: Path, monkeypatch, server_checks) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
     monkeypatch.setattr(hermes_cli.subprocess, "run", _successful_hermes_run)
@@ -230,13 +255,15 @@ def test_doctor_hermes_reports_missing_provider(tmp_path: Path, monkeypatch) -> 
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "hermes"])
 
     assert result.exit_code == 1
-    assert "hermes: ok - /usr/bin/hermes (Hermes Agent v0.20.4)" in result.output
     assert "plugin: failed - PowerContext Hermes plugin is not installed" in result.output
 
 
-def test_doctor_hermes_rejects_a_broken_provider(tmp_path: Path, monkeypatch) -> None:
+def test_doctor_hermes_rejects_a_broken_provider(tmp_path: Path, monkeypatch, server_checks) -> None:
     hermes_home = tmp_path / "hermes"
     _write_installed_plugins(hermes_home)
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n  provider: powercontext\nplugins:\n  enabled: [powercontext-command]\n"
+    )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
 
@@ -250,18 +277,16 @@ def test_doctor_hermes_rejects_a_broken_provider(tmp_path: Path, monkeypatch) ->
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "hermes", "--json"])
 
     assert result.exit_code == 1
-    payload = json.loads(result.output)
+    payload = json.loads(result.output)["hosts"]["hermes"]
     assert payload["ok"] is False
     assert payload["checks"]["plugin"]["status"] == "failed"
     assert "ImportError" in payload["checks"]["plugin"]["detail"]
 
 
-def test_doctor_hermes_rejects_an_unsupported_version(monkeypatch) -> None:
+def test_doctor_hermes_rejects_an_unsupported_version(monkeypatch, server_checks) -> None:
     monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
-    calls: list[list[str]] = []
 
     def old_hermes_run(command: list[str], **_kwargs) -> CompletedProcess[str]:
-        calls.append(command)
         return CompletedProcess(command, 0, stdout="Hermes Agent v0.20.3\n", stderr="")
 
     monkeypatch.setattr(hermes_cli.subprocess, "run", old_hermes_run)
@@ -269,48 +294,60 @@ def test_doctor_hermes_rejects_an_unsupported_version(monkeypatch) -> None:
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "hermes", "--json"])
 
     assert result.exit_code == 1
-    payload = json.loads(result.output)
+    payload = json.loads(result.output)["hosts"]["hermes"]
     assert payload["checks"]["hermes"]["status"] == "failed"
     assert "requires Hermes Agent v0.20.4 or newer" in payload["checks"]["hermes"]["detail"]
     assert payload["checks"]["plugin"]["status"] == "skipped"
-    assert len(calls) == 1
 
 
-def test_setup_hermes_remote_checkout_uses_the_requested_ref(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
-    captured: list[list[str]] = []
+@pytest.mark.parametrize("provider", ["", "other-provider"])
+def test_setup_preserves_hermes_provider_and_companion_disablement(
+    tmp_path, monkeypatch, hermes_activation, server_checks, provider
+):
+    checkout = tmp_path / "source"
+    _write_plugin(checkout)
+    home = tmp_path / "hermes"
+    home.mkdir()
+    config = home / "config.yaml"
+    original = f"memory:\n  provider: '{provider}'\nplugins:\n  disabled: [powercontext-command]\n"
+    config.write_text(original)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
+    monkeypatch.setattr(hermes_cli.subprocess, "run", _successful_hermes_run)
+    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "hermes", "--source", str(checkout), "--json"])
+    assert result.exit_code == 1, result.output
+    row = json.loads(result.output)["hosts"]["hermes"]
+    assert row["setup"] == "complete"
+    assert row["checks"]["provider"]["status"] == "failed"
+    assert row["checks"]["command_enabled"]["status"] == "failed"
+    assert config.read_text() == original
 
-    def fake_run(command, **_kwargs):
-        captured.append(command)
-        _write_plugin(Path(command[-1]))
-        return Mock(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(hermes_cli.subprocess, "run", fake_run)
+def test_failed_hermes_configuration_can_finish_activation_on_retry(
+    tmp_path, monkeypatch, hermes_activation, server_checks
+):
+    from powercontext.cli import installation
+    from powercontext.cli.transport import client_config_file
 
-    source = "oceanbase/powercontext"
-    ref = "v0.0.2"
-    plugin = hermes_cli.resolve_hermes_plugin_dir(source=source, ref=ref)
+    checkout = tmp_path / "source"
+    _write_plugin(checkout)
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(hermes_cli, "which", lambda _name: "/usr/bin/hermes")
+    monkeypatch.setattr(hermes_cli.subprocess, "run", _successful_hermes_run)
+    write = installation.write_bytes
 
-    assert plugin == hermes_cli.checkout_target(source, ref) / "integrations" / "hermes" / "plugins" / "powercontext"
-    assert captured[0][:6] == ["git", "clone", "--depth", "1", "--branch", "v0.0.2"]
-    assert captured[0][6] == "https://github.com/oceanbase/powercontext.git"
+    def failed_connection(path, content):
+        if path == client_config_file():
+            raise OSError("cannot write connection")  # noqa: TRY003
+        write(path, content)
 
-
-def test_remote_checkout_is_source_scoped_and_refreshes_mutable_refs(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
-    captured: list[list[str]] = []
-
-    def fake_run(command, **_kwargs):
-        captured.append(command)
-        _write_plugin(Path(command[-1]))
-        return CompletedProcess(command, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(hermes_cli.subprocess, "run", fake_run)
-
-    first = hermes_cli.resolve_hermes_plugin_dir(source="oceanbase/powercontext", ref="master")
-    refreshed = hermes_cli.resolve_hermes_plugin_dir(source="oceanbase/powercontext", ref="master")
-    other_source = hermes_cli.resolve_hermes_plugin_dir(source="other/project", ref="master")
-
-    assert first == refreshed
-    assert first != other_source
-    assert len(captured) == 3
+    arguments = ["setup", "hermes", "--source", str(checkout), "--json"]
+    with monkeypatch.context() as failure:
+        failure.setattr(installation, "write_bytes", failed_connection)
+        first = CliRunner().invoke(create_cli([setup_app]), arguments)
+    assert first.exit_code == 1
+    assert not (home / "config.yaml").exists()
+    retried = CliRunner().invoke(create_cli([setup_app]), arguments)
+    assert retried.exit_code == 0, retried.output
+    assert json.loads(retried.output)["hosts"]["hermes"]["checks"]["provider"]["ok"]

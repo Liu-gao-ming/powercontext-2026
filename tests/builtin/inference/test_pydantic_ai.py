@@ -15,8 +15,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import logging
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -35,10 +38,21 @@ from pydantic_ai.embeddings import (
 )
 from pydantic_ai.embeddings.result import EmbedInputType
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart
+from pydantic_ai.messages import (
+    FinishReason,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ToolCallPart,
+    UserPromptPart,
+)
+from pydantic_ai.models import Model, ModelRequestParameters, ModelResponseState, StreamedResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.instrumented import InstrumentationSettings, InstrumentedModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
@@ -52,6 +66,7 @@ from powercontext.builtin.inference.pydantic_ai import (
     PydanticAIConfigurationError,
     PydanticAIEmbeddingModel,
     PydanticAIStructuredGenerator,
+    StreamingAggregateModel,
     probe_pydantic_ai_model,
 )
 
@@ -331,6 +346,301 @@ def test_structured_generator_times_out_and_cancels_underlying_call() -> None:
         with pytest.raises(InferenceTimeoutError):
             await generation
         assert cleaned_up.is_set()
+
+    asyncio.run(scenario())
+
+
+class _ScriptedStream(StreamedResponse):
+    """Stream scripted chunk events to exercise aggregation edge cases."""
+
+    def __init__(
+        self,
+        script,
+        final_state: ModelResponseState = "complete",
+        finish_reason: FinishReason | None = "stop",
+        usage: RequestUsage | None = None,
+    ) -> None:
+        super().__init__(ModelRequestParameters())
+        self._script = script
+        self._final_state = final_state
+        self._finish_reason = finish_reason
+        self._usage = RequestUsage() if usage is None else usage
+
+    async def _get_event_iterator(self):
+        async for event in self._script(self):
+            yield event
+        self.state = self._final_state
+        self.finish_reason = self._finish_reason
+
+    @property
+    def model_name(self) -> str:
+        return "scripted-stream"
+
+    @property
+    def provider_name(self) -> str:
+        return "test"
+
+    @property
+    def provider_url(self) -> str | None:
+        return None
+
+    async def close_stream(self) -> None:
+        return None
+
+    @property
+    def timestamp(self) -> datetime:
+        return datetime.now(tz=UTC)
+
+
+class _ScriptedModel(Model):
+    """Serve one scripted stream and reject the non-streaming request path."""
+
+    system = "scripted"
+
+    def __init__(self, factory, open_delay_seconds: float = 0.0) -> None:
+        self._factory = factory
+        self._open_delay_seconds = open_delay_seconds
+
+    @property
+    def model_name(self) -> str:
+        return "scripted-model"
+
+    async def request(self, messages, model_settings, model_request_parameters, run_context=None) -> ModelResponse:
+        raise AssertionError("non-streaming path")  # noqa: TRY003
+
+    @asynccontextmanager
+    async def request_stream(self, messages, model_settings, model_request_parameters, run_context=None):
+        await asyncio.sleep(self._open_delay_seconds)
+        yield self._factory()
+
+
+def test_streaming_aggregate_model_aggregates_chunks_usage_and_identity(caplog) -> None:
+    async def chunked_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content=""):
+            yield event
+        for word in ("aggregated ", "value"):
+            for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content=word):
+                yield event
+
+    async def scenario() -> None:
+        stream = _ScriptedStream(chunked_script, usage=RequestUsage(input_tokens=5, output_tokens=7))
+        model = StreamingAggregateModel(_ScriptedModel(lambda: stream), idle_timeout_seconds=5)
+
+        with caplog.at_level(logging.WARNING, logger="powercontext.builtin.inference.pydantic_ai"):
+            response = await model.request(
+                [ModelRequest(parts=[UserPromptPart("bounded evidence")])],
+                ModelSettings(),
+                ModelRequestParameters(),
+            )
+
+        assert list(response.parts) == [TextPart("aggregated value")]
+        assert response.state == "complete"
+        assert response.usage == RequestUsage(input_tokens=5, output_tokens=7)
+        assert response.model_name == "scripted-stream"
+        assert response.provider_name == "test"
+        assert not [record for record in caplog.records if record.levelno == logging.WARNING]
+
+    asyncio.run(scenario())
+
+
+def test_streaming_aggregate_model_warns_when_provider_usage_is_missing(caplog) -> None:
+    async def silent_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content="aggregated value"):
+            yield event
+
+    async def scenario() -> None:
+        # The default RequestUsage reports zero tokens: no final usage chunk arrived.
+        stream = _ScriptedStream(silent_script)
+        model = StreamingAggregateModel(_ScriptedModel(lambda: stream), idle_timeout_seconds=5)
+
+        with caplog.at_level(logging.WARNING, logger="powercontext.builtin.inference.pydantic_ai"):
+            response = await model.request(
+                [ModelRequest(parts=[UserPromptPart("bounded evidence")])],
+                ModelSettings(),
+                ModelRequestParameters(),
+            )
+
+        assert response.state == "complete"
+        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].event == "inference.generation.usage_missing"
+        assert warnings[0].operation == "generate"
+        assert warnings[0].unit == "inference"
+
+    asyncio.run(scenario())
+
+
+def test_streaming_aggregate_model_times_out_when_chunks_stall() -> None:
+    cleaned_up = asyncio.Event()
+
+    async def stalling_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content=""):
+            yield event
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned_up.set()
+
+    async def scenario() -> None:
+        stream = _ScriptedStream(stalling_script)
+        model = StreamingAggregateModel(_ScriptedModel(lambda: stream), idle_timeout_seconds=0.1)
+
+        with pytest.raises(TimeoutError):
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart("bounded evidence")])],
+                ModelSettings(),
+                ModelRequestParameters(),
+            )
+        assert await asyncio.wait_for(cleaned_up.wait(), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_streaming_aggregate_model_rejects_incomplete_provider_response() -> None:
+    async def partial_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content="partial"):
+            yield event
+
+    async def scenario() -> None:
+        stream = _ScriptedStream(partial_script, final_state="incomplete")
+        model = StreamingAggregateModel(_ScriptedModel(lambda: stream), idle_timeout_seconds=5)
+
+        with pytest.raises(InvalidInferenceOutputError):
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart("bounded evidence")])],
+                ModelSettings(),
+                ModelRequestParameters(),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_streaming_aggregate_model_keeps_interleaved_part_deltas() -> None:
+    async def interleaved_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        manager = stream._parts_manager
+        if (
+            event := manager.handle_tool_call_delta(
+                vendor_part_id=0, tool_name="get_weather", args='{"city":', tool_call_id="call_0"
+            )
+        ) is not None:
+            yield event
+        if (
+            event := manager.handle_tool_call_delta(
+                vendor_part_id=1, tool_name="get_time", args='{"tz":', tool_call_id="call_1"
+            )
+        ) is not None:
+            yield event
+        # The first tool call keeps receiving argument deltas after the second one started.
+        if (event := manager.handle_tool_call_delta(vendor_part_id=0, args=' "Beijing"}')) is not None:
+            yield event
+        if (event := manager.handle_tool_call_delta(vendor_part_id=1, args=' "UTC"}')) is not None:
+            yield event
+
+    async def scenario() -> None:
+        stream = _ScriptedStream(interleaved_script)
+        model = StreamingAggregateModel(_ScriptedModel(lambda: stream), idle_timeout_seconds=5)
+
+        response = await model.request(
+            [ModelRequest(parts=[UserPromptPart("weather and time")])],
+            ModelSettings(),
+            ModelRequestParameters(),
+        )
+
+        assert [(part.tool_name, part.args) for part in response.parts if isinstance(part, ToolCallPart)] == [
+            ("get_weather", '{"city": "Beijing"}'),
+            ("get_time", '{"tz": "UTC"}'),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_streaming_aggregate_model_times_out_while_opening_the_stream() -> None:
+    async def scripted_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content="late first chunk"):
+            yield event
+
+    async def scenario() -> None:
+        stream = _ScriptedStream(scripted_script)
+        # Opening the stream stalls before any chunk exists; the watchdog must
+        # cover that phase instead of waiting for the overall generation timeout.
+        model = StreamingAggregateModel(
+            _ScriptedModel(lambda: stream, open_delay_seconds=0.3), idle_timeout_seconds=0.05
+        )
+
+        with pytest.raises(TimeoutError):
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart("bounded evidence")])],
+                ModelSettings(),
+                ModelRequestParameters(),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_streaming_aggregate_model_rejects_eof_without_completion_signal() -> None:
+    async def truncated_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content="partial answer"):
+            yield event
+
+    async def scenario() -> None:
+        # The stream ends cleanly but never carried a finish reason, like an
+        # OpenAI-compatible gateway dropping the connection before the final chunk.
+        stream = _ScriptedStream(truncated_script, finish_reason=None)
+        model = StreamingAggregateModel(_ScriptedModel(lambda: stream), idle_timeout_seconds=5)
+
+        with pytest.raises(InvalidInferenceOutputError):
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart("bounded evidence")])],
+                ModelSettings(),
+                ModelRequestParameters(),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_streaming_aggregate_model_accepts_unmapped_raw_finish_reason() -> None:
+    async def exotic_script(stream: _ScriptedStream) -> AsyncIterator[object]:
+        stream.provider_details = {"finish_reason": "eos"}
+        for event in stream._parts_manager.handle_text_delta(vendor_part_id=0, content="done"):
+            yield event
+
+    async def scenario() -> None:
+        # The gateway reported a finish reason that pydantic_ai does not map to a
+        # known value; the raw signal still proves the provider finished generating.
+        stream = _ScriptedStream(exotic_script, finish_reason=None)
+        model = StreamingAggregateModel(_ScriptedModel(lambda: stream), idle_timeout_seconds=5)
+
+        response = await model.request(
+            [ModelRequest(parts=[UserPromptPart("bounded evidence")])],
+            ModelSettings(),
+            ModelRequestParameters(),
+        )
+
+        assert response.state == "complete"
+        assert [part.content for part in response.parts if isinstance(part, TextPart)] == ["done"]
+
+    asyncio.run(scenario())
+
+
+def test_structured_generator_runs_the_aggregate_wrapper_end_to_end() -> None:
+    async def chunked_stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+        del messages, info
+        for word in ('{"value":', ' "chunked"}'):
+            yield word
+
+    async def scenario() -> None:
+        generator = PydanticAIStructuredGenerator(
+            model=StreamingAggregateModel(FunctionModel(stream_function=chunked_stream), idle_timeout_seconds=5),
+            instructions="Return a value.",
+            input_type=Question,
+            output_type=Answer,
+            limits=InferenceLimits(timeout_seconds=10, max_requests=2),
+        )
+
+        result = await generator.generate(Question("bounded evidence"))
+
+        assert result.output == Answer("chunked")
+        assert result.usage.requests == 1
 
     asyncio.run(scenario())
 

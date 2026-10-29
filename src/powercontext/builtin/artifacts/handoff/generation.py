@@ -16,10 +16,11 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
-from typing import Literal, Protocol, TypeAlias
+from typing import Annotated, Literal, Protocol, TypeAlias
 
-from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, model_validator
 
 from powercontext.artifacts import Artifact
 from powercontext.builtin.artifacts.handoff.models import (
@@ -30,6 +31,7 @@ from powercontext.builtin.artifacts.handoff.models import (
     HandoffGenerationEvidence,
     HandoffGenerationRequest,
     HandoffOmission,
+    HandoffRolloverReason,
     HandoffSourceEvidence,
     HandoffStatement,
 )
@@ -53,8 +55,19 @@ class HandoffGenerationInput(BaseModel):
     """Caller-owned objective, bounded evidence, and output budget."""
 
     objective: str
+    rollover_reasons: Annotated[
+        tuple[HandoffRolloverReason, ...],
+        Field(max_length=6),
+    ] = ()
     evidence: tuple[HandoffGenerationEvidenceInput, ...]
     max_bytes: int
+
+    @model_validator(mode="after")
+    def require_unique_rollover_reasons(self) -> HandoffGenerationInput:
+        for index, reason in enumerate(self.rollover_reasons):
+            if reason in self.rollover_reasons[:index]:
+                raise ValueError("Handoff rollover reasons must be unique")  # noqa: TRY003
+        return self
 
 
 class HandoffGenerationStatement(BaseModel):
@@ -148,6 +161,32 @@ def _validated_output(result: GenerationResult[HandoffGenerationOutput]) -> Hand
         raise InvalidInferenceOutputError("handoff-generate", "generator returned an invalid output tree") from error
 
 
+_ROLLOVER_TRANSCRIPT_INSTRUCTION = re.compile(
+    r"\b(?:continue\s+(?:the\s+previous\s+work|above)|see\s+the\s+conversation\s+above)\s*[.!?]*\s*\Z",
+    re.IGNORECASE,
+)
+
+
+def rollover_draft_violation(draft: HandoffDraft) -> str | None:
+    """Return the deterministic RFC 1783 rollover violation, if any.
+
+    The caller owns ``objective`` and the generator must preserve it exactly, so this checks
+    only generated checkpoint content. It rejects a direct instruction to rely on an old
+    transcript, not a descriptive or quoted mention of that instruction. A blocked checkpoint
+    may have no next action because the blocker itself explains why the fresh session cannot
+    continue safely.
+    """
+
+    if draft.next_action is None and draft.disposition == "continuable":
+        return "rollover_next_action"
+    texts = [*(statement.text for statement in draft.state)]
+    if draft.next_action is not None:
+        texts.append(draft.next_action.text)
+    if any(_ROLLOVER_TRANSCRIPT_INSTRUCTION.search(text) for text in texts):
+        return "rollover_quality"
+    return None
+
+
 def _generation_input(
     request: HandoffGenerationRequest,
     projector: HandoffEvidenceProjector,
@@ -167,6 +206,7 @@ def _generation_input(
     return (
         HandoffGenerationInput(
             objective=request.objective,
+            rollover_reasons=request.rollover_reasons,
             evidence=tuple(values),
             max_bytes=request.max_bytes,
         ),

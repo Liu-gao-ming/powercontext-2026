@@ -17,23 +17,28 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import struct
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import delete, event, func, insert, select, text, update
+from sqlalchemy import Table, delete, event, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.artifacts import ArtifactRef
+from powercontext.artifacts.fusion import FusionSelection
 from powercontext.builtin.artifacts.memory import EmbeddingProfile
-from powercontext.builtin.artifacts.search import AdmissionFloor, fts_match_query
+from powercontext.builtin.artifacts.search import AdmissionFloor, RecallChannelWeights, fts_match_query
 from powercontext.builtin.artifacts.topic_memory import (
     MAX_TOPIC_MEMORY_QUERY_LENGTH,
     MAX_TOPIC_MEMORY_SEARCH_LIMIT,
     TOPIC_MEMORY_CHUNK_MAX_COUNT,
+    TopicArtifactSearchRequest,
     TopicMemory,
     TopicMemoryBrowseCursor,
+    TopicMemoryCapabilities,
     TopicMemoryCapabilityError,
+    TopicMemoryChannelHit,
     TopicMemoryChunk,
     TopicMemoryContent,
     TopicMemoryDraft,
@@ -41,6 +46,7 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemoryProjectionError,
     TopicMemorySearchChannels,
     TopicMemorySearchRequest,
+    TopicMemorySearchResult,
     TopicMemoryStorageInvariantError,
     prepare_topic_memory_projection,
 )
@@ -70,6 +76,7 @@ from powercontext.builtin.persistence.topic_memory_index import (
     TopicMemoryIndex,
     topic_memory_embedding_profile_fingerprint,
 )
+from powercontext.builtin.records import InvalidBaseAccessRequestError
 from powercontext.sources import SourceMaterialization, SourceRef
 from tests.builtin.persistence.contract import SOURCE_ADAPTERS, NoteSource
 
@@ -99,6 +106,17 @@ class _SwitchableIndex:
         if self.fail_replace:
             raise RuntimeError("injected projection failure")  # noqa: TRY003
 
+    async def replace_many(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        items: Sequence[tuple[ArtifactRef, TopicMemoryProjection]],
+        /,
+    ) -> None:
+        await self.delegate.replace_many(connection, scope_id, items)
+        if self.fail_replace:
+            raise RuntimeError("injected projection failure")  # noqa: TRY003
+
     async def search(
         self,
         connection: AsyncConnection,
@@ -107,15 +125,6 @@ class _SwitchableIndex:
         /,
     ) -> TopicMemorySearchChannels:
         return await self.delegate.search(connection, scope_id, request)
-
-    async def vector_complete(
-        self,
-        connection: AsyncConnection,
-        scope_id: str,
-        topic_ref: ArtifactRef,
-        /,
-    ) -> bool:
-        return await self.delegate.vector_complete(connection, scope_id, topic_ref)
 
 
 def _content(label: str, detail_term: str) -> TopicMemoryContent:
@@ -140,8 +149,6 @@ def _fts_index() -> CompositeTopicMemoryIndex:
 
 
 def test_public_topic_search_keeps_signed_fts_metadata_and_exact_artifacts() -> None:
-    from powercontext.builtin.artifacts.topic_memory import TopicArtifactSearchRequest
-
     async def scenario() -> None:
         index = _fts_index()
         repository = TopicMemoryRepository(index=index)
@@ -174,13 +181,178 @@ def test_public_topic_search_keeps_signed_fts_metadata_and_exact_artifacts() -> 
             assert plain.artifacts is not None
             assert plain.artifacts[0] == publication.topic
             assert plain.artifacts[0].as_ref() == scored.matches[0].artifact_ref
-            assert legacy.artifacts is None
+            assert tuple(hit.artifact_ref for hit in legacy.hits) == tuple(hit.artifact_ref for hit in plain.hits)
             assert empty.artifacts == ()
             assert plain.matches[0].channel_scores is None
             assert scored.matches[0].channel_scores is not None
             assert scored.matches[0].channel_scores["topic_fts"].raw < 0
             assert scored.matches[0].channel_scores["topic_fts"].metric == "sqlite_bm25"
             assert scored.matches[0].channel_scores["detail_fts"].raw < 0
+
+    asyncio.run(scenario())
+
+
+def test_topic_search_deployment_weights_change_results_and_request_fusion_replaces_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedding_profile = EmbeddingProfile(profile_id="topic-test-v1", model="test", dimension=2)
+    lexical_ref = ArtifactRef(family="topic-memory", artifact_id="lexical", revision=1)
+    semantic_ref = ArtifactRef(family="topic-memory", artifact_id="semantic", revision=1)
+    channels = TopicMemorySearchChannels(
+        topic_fts=(
+            TopicMemoryChannelHit(
+                artifact_ref=lexical_ref,
+                title="Needle lexical topic",
+                summary="Needle lexical evidence",
+                channel="topic_fts",
+            ),
+        ),
+        topic_vector=(
+            TopicMemoryChannelHit(
+                artifact_ref=semantic_ref,
+                title="Semantic topic",
+                summary="Semantic evidence",
+                channel="topic_vector",
+                distance=0.1,
+            ),
+        ),
+    )
+
+    class StaticIndex:
+        capabilities = TopicMemoryCapabilities(
+            fts=True,
+            vector=True,
+            hybrid=True,
+            embedding_profile=embedding_profile,
+        )
+        tables: tuple[Table, ...] = ()
+
+        async def initialize(self, _connection: AsyncConnection, /) -> None:
+            pass
+
+        async def validate_current(self, _connection: AsyncConnection, /) -> None:
+            pass
+
+        async def replace(
+            self,
+            _connection: AsyncConnection,
+            _scope_id: str,
+            _topic_ref: ArtifactRef,
+            _projection: TopicMemoryProjection,
+            /,
+        ) -> None:
+            pass
+
+        async def replace_many(
+            self,
+            _connection: AsyncConnection,
+            _scope_id: str,
+            _items: Sequence[tuple[ArtifactRef, TopicMemoryProjection]],
+            /,
+        ) -> None:
+            pass
+
+        async def search(
+            self,
+            _connection: AsyncConnection,
+            _scope_id: str,
+            _request: TopicMemorySearchRequest,
+            /,
+        ) -> TopicMemorySearchChannels:
+            return channels
+
+    topics = {
+        ref.artifact_id: TopicMemory(
+            artifact_id=ref.artifact_id,
+            revision=ref.revision,
+            content=TopicMemoryContent(title=ref.artifact_id, summary="Evidence", detail="Evidence detail"),
+        )
+        for ref in (lexical_ref, semantic_ref)
+    }
+    default_repository = TopicMemoryRepository(index=StaticIndex())
+    equal_repository = TopicMemoryRepository(
+        index=StaticIndex(),
+        recall_channel_weights=RecallChannelWeights(fts=1.0, vector=1.0),
+    )
+    fts_weighted_repository = TopicMemoryRepository(
+        index=StaticIndex(),
+        recall_channel_weights=RecallChannelWeights(fts=3.0, vector=1.0),
+    )
+    vector_weighted_repository = TopicMemoryRepository(
+        index=StaticIndex(),
+        recall_channel_weights=RecallChannelWeights(fts=1.0, vector=3.0),
+    )
+
+    async def get_topics(_connection: AsyncConnection, _scope_id: str, refs) -> tuple[TopicMemory, ...]:
+        return tuple(topics[ref.artifact_id] for ref in refs)
+
+    for repository in (
+        default_repository,
+        equal_repository,
+        fts_weighted_repository,
+        vector_weighted_repository,
+    ):
+        monkeypatch.setattr(repository.artifacts, "get_many", get_topics)
+
+    async def scenario() -> None:
+        async with (
+            SQLiteProfile.open(SQLiteConfig(), tables=BUILTIN_TABLES) as profile,
+            profile.database.transaction() as connection,
+        ):
+            await default_repository.initialize(connection)
+
+            async def search(
+                repository: TopicMemoryRepository,
+                *,
+                artifact_request: TopicArtifactSearchRequest | None = None,
+            ) -> TopicMemorySearchResult:
+                return await repository.search(
+                    connection,
+                    "scope-a",
+                    "needle",
+                    limit=2,
+                    mode="hybrid",
+                    query_vector=(1.0, 0.0),
+                    embedding_profile=embedding_profile,
+                    artifact_request=artifact_request,
+                )
+
+            default_result = await search(default_repository)
+            equal_result = await search(equal_repository)
+            fts_weighted_result = await search(fts_weighted_repository)
+            vector_weighted_result = await search(vector_weighted_repository)
+            request_weighted_result = await search(
+                fts_weighted_repository,
+                artifact_request=TopicArtifactSearchRequest(
+                    query="needle",
+                    mode="hybrid",
+                    fusion=FusionSelection(
+                        method="rrf",
+                        params={
+                            "weights": {
+                                "topic_vector": 3.0,
+                                "detail_vector": 3.0,
+                            }
+                        },
+                    ),
+                ),
+            )
+
+        default_scores = {hit.artifact_ref.artifact_id: hit.score for hit in default_result.hits}
+        equal_scores = {hit.artifact_ref.artifact_id: hit.score for hit in equal_result.hits}
+        fts_weighted_scores = {hit.artifact_ref.artifact_id: hit.score for hit in fts_weighted_result.hits}
+        vector_weighted_scores = {hit.artifact_ref.artifact_id: hit.score for hit in vector_weighted_result.hits}
+        request_weighted_scores = {hit.artifact_ref.artifact_id: hit.score for hit in request_weighted_result.hits}
+
+        assert default_result.hits == equal_result.hits
+        assert default_scores == {"lexical": 25.0, "semantic": 25.0}
+        assert equal_scores == default_scores
+        assert tuple(hit.artifact_ref for hit in fts_weighted_result.hits) == (lexical_ref, semantic_ref)
+        assert fts_weighted_scores == {"lexical": 37.5, "semantic": 12.5}
+        assert tuple(hit.artifact_ref for hit in vector_weighted_result.hits) == (semantic_ref, lexical_ref)
+        assert vector_weighted_scores == {"lexical": 12.5, "semantic": 37.5}
+        assert tuple(hit.artifact_ref for hit in request_weighted_result.hits) == (semantic_ref, lexical_ref)
+        assert request_weighted_scores == vector_weighted_scores
 
     asyncio.run(scenario())
 
@@ -206,7 +378,7 @@ def test_public_topic_missing_selected_exact_revision_is_a_contract_failure(monk
             async def missing(connection, scope, ref):
                 raise RepositoryNotFoundError("artifact", ref)
 
-            monkeypatch.setattr(repository.artifacts, "get", missing)
+            monkeypatch.setattr(repository.artifacts, "get_many", missing)
             legacy = await repository.search(connection, "scope-a", "needle", limit=10)
             assert len(legacy.hits) == 1
             with pytest.raises(ArtifactSearchContractError):
@@ -381,6 +553,9 @@ def test_publication_retains_exact_revisions_and_searches_only_the_current_scope
             async with profile.database.transaction() as connection:
                 old = await repository.get_exact(connection, "scope-a", first.topic.as_ref())
                 current = await repository.get_exact(connection, "scope-a", second.topic.as_ref())
+                batch = await repository.get_exact_many(
+                    connection, "scope-a", (second.topic.as_ref(), first.topic.as_ref(), second.topic.as_ref())
+                )
                 browse = await repository.browse_current(connection, "scope-a", limit=10)
                 old_search = await repository.search(connection, "scope-a", "saffron", limit=10)
                 current_search = await repository.search(connection, "scope-a", "zircon", limit=10)
@@ -398,6 +573,7 @@ def test_publication_retains_exact_revisions_and_searches_only_the_current_scope
             assert not old.is_current
             assert old.current_artifact == second.topic.as_ref()
             assert current.is_current
+            assert batch == (current, old, current)
             assert current.topic.lineage.sources == (source.ref,)
             assert current.topic.lineage.artifacts == (first.topic.as_ref(),)
             assert tuple(item.artifact_ref for item in browse) == (second.topic.as_ref(),)
@@ -480,7 +656,8 @@ def test_current_browse_uses_stable_exclusive_keyset_order() -> None:
     asyncio.run(scenario())
 
 
-def test_standard_artifact_list_adapts_topic_memory_metadata_and_cursor() -> None:
+@pytest.mark.parametrize("limit", [1, 100])
+def test_standard_artifact_list_adapts_topic_memory_metadata_and_cursor(limit: int) -> None:
     async def scenario() -> None:
         index = _fts_index()
         sources = SourceRepository(SOURCE_ADAPTERS)
@@ -519,13 +696,14 @@ def test_standard_artifact_list_adapts_topic_memory_metadata_and_cursor() -> Non
                     _draft(older, sources=(source.ref,)),
                     prepare_topic_memory_projection(older),
                 )
-                await repository.publish_create(
-                    connection,
-                    "scope-a",
-                    "topic-newer",
-                    _draft(newer, sources=(source.ref,)),
-                    prepare_topic_memory_projection(newer),
-                )
+                for number in range(limit):
+                    await repository.publish_create(
+                        connection,
+                        "scope-a",
+                        "topic-newer" if number == 0 else f"topic-newer-{number:03d}",
+                        _draft(newer, sources=(source.ref,)),
+                        prepare_topic_memory_projection(newer),
+                    )
                 await connection.execute(
                     update(TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE)
                     .where(
@@ -538,19 +716,24 @@ def test_standard_artifact_list_adapts_topic_memory_metadata_and_cursor() -> Non
                     update(TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE)
                     .where(
                         TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE.c.scope_id == "scope-a",
-                        TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE.c.artifact_id == "topic-newer",
+                        TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE.c.artifact_id != "topic-older",
                     )
                     .values(published_at=datetime(2026, 9, 6, 3, 4, 5, tzinfo=UTC))
                 )
 
-            first_page = await records.query_artifacts("scope-a", TopicMemory.family, limit=1, cursor=None)
+            first_page = await records.query_artifacts("scope-a", TopicMemory.family, limit=limit, cursor=None)
             second_page = await records.query_artifacts(
                 "scope-a",
                 TopicMemory.family,
-                limit=1,
+                limit=limit,
                 cursor=first_page.next_cursor,
             )
 
+            with pytest.raises(InvalidBaseAccessRequestError):
+                await records.query_artifacts("scope-a", TopicMemory.family, limit=101, cursor=None)
+
+        assert len(first_page.items) == limit
+        assert len({item.artifact_id for item in first_page.items}) == limit
         assert first_page.next_cursor is not None
         assert first_page.items[0].artifact_id == "topic-newer"
         assert first_page.items[0].title == "Newer recovery"
@@ -738,8 +921,8 @@ def test_default_topic_memory_search_preserves_eligible_candidates_before_trunca
 
         assert tuple(hit.artifact_ref for hit in result.hits) == (published.topic.as_ref(),)
         assert result.admission is not None
-        assert result.admission.retrieved > MAX_TOPIC_MEMORY_SEARCH_LIMIT
-        assert result.admission.admitted >= 1
+        assert result.admission.admitted > 0
+        assert result.admission.rejected is not None and result.admission.rejected > 0
 
     asyncio.run(scenario())
 
@@ -1245,7 +1428,7 @@ def test_startup_rejects_a_topic_revision_without_publication_metadata() -> None
     asyncio.run(scenario())
 
 
-def test_search_rechecks_shape_after_a_concurrent_empty_store_switch(tmp_path: Path) -> None:
+def test_search_snapshot_excludes_a_concurrent_shape_switch_and_rejects_it_on_the_next_read(tmp_path: Path) -> None:
     async def scenario() -> None:
         embedding_profile = EmbeddingProfile(
             profile_id="old", model="test", dimension=2, distance="l2", normalization="unit"
@@ -1272,18 +1455,21 @@ def test_search_rechecks_shape_after_a_concurrent_empty_store_switch(tmp_path: P
             old = TopicMemoryRepository(index=SwitchDuringSearch(hybrid))
             async with profile.database.transaction() as connection:
                 await old.initialize(connection)
+            async with profile.database.transaction(consistent_snapshot=True) as reader:
+                result = await old.search(
+                    reader,
+                    "scope-a",
+                    "evidence",
+                    limit=2,
+                    mode="hybrid",
+                    query_vector=(1.0, 0.0),
+                    embedding_profile=embedding_profile,
+                )
+                assert result.mode == "hybrid" and not result.hits
             with pytest.raises(TopicMemoryCapabilityError, match="retrieval-shape"):
-                async with profile.database.transaction() as reader:
-                    await old.search(
-                        reader,
-                        "scope-a",
-                        "evidence",
-                        limit=2,
-                        mode="hybrid",
-                        query_vector=(1.0, 0.0),
-                        embedding_profile=embedding_profile,
-                    )
-            async with profile.database.transaction() as reader:
+                async with profile.database.transaction(consistent_snapshot=True) as reader:
+                    await old.search(reader, "scope-a", "evidence", limit=2)
+            async with profile.database.transaction(consistent_snapshot=True) as reader:
                 result = await current.search(reader, "scope-a", "evidence", limit=2)
                 assert result.mode == "fts"
                 assert [hit.artifact_ref.artifact_id for hit in result.hits] == ["new"]
@@ -1547,6 +1733,39 @@ def test_sqlite_vector_and_hybrid_require_complete_active_embeddings() -> None:
                     delete(SQLITE_TOPIC_MEMORY_VECTOR_CHUNKS_TABLE).where(
                         SQLITE_TOPIC_MEMORY_VECTOR_CHUNKS_TABLE.c.artifact_id == "topic-alpha"
                     )
+                )
+            with pytest.raises(TopicMemoryStorageInvariantError, match="incomplete-vector"):
+                async with profile.database.transaction() as connection:
+                    await repository.initialize(connection)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("channel", ["topic", "chunk"])
+def test_startup_rejects_native_vector_scope_mapping_corruption(channel: str) -> None:
+    async def scenario() -> None:
+        embedding = EmbeddingProfile(profile_id="scope-mapping", model="fixture", dimension=2)
+        index = CompositeTopicMemoryIndex(SQLiteTopicMemoryFTSIndex(), SQLiteTopicMemoryVectorIndex(embedding))
+        repository = TopicMemoryRepository(index=index)
+        content = _content("Evidence", "scope")
+        projection = prepare_topic_memory_projection(
+            content,
+            topic_embedding=(1.0, 0.0),
+            chunk_embeddings=((1.0, 0.0),),
+            embedding_profile=embedding,
+        )
+        async with SQLiteProfile.open(
+            SQLiteConfig(), tables=BUILTIN_TABLES + index.tables, load_vector_extension=True
+        ) as profile:
+            async with profile.database.transaction() as connection:
+                await repository.initialize(connection)
+                await repository.publish_create(connection, "scope-a", "topic-1", _draft(content), projection)
+                native = f"pc_topic_memory_{channel}_vec"
+                row = (await connection.exec_driver_sql(f"SELECT rowid, embedding FROM {native}")).one()  # noqa: S608
+                await connection.exec_driver_sql(f"DELETE FROM {native} WHERE rowid=?", (row[0],))  # noqa: S608
+                await connection.exec_driver_sql(
+                    f"INSERT INTO {native} (rowid, scope_id, embedding) VALUES (?, ?, ?)",  # noqa: S608
+                    (row[0], "foreign", row[1]),
                 )
             with pytest.raises(TopicMemoryStorageInvariantError, match="incomplete-vector"):
                 async with profile.database.transaction() as connection:
@@ -1899,7 +2118,7 @@ def test_sqlite_vector_probe_rejects_a_detail_channel_dimension_mismatch() -> No
 
 
 def test_sqlite_topic_publication_without_returning_survives_revision_rollback_and_reopen(tmp_path: Path) -> None:
-    """Simulate the pre-3.35 SQL restriction without substituting the storage backend."""
+    """Publish and retrieve revisions when the driver does not use RETURNING."""
 
     def reject_returning(_connection, _cursor, statement, _parameters, _context, _executemany):
         if "RETURNING" in statement.upper():
@@ -1969,7 +2188,7 @@ def test_sqlite_topic_publication_without_returning_survives_revision_rollback_a
                 assert current.topic.content == revised
                 assert current.is_current
                 for scope_id, expected in (("scope-a", second.topic.as_ref()), ("scope-b", first.topic.as_ref())):
-                    for mode in ("vector", "hybrid"):
+                    for mode in ("fts", "vector", "hybrid"):
                         result = await repository.search(
                             connection,
                             scope_id,
@@ -1980,7 +2199,10 @@ def test_sqlite_topic_publication_without_returning_survives_revision_rollback_a
                             embedding_profile=embedding_profile,
                         )
                         assert tuple(hit.artifact_ref for hit in result.hits) == (expected,)
-                        assert {"topic_vector", "detail_vector"} <= set(result.hits[0].matched_by)
+                        if mode in {"fts", "hybrid"}:
+                            assert {"topic_fts", "detail_fts"} <= set(result.hits[0].matched_by)
+                        if mode in {"vector", "hybrid"}:
+                            assert {"topic_vector", "detail_vector"} <= set(result.hits[0].matched_by)
 
     asyncio.run(scenario())
 
@@ -2012,5 +2234,127 @@ def test_sqlite_vector_probe_rejects_unwritable_metadata(table_name: str) -> Non
                 "SELECT count(*) FROM pc_topic_memory_chunk_vec",
             ):
                 assert (await connection.exec_driver_sql(query)).scalar_one() == 0
+
+    asyncio.run(scenario())
+
+
+def test_dense_detail_neighbors_do_not_hide_a_topic_after_chunk_collapse() -> None:
+    import math
+
+    async def scenario() -> None:
+        embedding = EmbeddingProfile(profile_id="dense-topics", model="fixture", dimension=2)
+        index = CompositeTopicMemoryIndex(SQLiteTopicMemoryFTSIndex(), SQLiteTopicMemoryVectorIndex(embedding))
+        repository = TopicMemoryRepository(index=index)
+        async with SQLiteProfile.open(
+            SQLiteConfig(), tables=BUILTIN_TABLES + index.tables, load_vector_extension=True
+        ) as profile:
+            async with profile.database.transaction() as connection:
+                await repository.initialize(connection)
+                dense = TopicMemoryContent(
+                    title="Dense siblings",
+                    summary="Many close detail chunks",
+                    detail="\n\n".join(["small", "a" * 1801] * 44),
+                )
+                unembedded = prepare_topic_memory_projection(dense)
+                projection = prepare_topic_memory_projection(
+                    dense,
+                    topic_embedding=(0.9, math.sqrt(0.19)),
+                    chunk_embeddings=((1.0, 0.0),) * len(unembedded.chunks),
+                    embedding_profile=embedding,
+                )
+                for number in range(32):
+                    await repository.publish_create(
+                        connection, "scope", f"dense-{number:02}", _draft(dense), projection
+                    )
+                background = TopicMemoryContent(title="Background", summary="Other evidence", detail="Other detail")
+                projection = prepare_topic_memory_projection(
+                    background,
+                    topic_embedding=(0.95, math.sqrt(1 - 0.95**2)),
+                    chunk_embeddings=((-1.0, 0.0),),
+                    embedding_profile=embedding,
+                )
+                for number in range(40):
+                    await repository.publish_create(
+                        connection, "scope", f"background-{number:02}", _draft(background), projection
+                    )
+                target = TopicMemoryContent(title="Target", summary="Complementary evidence", detail="Target detail")
+                await repository.publish_create(
+                    connection,
+                    "scope",
+                    "target",
+                    _draft(target),
+                    prepare_topic_memory_projection(
+                        target,
+                        topic_embedding=(1.0, 0.0),
+                        chunk_embeddings=((0.6, 0.8),),
+                        embedding_profile=embedding,
+                    ),
+                )
+            async with profile.database.transaction(consistent_snapshot=True) as connection:
+                result = await repository.search(
+                    connection,
+                    "scope",
+                    "semantic",
+                    limit=20,
+                    mode="vector",
+                    query_vector=(1.0, 0.0),
+                    embedding_profile=embedding,
+                )
+            assert result.hits[0].artifact_ref.artifact_id == "target"
+            assert set(result.hits[0].matched_by) == {"topic_vector", "detail_vector"}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_vector_boundary_ties_preserve_capacity_and_strictly_nearer_topics(reverse: bool) -> None:
+    async def scenario() -> None:
+        embedding = EmbeddingProfile(profile_id="topic-ties", model="fixture", dimension=2)
+        index = CompositeTopicMemoryIndex(SQLiteTopicMemoryFTSIndex(), SQLiteTopicMemoryVectorIndex(embedding))
+        repository = TopicMemoryRepository(index=index)
+        content = TopicMemoryContent(title="Equal topic", summary="Equal evidence", detail="Equal detail")
+        projection = prepare_topic_memory_projection(
+            content,
+            topic_embedding=(0.6, 0.8),
+            chunk_embeddings=((0.6, 0.8),),
+            embedding_profile=embedding,
+        )
+        async with SQLiteProfile.open(
+            SQLiteConfig(), tables=BUILTIN_TABLES + index.tables, load_vector_extension=True
+        ) as profile:
+            async with profile.database.transaction() as connection:
+                await repository.initialize(connection)
+                for number in reversed(range(100)) if reverse else range(100):
+                    await repository.publish_create(
+                        connection, "scope", f"topic-{number:03}", _draft(content), projection
+                    )
+                await repository.publish_create(
+                    connection,
+                    "scope",
+                    "target",
+                    _draft(content),
+                    prepare_topic_memory_projection(
+                        content,
+                        topic_embedding=(1.0, 0.0),
+                        chunk_embeddings=((1.0, 0.0),),
+                        embedding_profile=embedding,
+                    ),
+                )
+            async with profile.database.transaction(consistent_snapshot=True) as connection:
+                result = await repository.search(
+                    connection,
+                    "scope",
+                    "equal",
+                    limit=8,
+                    mode="vector",
+                    query_vector=(1.0, 0.0),
+                    embedding_profile=embedding,
+                )
+            identities = [hit.artifact_ref.artifact_id for hit in result.hits]
+            assert len(set(identities)) == 8
+            assert identities[0] == "target"
+            scores = [hit.score for hit in result.hits]
+            assert scores == sorted(scores, reverse=True)
+            assert all(identity.startswith("topic-") for identity in identities[1:])
 
     asyncio.run(scenario())

@@ -57,36 +57,41 @@ def setup_boundary(tmp_path, monkeypatch):
     return plugin, run, inspect
 
 
-@pytest.mark.parametrize("mode", ["interactive", "explicit", "json", "noninteractive"])
-def test_setup_selects_profile_and_reports_destination(tmp_path, monkeypatch, desktop_command, setup_boundary, mode):
-    import powercontext.cli.system as system
-
-    plugin, run, inspect = setup_boundary
-    profile = "web" if mode in {"json", "noninteractive"} else "desktop"
+@pytest.mark.parametrize("profile", ["web", "desktop"])
+def test_setup_and_default_doctor_reuse_the_selected_native_target(
+    tmp_path, monkeypatch, desktop_command, setup_boundary, profile, server_checks
+):
+    plugin, _, _ = setup_boundary
     desktop_dir = Path(os.environ["DSH_HOME"]) / "profiles/desktop"
     desktop_dir.mkdir(parents=True)
     (desktop_dir / "package.json").write_text("{}")
-    monkeypatch.setattr(system, "stdin_is_tty", lambda: mode in {"interactive", "json"})
-    args = ["setup", "dsh", "--source", str(plugin), "--dsh-command", str(desktop_command)]
-    if mode == "explicit":
-        args += ["--profile", "desktop"]
-    if mode == "json":
-        args += ["--json"]
-    result = CliRunner().invoke(create_cli([setup_app]), args, input="desktop\n")
-    assert result.exit_code == 0, result.output
-    assert run.call_args_list[0].args[2] == profile
-    assert run.call_args_list[0].kwargs["executable"] == str(desktop_command.resolve())
-    assert {call.kwargs["profile"] for call in inspect.call_args_list} == {profile}
-    assert str(Path(os.environ["DSH_HOME"]) / "profiles" / profile) in (
-        json.loads(result.stdout)["profile_dir"] if mode == "json" else result.output
+    result = CliRunner().invoke(
+        create_cli(),
+        [
+            "setup",
+            "dsh",
+            "--source",
+            str(plugin),
+            "--dsh-command",
+            str(desktop_command),
+            "--profile",
+            profile,
+            "--json",
+        ],
     )
-    if mode == "json":
-        assert json.loads(result.stdout)["profile"] == "web"
-        assert "DSH profile" not in result.output
-    if profile == "desktop":
-        assert "reopen DeepSeek Harness Desktop" in result.output
-        assert "fully quit" in result.output
-        assert all("--dump-config" not in call.args for call in run.call_args_list)
+    assert result.exit_code == 0, result.output
+    installed = json.loads(result.stdout)["hosts"]["dsh"]["result"]
+    assert installed["profile"] == profile
+    assert installed["profile_dir"] == str(Path(os.environ["DSH_HOME"]) / "profiles" / profile)
+    original = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    doctor = CliRunner().invoke(create_cli(), ["doctor", "--json"])
+    assert doctor.exit_code == 0, doctor.output
+    plugin_check = json.loads(doctor.output)["hosts"]["dsh"]["checks"]["plugin"]
+    assert ("Desktop" if profile == "desktop" else "Web") in plugin_check["detail"]
+    assert plugin_check["checks"]["running_host_configuration"] == "not_observed"
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == original
+    configured = CliRunner().invoke(create_cli(), ["config", "agent", "dsh", "--json"])
+    assert configured.exit_code == 0, configured.output
 
 
 def test_uninitialized_desktop_fails_before_installation(tmp_path, desktop_command, setup_boundary):
@@ -129,13 +134,10 @@ def test_doctor_keeps_plugin_check_when_target_is_unavailable(
         ["doctor", "dsh", "--profile", profile, "--dsh-command", str(command), "--json"],
     )
     assert result.exit_code == 1
-    report = json.loads(result.stdout)
+    report = json.loads(result.stdout)["hosts"]["dsh"]
     assert report["status"] == "failed"
-    assert set(report["checks"]) == {"dsh", "plugin"}
-    assert report["checks"]["dsh"]["status"] == "failed"
-    assert error in report["checks"]["dsh"]["detail"]
-    assert report["checks"]["plugin"]["status"] == "skipped"
-    assert "not checked" in report["checks"]["plugin"]["detail"]
+    assert report["checks"]["verification"]["status"] == "failed"
+    assert error in report["checks"]["verification"]["detail"]
     assert not (Path(os.environ["DSH_HOME"]) / "profiles").exists()
 
 
@@ -167,17 +169,6 @@ def test_invalid_profile_never_installs(setup_boundary):
     result = CliRunner().invoke(create_cli([setup_app]), ["setup", "dsh", "--profile", "../other"])
     assert result.exit_code == 2
     run.assert_not_called()
-
-
-def test_cancelled_selection_has_no_installation_effects(monkeypatch, setup_boundary):
-    import powercontext.cli.system as system
-
-    _, run, inspect = setup_boundary
-    monkeypatch.setattr(system, "stdin_is_tty", lambda: True)
-    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "dsh"], input="\x03")
-    assert result.exit_code == 1
-    run.assert_not_called()
-    inspect.assert_not_called()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows installed command layout")

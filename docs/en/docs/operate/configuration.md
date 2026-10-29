@@ -54,8 +54,11 @@ evidence and requires an explicit choice; by default errors retain the window fo
 
 Atomic Memory has no legacy collection capacity budget or compact operation. `MEMORY_MAX_ACTIVE_ENTRIES`,
 `MEMORY_MAX_MANIFEST_ENTRIES`, `MEMORY_MAX_MANIFEST_BYTES` and `MEMORY_COMPACTION_*` settings remain parseable but do not
-limit new memories or enable compaction. The legacy MemoryWriteGate collection contract is unsupported by the Atomic
-Runtime; enabling `MEMORY_WRITE_GATE_ENABLED` or injecting an old gate is rejected explicitly.
+limit new memories or enable compaction. MemoryWriteGate is fail-open and only governs the write decision; it never
+changes authoritative history. For a hosted decision backend, set `MEMORY_WRITE_GATE_PRIVACY_BOUNDARY=hosted_redacted`
+and explicitly select `MEMORY_WRITE_GATE_SANITIZER=known_secrets`. The sanitizer covers known sensitive environment/Codex
+values and a bounded set of provider-key prefixes; it is not a general PII or password detector. The sanitizer selection
+defaults to `none`, and hosted-redacted composition fails with a named configuration error until one is selected.
 The existing limit of 32 tags per Artifact still applies. If merged input tags exceed it, the whole merge fails;
 Source processing also retains the window without partial publication or cursor advancement.
 
@@ -76,14 +79,43 @@ Without an override, the default is:
 The default SQLite database is `powercontext.db` in this directory. Built-in background processors persist
 intents and scheduling checkpoints in the same database. Existing installations require [offline migration](artifact-processing-migration.md).
 
+The built-in SQLite backend requires Python's linked SQLite library (`sqlite3.sqlite_version`) to be **3.38.0 or newer**,
+with FTS5, JSON functions, and loadable sqlite-vec for vector search. This retains the backend minimum specified in
+[the Memory design](../../rfcs/0014_memory_layer_design.md#sqlite-adapter), including native vector `IN` filtering.
+Older libraries are rejected before database initialization or accepting writes.
+
 ## Server
 
 Server settings use the `POWERCONTEXT_SERVER_` prefix.
+
+Each Server process admits at most 64 concurrent external HTTP requests, including REST, MCP, Dashboard, and health
+requests. A request occupies a slot while its body is read and until its response finishes, including streaming
+responses. Saturation returns `503` with error code `server_overloaded` and `Retry-After: 1` immediately, without
+queueing or reading the rejected request body. Exceptions and cancellation release the slot. Trusted in-process
+MCP-to-HTTP projections reuse the external request's admission.
+
+Before downstream parsing, the Server checks the actual body against a 16 MiB limit, including chunked uploads.
+An oversized declared `Content-Length` is rejected early; an absent or smaller declared length cannot bypass the
+actual-byte check. Oversized requests return `413` with error code `request_too_large`, and reading stops at the
+first excess chunk. This deployment-level cap is configurable and does not change domain field limits. The default
+fits the current 5 MiB Skill archive limit, whose base64 representation takes at most 6,990,508 characters, plus its
+JSON envelope. Lower caps can reject otherwise valid operations. Both HTTP limits must be positive integers.
+Size them for available memory: 64 requests retaining 16 MiB each already represent 1 GiB of body data, before
+parsing and application overhead; replay briefly copies each accepted body once before releasing its input buffer.
+Reverse proxies own request-rate quotas, upload timeouts, connection limits,
+and aggregate limits across Server processes.
+
+MCP uses stateless Streamable HTTP so each tool execution receives the current request's authenticated identity.
+It does not issue transport session IDs or retain resumable cross-request SSE sessions. Reconnect clients after
+upgrading from a stateful Server. Persisted Scope, Memory and Handoff data are unaffected. A long-lived response
+still occupies an HTTP slot until it finishes; reserve other slots for concurrent requests.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `POWERCONTEXT_SERVER_HTTP_HOST` | `127.0.0.1` | Listener address |
 | `POWERCONTEXT_SERVER_HTTP_PORT` | `8000` | Listener port; the configuration wizard suggests `17429` for new setups |
+| `POWERCONTEXT_SERVER_HTTP_MAX_REQUEST_BODY_BYTES` | `16777216` | Maximum external HTTP body bytes before parsing, including chunked uploads |
+| `POWERCONTEXT_SERVER_HTTP_MAX_CONCURRENT_REQUESTS` | `64` | Per-process external HTTP requests in flight, including full streaming responses |
 | `POWERCONTEXT_SERVER_WORKSPACE` | Server startup directory | Resolution root for local project Agent Skill folders |
 | `POWERCONTEXT_SERVER_MCP_ENABLED` | `true` | Enable Streamable HTTP MCP |
 | `POWERCONTEXT_SERVER_MCP_PATH` | `/mcp` | MCP path |
@@ -101,7 +133,13 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 | `POWERCONTEXT_SERVER_LOGGING_LEVEL` | `INFO` | Operational log level |
 | `POWERCONTEXT_SERVER_LOGGING_FORMAT` | `console` | `console` or structured `json` output |
 | `POWERCONTEXT_SERVER_LOGGING_ACCESS` | `true` | Log external HTTP and logical MCP request completion |
+| `POWERCONTEXT_SERVER_LOGGING_FILE` | `false` | Write managed files instead of stdout; enabled by default for macOS/Windows personal services |
+| `POWERCONTEXT_SERVER_LOGGING_DIRECTORY` | User data directory + `logs/` | Managed log directory |
+| `POWERCONTEXT_SERVER_LOGGING_MAX_BYTES` | `20971520` | Positive size threshold for rotation |
+| `POWERCONTEXT_SERVER_LOGGING_BACKUP_COUNT` | `10` | Positive maximum archive count per active file |
+| `POWERCONTEXT_SERVER_LOGGING_COMPRESSION` | `gzip` | Archive compression: `gzip` or `none` |
 | `POWERCONTEXT_SERVER_METRICS_ENABLED` | `true` | Expose Prometheus metrics at `/metrics` |
+| `POWERCONTEXT_SERVER_METRICS_BACKGROUND_PORT` | `8001` | Background-role infrastructure listener port; uses `HTTP_HOST` and is disabled with metrics |
 | `POWERCONTEXT_SERVER_TRACING_ENABLED` | `false` | Enable span recording and OTLP export |
 | `POWERCONTEXT_SERVER_CURSOR_SIGNING_SECRET` | local persisted key | Shared secret of at least 32 bytes for signing REST pagination cursors |
 | `POWERCONTEXT_SERVER_DATABASE_KIND` | `sqlite` | Storage backend: `sqlite`, `seekdb`, or `oceanbase` |
@@ -115,9 +153,11 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_RERANK_ENABLED` | `false` | Apply listwise reranking after coarse Memory retrieval |
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_RERANK_CANDIDATE_LIMIT` | `30` | Coarse candidate pool supplied to the reranker |
 | `POWERCONTEXT_SERVER_RUNTIME_DECISION_ASSISTANCE_ENABLED` | `false` | Enable decision-model assistance; requires a decision or generation model |
-| `POWERCONTEXT_SERVER_RUNTIME_MEMORY_WRITE_GATE_ENABLED` | `false` | Legacy collection WriteGate; unsupported by Atomic Runtime, which rejects enabling it |
+| `POWERCONTEXT_SERVER_RUNTIME_MEMORY_WRITE_GATE_ENABLED` | `false` | Enable the fail-open Memory write decision gate |
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_WRITE_GATE_HOLD_ON` | `yes` | Decision outcome that means evidence is insufficient: `yes` or `no` |
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_WRITE_GATE_THRESHOLD` | unset | Optional confidence threshold from `0` to `1`; a hold-direction verdict below it is flagged instead of held |
+| `POWERCONTEXT_SERVER_RUNTIME_MEMORY_WRITE_GATE_PRIVACY_BOUNDARY` | `no_external_call` | Decision egress boundary: `no_external_call` or `hosted_redacted` |
+| `POWERCONTEXT_SERVER_RUNTIME_MEMORY_WRITE_GATE_SANITIZER` | `none` | Required for `hosted_redacted`; choose `known_secrets` to install the built-in projection sanitizer |
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_MAX_ACTIVE_ENTRIES` | `5000` | Legacy collection setting; does not limit Atomic Memory, but parsing still validates it against the manifest limit |
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_MAX_MANIFEST_ENTRIES` | `10000` | Legacy collection setting; Atomic Memory has no collection manifest |
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_MAX_MANIFEST_BYTES` | `4194304` | Legacy collection setting; does not limit total Atomic Memory content |
@@ -133,6 +173,9 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 | `POWERCONTEXT_SERVER_RUNTIME_RECALL_GATE_ROUND1_MIN_SEMANTIC_SIMILARITY` | `0.15` | Semantic-similarity admission floor for the first expansion round; must not exceed the round-zero `0.3` |
 | `POWERCONTEXT_SERVER_RUNTIME_RECALL_GATE_ROUND2_MIN_SEMANTIC_SIMILARITY` | `0.10` | Semantic-similarity admission floor for the second expansion round; must not exceed the first round's value |
 | `POWERCONTEXT_SERVER_RUNTIME_RECALL_GATE_ALLOW_WITH_RERANK` | `false` | Whether expansion may still run when `MEMORY_RERANK_ENABLED` is set; by default reranking ends the expansion |
+| `POWERCONTEXT_SERVER_RUNTIME_RECALL_FTS_WEIGHT` | `1.0` | Relative FTS contribution in hybrid Atomic Memory and Topic Memory RRF; `0` excludes FTS-only matches from hybrid results |
+| `POWERCONTEXT_SERVER_RUNTIME_RECALL_VECTOR_WEIGHT` | `1.0` | Relative vector contribution in hybrid Atomic Memory and Topic Memory RRF; `0` excludes vector-only matches from hybrid results |
+| `POWERCONTEXT_SERVER_RUNTIME_RECALL_EMBEDDING_TIMEOUT_SECONDS` | `0.5` | Seconds one context preparation waits for query embeddings in total, at most `60`. The Atomic Memory searches of the Scope and each of its context references and the Topic Memory search share this budget, and only the time spent waiting for an embedding is charged to it: each search waits only for what the earlier ones left, so the preparation's wait stays within it however many Scopes are searched, while database reads and reranking between the searches do not use it up. The search whose embedding wait spends the budget logs `memory.search.embedding_fallback` or `topic_memory.search.embedding_fallback` once. A later search in the same preparation sends no new embedding request and logs no fallback event: it still uses a query vector an earlier search obtained, and otherwise continues with lexical matching only. The default covers a typical remote embedding round trip; keep it below the prepare request timeout of the hosts in use, the shortest default being 1 second on Kimi Code, ZCode, and DSH |
 | `POWERCONTEXT_SERVER_RUNTIME_MEMORY_SCHEDULE_SECONDS` | unset | Memory automatic admission interval; `SCHEDULE_SECONDS` remains a compatibility alias |
 | `POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_SCHEDULE_SECONDS` | unset | Topic Memory automatic admission interval; unset disables new automatic admission |
 | `POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_SOURCE_WINDOW_LIMIT` | `10` | Maximum Sources per Topic Memory Window, capped at 100; one Scope invocation can finish several Windows |
@@ -165,6 +208,8 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 | `POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL_SETTINGS` | `{}` | JSON object of Pydantic AI generation model settings |
 | `POWERCONTEXT_SERVER_INFERENCE_GENERATION_TIMEOUT_SECONDS` | `30` | Timeout in seconds for one structured generation operation |
 | `POWERCONTEXT_SERVER_INFERENCE_GENERATION_MAX_REQUESTS` | `2` | Maximum provider requests for one structured generation operation, including retries |
+| `POWERCONTEXT_SERVER_INFERENCE_GENERATION_STREAMING` | `disabled` | When `auto`, only generation models whose provider prefix is `anthropic`, `openai`, `openai-chat`, or `openai-responses` use a streamed request aggregated locally into one complete response. Other prefixes stay on non-streaming requests. `disabled` keeps every model on non-streaming requests |
+| `POWERCONTEXT_SERVER_INFERENCE_GENERATION_STREAM_IDLE_TIMEOUT_SECONDS` | `60` | Maximum idle seconds while aggregating a streamed request: while the stream opens and waits for its first model event, and between model events (text, thinking, or tool-call parts). Provider heartbeat frames do not reset this timer; a longer gap fails as a timeout |
 | `POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL_CONTEXT_WINDOW_TOKENS` | `125000` | Total generation-model context window used to budget Topic processing |
 | `POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_MODEL` | unset | Pydantic AI embedding model; requires profile ID and dimension |
 | `POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_BASE_URL` | provider default | Custom OpenAI-compatible embeddings base URL |
@@ -190,6 +235,23 @@ Server settings use the `POWERCONTEXT_SERVER_` prefix.
 | `POWERCONTEXT_SERVER_INFERENCE_DECISION_MAX_REQUESTS` | generation request limit | Maximum model requests for one decision operation, including model-output validation retries; excludes provider SDK HTTP retries |
 | `POWERCONTEXT_SERVER_RUNTIME_EXPERIENCE_SCHEDULE_SECONDS` | unset | Experience automatic admission interval; unset preserves accepted work and stops new automatic admission |
 | `POWERCONTEXT_SERVER_EXTERNAL_SKILLS` | automatic local project targets | JSON override containing the host identity and explicit Agent Skill targets |
+
+The recall channel weights are a ratio and apply to Atomic Memory and Topic Memory only after hybrid candidates pass
+their channel admission floors. Single-channel searches remain unweighted; `auto` applies the weights only when it
+selects hybrid search. Atomic Memory excludes zero-weight channels from `matched_by` and recall-gate relevance.
+Topic Memory retains their evidence for Topics selected by a positive-weight channel.
+Scaling both values equally has no effect. Setting one value to `0` excludes that channel from hybrid fusion, but a
+higher weight cannot restore a candidate rejected before fusion. A zero weight does not disable that channel's
+retrieval or admission work: vector embeddings may still be generated, and retrieval/admission counts still include
+the zero-weight channel. A Topic or Atomic Memory Artifact search request that supplies its own `fusion` parameters replaces the
+deployment recall weights entirely. The deployment weights apply only when the request does not specify `fusion`
+parameters. After normalization, each non-zero channel weight must be at least the smallest normal IEEE 754 binary64
+value (`2.2250738585072014e-308`); smaller values are rejected at startup. Only an explicit `0` disables a channel's
+fusion contribution. Evaluate weight changes together with recall-gate rounds, semantic admission floors, and
+historical Topic candidate selection instead of treating the knobs independently. In particular, weighting FTS more
+heavily can move a Topic's normalized score across
+`POWERCONTEXT_SERVER_RUNTIME_TOPIC_MEMORY_HISTORY_RRF_THRESHOLD` (default `70`) and change which historical Topics
+are sent to the planner.
 
 The recall-sufficiency gate is disabled by default. When enabled, the Runtime assesses the first recall's candidate
 count, family coverage, top-candidate score, and lexical coverage during `prepare_context`; when it judges the result
@@ -290,12 +352,17 @@ family, or disabling built-in background families with `ARTIFACT_PROCESSING_FAMI
 before accepting work. Turning off schedules alone is insufficient because explicit requests still start workers.
 Custom Source registries remain available to synchronous SDK contexts and API-only composition.
 
-The authenticated `/metrics` endpoint exposes `powercontext_server_artifact_processing_*` observations with only a `family`
-label: Worker capacity, ready/retry queues, unacknowledged Scopes, discovery and invocation duration, completions,
+The authenticated `/metrics` endpoint exposes `powercontext_server_artifact_processing_*` observations with a bounded `family`
+label and, where applicable, `state`, `outcome`, `category`, or `reason`: Worker capacity, ready/retry queues,
+unacknowledged Scopes, discovery and invocation duration, completions,
 failures, and timeouts. Unacknowledged counts reflect the latest discovery; counters reset with the Supervisor instance.
+See [Logs, metrics, and tracing](observability.md) for freshness, state, attempt/acknowledgement, and alert semantics.
 
 The `extraction` object in `GET /v1/capabilities` separates configuration, background execution, and local observations.
 Reading this snapshot does not query the database or call a model, and does not produce an overall health verdict.
+`powercontext capabilities` prints the same facts. Missing diagnostics print `unavailable`, a null supervisor role
+prints `absent`, and unknown values print `unknown`. Success and failure times are historical observations, not a
+current health verdict. `--json` returns the Server payload unchanged.
 
 - `configuration` is `configured` when a local extraction model or custom pipeline is assembled, or a local Memory
   worker is registered. It is `unconfigured` when none is available. Registration does not verify credentials or
@@ -381,9 +448,13 @@ Handoff Report API routes are independently enabled by default. See
 [Use Handoff Report](../workflows/use-handoff-report.md) for selection, inspection, and export.
 
 The Artifact Processing Supervisor is enabled by the default `all` role. OceanBase deployments may run `api` and
-`background` separately; `powercontext server run --role background` starts no HTTP, MCP, or Dashboard listener, and
-multiple background candidates use the database Lease to elect one active Leader. SQLite and embedded seekdb support
-only the single-process `all` role. Automatic Topic Memory waves remain disabled until a positive interval is set;
+`background` separately. When metrics are enabled, `powercontext server run --role background` exposes `/metrics` and
+public `/health/live` using `POWERCONTEXT_SERVER_HTTP_HOST` and `POWERCONTEXT_SERVER_METRICS_BACKGROUND_PORT`
+(default `8001`); it does not serve business APIs, MCP, Dashboard, OpenAPI, or `/health/ready`.
+`/metrics` uses the same authentication and `server.observe` authorization as the API host.
+Use distinct ports for API and background processes on the same host. `POWERCONTEXT_SERVER_METRICS_ENABLED=false`
+opens no background listener. Multiple background candidates use the database Lease to elect one active Leader.
+SQLite and embedded seekdb support only the single-process `all` role. Automatic Topic Memory waves remain disabled until a positive interval is set;
 explicit flush work remains recoverable regardless of that interval. Topic workers need file-backed SQLite: configuring
 a generation model with an in-memory SQLite database is rejected before processing is advertised. Use a persistent
 `POWERCONTEXT_SERVER_DATABASE_URL`, such as `sqlite+aiosqlite:////srv/powercontext/runtime.db`.
@@ -439,6 +510,18 @@ reranking when search must remain independent of model availability. See
 The built-in reranker is an LLM listwise reranker, not a dedicated cross-encoder protocol. By default it reuses the
 generation model and its provider settings. Set `POWERCONTEXT_SERVER_INFERENCE_RERANK_MODEL` to give that LLM operation
 an independent model, base URL, headers, settings, timeout, and request limit.
+
+Python deployments can inject the optional `JevMemoryReranker` with a
+`JevRerankConfig` and a caller-owned HTTPX client into
+`open_builtin_runtime(memory_reranker=...)`. It requires a dedicated API key,
+System One endpoint, and pinned model such as `jev-1.13.0`. Its total deadline
+and concurrency/request-size bounds are explicit. Provider failures propagate as
+inference errors under RFC 0080, including timeouts, unavailable providers, invalid
+scores, missing usage receipts, and model-version drift. Injected rerankers also
+disable recall expansion unless the existing `RECALL_GATE_ALLOW_WITH_RERANK`
+setting enables it. The Server environment switch above selects the existing LLM
+reranker. See `evaluation/memory/locomo/README.md` in the repository for Jev
+configuration, the three-arm comparison, and execution coverage.
 
 The same configured generation model gates explicit Experience generation, managed Skill generation, and semantic
 Skill fork/evolution. Exact external Skill import and complete package upload do not use a model: PowerContext validates

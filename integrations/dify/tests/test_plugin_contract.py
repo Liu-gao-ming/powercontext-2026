@@ -190,6 +190,7 @@ def test_sdk_registers_exact_catalog_and_json_text_inputs(registry):
             "max_bytes",
             "include_code",
             "assembly",
+            "bootstrap_receipt_id",
             "api_token",
             "server_url",
         } & {parameter.name for parameter in declaration.parameters}
@@ -207,6 +208,7 @@ def test_sdk_registers_exact_catalog_and_json_text_inputs(registry):
         ("pc_prepare_context", {"query": "scope"}, "max_bytes", 1),
         ("pc_prepare_context", {"query": "scope"}, "include_code", True),
         ("pc_prepare_context", {"query": "scope"}, "assembly", {}),
+        ("pc_prepare_context", {"query": "scope"}, "bootstrap_receipt_id", "receipt-1"),
         ("pc_search", {"query": "scope"}, "tag_filter", {"tags": ["private"]}),
         ("pc_remember", {"kind": "decision", "text": "Retain."}, "expected_revision", 1),
     ],

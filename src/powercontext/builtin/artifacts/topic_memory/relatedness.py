@@ -20,7 +20,7 @@ from collections import Counter
 from dataclasses import dataclass
 from math import sqrt
 
-from powercontext.builtin.artifacts.search import admits_fts_text, analyze_text
+from powercontext.builtin.artifacts.search import admits_fts_text, lexical_query_words
 from powercontext.builtin.artifacts.topic_memory.fusion import admits_topic_memory_vector_distance
 from powercontext.builtin.artifacts.topic_memory.generation import MAX_TOPIC_MEMORY_STAGE_ITEMS, TopicMemoryProposal
 from powercontext.builtin.artifacts.topic_memory.models import (
@@ -45,20 +45,19 @@ def topic_memory_lexical_signature(content: TopicMemoryContent, /) -> str:
     weighted: Counter[str] = Counter()
     first: dict[str, tuple[int, int]] = {}
     for field_order, (weight, value) in enumerate(((8, content.title), (4, content.summary), (1, content.detail))):
-        for position, term in enumerate(analyze_text(value).split()):
+        for position, term in enumerate(lexical_query_words(value)):
             weighted[term] += weight
             first.setdefault(term, (field_order, position))
     ordered = sorted(weighted, key=lambda term: (-weighted[term], first[term], term.encode()))
     selected: list[str] = []
     characters = 0
-    for term in ordered[:MAX_TOPIC_MEMORY_QUERY_TERMS]:
+    for word in ordered[:MAX_TOPIC_MEMORY_QUERY_TERMS]:
+        term = f'"{word}"'
         additional = len(term) + int(bool(selected))
         if characters + additional > MAX_TOPIC_MEMORY_QUERY_LENGTH:
             continue
         selected.append(term)
         characters += additional
-    if not selected:
-        raise ValueError("Topic Memory content has no bounded lexical signature")  # noqa: TRY003
     return " ".join(selected)
 
 
@@ -93,6 +92,7 @@ def topic_memory_related_components(  # noqa: C901
     *,
     secondary_candidates: tuple[frozenset[str], ...],
     vectors: tuple[EmbeddingVector | None, ...] = (),
+    signatures: tuple[str, ...] | None = None,
 ) -> tuple[tuple[int, ...], ...]:
     """Build bounded connected components from shared targets and bidirectional similarity."""
 
@@ -100,6 +100,8 @@ def topic_memory_related_components(  # noqa: C901
         raise ValueError("Topic Memory relatedness input exceeds its bounded contract")  # noqa: TRY003
     if vectors and len(vectors) != len(proposals):
         raise ValueError("Topic Memory relatedness vectors must cover every proposal")  # noqa: TRY003
+    if signatures is not None and len(signatures) != len(proposals):
+        raise ValueError("Topic Memory relatedness signatures must cover every proposal")  # noqa: TRY003
     parents = list(range(len(proposals)))
 
     def find(index: int) -> int:
@@ -114,7 +116,8 @@ def topic_memory_related_components(  # noqa: C901
         if left_root != right_root:
             parents[max(left_root, right_root)] = min(left_root, right_root)
 
-    signatures = tuple(topic_memory_lexical_signature(proposal.content) for proposal in proposals)
+    if signatures is None:
+        signatures = tuple(topic_memory_lexical_signature(proposal.content) for proposal in proposals)
     for left in range(len(proposals)):
         for right in range(left + 1, len(proposals)):
             if (
@@ -128,7 +131,9 @@ def topic_memory_related_components(  # noqa: C901
                 continue
             left_text = _content_text(proposals[left].content)
             right_text = _content_text(proposals[right].content)
-            lexical = admits_fts_text(signatures[left], right_text) and admits_fts_text(signatures[right], left_text)
+            lexical = bool(signatures[left] and signatures[right]) and (
+                admits_fts_text(signatures[left], right_text) and admits_fts_text(signatures[right], left_text)
+            )
             semantic = False
             left_vector = None if not vectors else vectors[left]
             right_vector = None if not vectors else vectors[right]

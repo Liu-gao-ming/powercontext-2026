@@ -300,6 +300,10 @@ node --test integrations/zcode/plugins/powercontext/tests/host.test.mjs
 ```
 
 第二条需要将 `ZCODE_CLI_BIN` 指向已构建的开源 CLI；它使用模拟模型和 Server，不能代替真实宿主验收。
+仓库的 ZCode acceptance CI 在 Windows 上构建固定提交的开源 CLI，运行完整 Node 测试和两轮
+真实 CLI + PowerContext Server 的可控模型核心验收；PR、master 更新和每周检查都会触发。
+构建版本、逐场景摘要和选定证据随 Actions artifact 保留 14 天；详细范围与升级步骤见
+[可重复 CLI 验收](https://github.com/oceanbase/powercontext/blob/master/integrations/zcode/acceptance/README.md#continuous-integration)。
 官方 Windows 桌面版 3.14.3 已分别连接本地无鉴权与 Bearer 鉴权 Server：MCP `list_scopes` 成功，
 普通提示词经 Hook 形成可读回的 Source。断服期间普通对话仍能回答；本轮隔离验收中，Server 重启后
 同一任务的原生 MCP 调用返回 `Session not found`；新建任务后原生 MCP 恢复，无需重启程序。
@@ -307,7 +311,7 @@ node --test integrations/zcode/plugins/powercontext/tests/host.test.mjs
 `handoff_current_work` → `continue_handoff`（prepared）→
 `commit_handoff` → 全新会话 `continue_handoff`（latest），提交的 revision 1 能从 Server 读回。
 其他已实测工具包括 `get_scope`、`list_memory_entries`、`capture_content_source`、
-`list_artifact_candidates` 和 `list_dream_runs`；后两者返回合法的空列表。
+`list_candidates` 和 `list_dream_runs`；后两者返回合法的空列表。
 另在由 Windows 登录用户创建的全新用户目录中安装插件，官方桌面版通过 MCP `list_scopes` 读取隔离 Server，
 Hook 也把该轮普通提示词写成 Source。其他官方版本尚未实测。
 开源 ZCode CLI 0.16.9 也已用真实模型和本地 Server 完成采集 → 自动生成 Memory → 全新会话召回：
@@ -405,3 +409,7 @@ Server URL 时作为 Hook 的回退值，不能用于修改正常安装的 MCP �
 从 `~/.zcode/cli/config.json` 的 `plugins.dirs` 中只移除 PowerContext 路径；确认
 `~/.zcode/cli/plugins/powercontext` 中存在 `.powercontext-owned` 后，再删除该受管理目录。
 最后完全退出并重启 ZCode。卸载插件不会删除 Server 数据或 ZCode 模型配置。
+
+## 自动输入隐私
+
+本宿主的捕获默认值、关闭方式、凭据识别局限及独立只读查询行为见[自动 prompt 隐私策略](index.md#自动-prompt-隐私策略)。识别到凭据的输入会跳过捕获，已接受的 Source 正文和事件身份不被改写。

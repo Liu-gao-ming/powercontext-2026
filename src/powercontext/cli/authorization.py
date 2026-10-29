@@ -92,14 +92,22 @@ def credential_path(host: str) -> Path:
     return root / "powercontext" / "credentials.json"
 
 
+def _authorization_bytes(path: Path, *, server_url: str, value: str) -> bytes:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError("credential path must be a regular file")  # noqa: TRY003
+    payload = {
+        "version": 1,
+        "server_url": normalize_client_url(server_url),
+        "authorization": normalize_authorization(value),
+    }
+    return (json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+
+
 def write_stored_authorization(path: Path, *, server_url: str, value: str) -> None:
     """Atomically persist one URL-bound authorization record."""
 
     path = Path(path).expanduser()
-    if path.exists() and (path.is_symlink() or not path.is_file()):
-        raise ValueError("credential path must be a regular file")  # noqa: TRY003
-    normalized_url = normalize_client_url(server_url)
-    authorization = normalize_authorization(value)
+    content = _authorization_bytes(path, server_url=server_url, value=value)
     parent = path.parent
     parent.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -109,14 +117,8 @@ def write_stored_authorization(path: Path, *, server_url: str, value: str) -> No
     try:
         if os.name != "nt":
             os.fchmod(fd, 0o600)
-        payload = {
-            "version": 1,
-            "server_url": normalized_url,
-            "authorization": authorization,
-        }
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=True, separators=(",", ":"))
-            handle.write("\n")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -160,17 +162,18 @@ def clear_stored_authorization(path: Path) -> Literal["cleared", "not_configured
     return "cleared"
 
 
-def configure_stored_authorization(host: str, *, server_url: str, value: str | None = None) -> SetupAuthorizationStatus:
-    """Persist a setup-only token, or report the existing URL-bound credential state."""
-
-    path = credential_path(host)
+def authorization_updates(connection) -> tuple[dict[Path, bytes], SetupAuthorizationStatus]:
+    """Validate credentials before publishing the connection and its URL binding together."""
+    path = credential_path(connection.host)
+    value = setup_authorization_value(connection.host)
     if value is not None and value.strip():
-        write_stored_authorization(path, server_url=server_url, value=value)
-        return "configured"
-    resolution = read_stored_authorization(path, server_url=server_url)
-    if resolution.status == "configured":
-        return "preserved"
-    return resolution.status
+        content = _authorization_bytes(path, server_url=connection.server_url, value=value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            path.parent.chmod(0o700)
+        return {path: content}, "configured"
+    resolution = read_stored_authorization(path, server_url=connection.server_url)
+    return {}, "preserved" if resolution.status == "configured" else resolution.status
 
 
 def setup_authorization_value(host: str) -> str | None:
@@ -182,11 +185,18 @@ def setup_authorization_value(host: str) -> str | None:
     return values.get(_AUTHORIZATION_ENVIRONMENTS[host]) or values.get("POWERCONTEXT_CLIENT_API_TOKEN")
 
 
-def setup_server_url(host: str, default: str) -> str:
-    """Compatibility entry point; installation resolves endpoints in setup orchestration."""
-    from powercontext.cli.transport import resolve_setup_endpoint
+def validate_setup_authorization(host: str) -> None:
+    """Reject invalid explicit credentials before changing host configuration."""
+    if host in _AUTHORIZATION_ENVIRONMENTS:
+        value = setup_authorization_value(host)
+        if value is not None and value.strip():
+            normalize_authorization(value)
+    elif host == "zcode":
+        from powercontext.cli.transport import setup_environment
 
-    return resolve_setup_endpoint(host, default=default)
+        value = (setup_environment() | dict(os.environ)).get("POWERCONTEXT_ZCODE_AUTHORIZATION")
+        if value and normalize_authorization(value) != value:
+            raise ValueError("POWERCONTEXT_ZCODE_AUTHORIZATION must be a complete Bearer header")  # noqa: TRY003
 
 
 def configure_codex_desktop_authorization(value: str) -> bool:
@@ -258,12 +268,11 @@ __all__ = [
     "AuthorizationStatus",
     "clear_stored_authorization",
     "configure_codex_desktop_authorization",
-    "configure_stored_authorization",
     "credential_path",
     "normalize_authorization",
     "read_codex_desktop_authorization",
     "read_stored_authorization",
     "setup_authorization_value",
-    "setup_server_url",
+    "validate_setup_authorization",
     "write_stored_authorization",
 ]

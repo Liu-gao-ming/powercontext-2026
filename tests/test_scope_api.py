@@ -24,6 +24,62 @@ from powercontext.server.factory import create_server_app
 from powercontext.server.settings import BearerAuthConfig, McpConfig, ServerSettings
 
 
+def test_artifact_handle_bind_and_resolve_public_path(tmp_path) -> None:
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'handles.db'}"),
+            mcp=McpConfig(enabled=False),
+        )
+    )
+    with TestClient(app) as client:
+        scope_id = client.get("/v1/scopes/default").json()["scope_id"]
+        created = client.post(
+            f"/v1/scopes/{scope_id}/artifacts",
+            json={"family": "profile", "content": {"content": "# Chinese support agent"}},
+        )
+        assert created.status_code == 201
+        artifact = created.json()
+        path = f"/v1/scopes/{scope_id}/artifact-handles/profile/support-agent"
+        expected = {
+            "family": "profile",
+            "key": "support-agent",
+            "artifact": {
+                "family": "profile",
+                "artifact_id": artifact["artifact_id"],
+                "revision": artifact["revision"],
+            },
+        }
+
+        bound = client.put(
+            path,
+            json={"artifact_id": artifact["artifact_id"], "revision": artifact["revision"]},
+        )
+        assert bound.status_code == 200
+        assert bound.json() == expected
+        assert client.get(path).json() == expected
+
+        artifact_path = f"/v1/scopes/{scope_id}/artifacts/profile/{artifact['artifact_id']}"
+        revised = client.put(
+            artifact_path,
+            headers={"If-Match": created.headers["ETag"]},
+            json={"content": {"content": "# English support agent"}},
+        )
+        assert revised.status_code == 200
+        assert revised.json()["revision"] == 2
+        assert client.get(path).json() == expected
+
+        conflicting = client.put(
+            path,
+            json={"artifact_id": artifact["artifact_id"], "revision": revised.json()["revision"]},
+        )
+        assert conflicting.status_code == 409
+        assert conflicting.json()["error"]["details"] == {"kind": "artifact_handle"}
+
+        missing = client.get(f"/v1/scopes/{scope_id}/artifact-handles/profile/missing")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "artifact_handle_not_found"
+
+
 @pytest.mark.parametrize("binding_kind", ["durable", "default"])
 def test_missing_binding_target_is_a_conflict_without_fallback_or_replacement(tmp_path, binding_kind) -> None:
     database_path = tmp_path / "missing-target.db"

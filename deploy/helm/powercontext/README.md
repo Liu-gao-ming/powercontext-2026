@@ -6,8 +6,8 @@ use the single-process Docker example for evaluation.
 
 ## Application compatibility
 
-Chart 0.1.0 targets the current master role/configuration contract, inspected at
-`86537e4f`. No public release image is assumed.
+Chart 0.1.0 targets the current master role/configuration and managed-database contracts,
+inspected at `1f0afd6b`. No public release image is assumed.
 Build the repository Dockerfile from the application revision being tested and publish it
 to your registry. Supply its immutable tag or SHA-256 digest explicitly; `latest` is rejected.
 The chart is not compatible with the proposed API/Scheduler/Worker deployment until that
@@ -33,8 +33,9 @@ Provision a Secret named `powercontext` in your namespace through your secret ma
 | `cursor-signing-secret` | The same secret of at least 32 bytes for every replica |
 
 URL-encode credentials in the database URL. The database must meet PowerContext's
-OceanBase requirements. For an existing database, complete the processing migration
-before startup. Secret values are never stored in Helm values or a rendered Secret.
+OceanBase requirements. Both empty and existing databases require explicit Server
+maintenance before any API or background Pod starts; follow the initialization procedure
+below. Secret values are never stored in Helm values or a rendered Secret.
 
 Optional `providerSecret` names a second existing Secret whose keys are provider environment
 variables such as `OPENAI_API_KEY`. Reserve it for provider credentials: do not put
@@ -57,10 +58,71 @@ Use the same model configuration on both roles. Secrets referenced as environmen
 are read at Pod startup; coordinate a restart after rotation. Rotating the cursor key invalidates
 outstanding cursors.
 
+## Initialize the database and install
+
+OceanBase Server startup validates managed storage; it does not initialize an empty
+database or repair an old schema. Run the target application's `server db-migrate`
+commands before the first Helm install. Stop every writer before maintaining an existing
+database. There is no automatic Helm migration hook or per-Pod initialization container.
+
+Use one fixed maintenance host with Docker and a persistent evidence directory dedicated
+to this database. All inspections, migration attempts and retries must use that same host,
+container hostname and mounted directory. A shared volume or a repeated hostname on a
+different node does not provide cross-host coordination. If you instead run a Kubernetes
+maintenance Job, pin it to that one node, retain its evidence volume and hostname across
+replacement Jobs, and follow the same commands and stopped-writer requirements.
+
+On that host, prepare a protected `deployment.env` through your secret manager. It must
+select `POWERCONTEXT_SERVER_DATABASE_KIND=oceanbase`, the same database URL and credentials,
+authentication and cursor secrets, global supervisor mode, and the same inference and
+Processing configuration as the target Pods. In particular, the acceptance profile's
+`POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL=test` must also be present when preparing
+its database. The migration plan binds the target Processing declaration and embedding
+profile; changing those settings requires a new plan. Do not commit this file.
+
+The database must already exist in a MySQL-mode user tenant. The maintenance credential
+needs the target-identity permissions documented in
+[database migrations](../../../docs/en/docs/operate/database-migrations.md#target-configuration-and-external-evidence).
+Create a durable directory writable by the image's UID/GID `10001`, then run:
+
+```sh
+export POWERCONTEXT_IMAGE=registry.example.com/powercontext:YOUR_REVISION
+sudo install -d -m 0700 -o 10001 -g 10001 /srv/powercontext/YOUR_DATABASE/migration-evidence
+
+pc_migrate() {
+  docker run --rm --hostname powercontext-maintenance \
+    --env-file "$PWD/deployment.env" \
+    --mount type=bind,src=/srv/powercontext/YOUR_DATABASE/migration-evidence,dst=/migration-evidence \
+    "$POWERCONTEXT_IMAGE" server db-migrate "$@" --bundle server \
+    --evidence-dir /migration-evidence --lock-coordination single-host
+}
+
+pc_migrate status
+pc_migrate plan --backup manual --shared-database
+# Inspect the plan, stop every writer and make a manual database backup first.
+# Replace PLAN_ID with the returned plan_id; confirmation flags declare those actions complete.
+pc_migrate apply --backup manual --shared-database --plan-id PLAN_ID \
+  --backup-confirmed --maintenance-confirmed --yes
+pc_migrate verify
+```
+
+Require `state=ready`, `readiness_scope=server` and `server_ready=true` before starting
+the Deployments. Keep the evidence directory and backup after the container exits.
+Unsupported historical layouts require a registered migration path; do not bypass
+admission or reuse the historical patched image below to initialize current storage.
+Then install the chart using that same image and configuration. Start one API Pod
+first so its static bearer Access bindings are committed before other processes
+bootstrap the same preset. Schema maintenance does not seed those credential-specific
+bindings. After that API becomes Ready, restore the desired replica counts from your
+saved values file; do not retain the temporary overrides with `--reuse-values`:
+
 ```sh
 helm lint deploy/helm/powercontext -f values.local.yaml
 helm upgrade --install pc deploy/helm/powercontext \
-  --namespace powercontext --create-namespace -f values.local.yaml --wait --timeout 10m
+  --namespace powercontext --create-namespace -f values.local.yaml \
+  --set api.replicas=1 --set background.replicas=0 --wait --timeout 10m
+helm upgrade pc deploy/helm/powercontext \
+  --namespace powercontext -f values.local.yaml --wait --timeout 10m
 kubectl -n powercontext port-forward service/pc-powercontext 8000:8000
 ```
 
@@ -106,15 +168,20 @@ Deployments**. Do not assume an ordinary `helm upgrade` is a safe mixed-version 
    not promise every model call will drain. A longer grace period alone does not guarantee draining.
 3. Scale both Deployments to zero and wait until all their Pods have terminated. Disable any external
    reconciler that would restore replicas during maintenance.
-4. With the target application's configuration and credentials, follow
-   `docs/en/docs/operate/database-migrations.md` and run each required migration's `plan`,
-   `apply --maintenance-confirmed`, and `verify` before starting the target image. Existing
-   Memory-entry databases also require `docs/en/docs/operate/atomic-memory-migration.md`;
-   processing migrations are described in `docs/en/docs/operate/artifact-processing-migration.md`.
-   There is no automatic Helm migration hook.
-5. Only after migration verification succeeds, upgrade the chart/image using your saved values and
-   restore the desired replica counts. Check readiness, authentication and background progress before
-   resuming traffic.
+4. Use the target image and configuration to run the full Server maintenance procedure
+   above on the fixed maintenance host with its retained evidence directory. Review the
+   plan and backup policy, apply the exact `plan_id` with the required confirmations, and
+   require full Server readiness from `verify`. Complete any required Processing ownership
+   transition separately through `--bundle processing` as described in
+   [database migrations](../../../docs/en/docs/operate/database-migrations.md).
+   [Atomic Memory migration](../../../docs/en/docs/operate/atomic-memory-migration.md) and
+   [processing migration](../../../docs/en/docs/operate/artifact-processing-migration.md)
+   describe compatibility commands and their limits; partial domain readiness does not
+   replace full Server readiness. There is no automatic Helm migration hook.
+5. Only after migration verification succeeds, start one API Pod with zero background replicas
+   using the target image and your saved values as shown above. After it is Ready, restore the
+   desired replica counts from those values. Check readiness, authentication and background
+   progress before resuming traffic.
 
 A Helm rollback does not roll back the database. Assess schema compatibility and restore the database
 backup when required before returning to an earlier application version. Uninstall removes the
@@ -146,6 +213,8 @@ image:
 existingSecret: powercontext-acceptance
 ```
 
+Initialize and verify the disposable database with the target image and acceptance
+configuration using the maintenance procedure above before installing any Pods.
 The supplied `values-acceptance.yaml` selects two API replicas, one initial background replica,
 and the local `test` generation model so the background capability acquires a lease without an
 external model provider. This profile is for deployment tests only; leave embedding providers
@@ -155,6 +224,10 @@ unconfigured. It does not validate real model quality or interrupted inference r
 helm upgrade --install pc-acceptance deploy/helm/powercontext \
   --namespace powercontext-acceptance --create-namespace \
   -f values.acceptance.local.yaml \
+  -f deploy/helm/powercontext/values-acceptance.yaml \
+  --set api.replicas=1 --set background.replicas=0 --wait --timeout 10m
+helm upgrade pc-acceptance deploy/helm/powercontext \
+  --namespace powercontext-acceptance -f values.acceptance.local.yaml \
   -f deploy/helm/powercontext/values-acceptance.yaml --wait --timeout 10m
 uv run python tests/e2e/helm_acceptance.py \
   --namespace powercontext-acceptance --release pc-acceptance
@@ -171,7 +244,7 @@ Run only against a test deployment. A lease transition is not proof that all acc
 completed: validate application processing and provider-specific recovery separately with representative
 workloads. Multi-active-worker recovery and mixed-version rolling upgrades are outside this chart's scope.
 
-### Verified environment
+### Historical cluster evidence
 
 On 2026-10-05, the isolated cluster check passed on three Linux amd64 RKE2 nodes
 (Kubernetes `v1.35.7+rke2r1`, Helm 3.19.0) with OceanBase CE 4.4.2.1. A fresh database
@@ -186,10 +259,11 @@ returned to one; the disposable namespaces and database were removed.
 The application image included separate local concurrent-startup fixes. These make
 relational and FULLTEXT DDL idempotent, probe all four FULLTEXT projections with `MATCH`,
 and retry narrowly identified authorization bootstrap conflicts after rollback.
-The fixes must be integrated separately before this cold-start result applies to a
-released image. This evidence predates the Atomic Memory schema; the old Memory-entry
-FULLTEXT patch and this image do not establish concurrent cold-start acceptance for
-Atomic Memory. Validate the target runtime and its migrations separately.
+This evidence predates the Atomic Memory and managed Server schemas. The old Memory-entry
+FULLTEXT patch and this image do not establish acceptance for the current runtime. Current
+deployments initialize through explicit maintenance, seed Access with one API Pod, then
+start the desired replicas against verified storage. Validate that sequence and Pod replacement with the target image;
+the historical empty-database startup result does not certify it.
 
 | Component | Tested revision |
 | --- | --- |

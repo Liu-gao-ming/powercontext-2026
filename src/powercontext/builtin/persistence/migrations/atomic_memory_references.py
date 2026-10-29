@@ -85,6 +85,24 @@ _WORK_MODELS: dict[str, type[BaseModel]] = {
 _TERMINAL_DREAM = frozenset({"succeeded", "failed"})
 
 
+def _stored_work_payload(payload: bytes, /) -> tuple[type[BaseModel], Mapping[str, Any], Mapping[str, Any]] | None:
+    """Return one stored Source's typed Work payload with its stored root, or None when it holds none.
+
+    The stored payload envelope arrived after structured Work Sources did, so a Work
+    payload can sit at the top level of a row written by an earlier release. The root
+    lets a rewrite keep the layout the row already uses.
+    """
+
+    stored = json.loads(payload)
+    if not isinstance(stored, dict):
+        return None
+    value = stored.get("value")
+    if not isinstance(value, dict):
+        value = stored
+    model = _WORK_MODELS.get(str((value.get("metadata") or {}).get("kind")))
+    return None if model is None else (model, value, stored)
+
+
 class _LegacyValue(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -207,6 +225,8 @@ class _Context:
     decisions: dict[tuple[str, str, int], CandidateDecision]
     write: bool
     citation_tables: frozenset[str] = frozenset()
+    candidate_versions: str = "pc_candidate_versions"
+    candidate_heads: str = "pc_candidate_heads"
     errors: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     used_decisions: set[tuple[str, str, int]] = field(default_factory=set)
@@ -710,11 +730,10 @@ async def _work_sources(context: _Context, units: _Units) -> None:  # noqa: C901
             ),
             dict(key),
         )
-        envelope = json.loads(bytes(stored))
-        value = envelope["value"]
-        model = _WORK_MODELS.get(str((value.get("metadata") or {}).get("kind")))
-        if model is None:
+        work = _stored_work_payload(bytes(stored))
+        if work is None:
             return
+        model, value, root = work
         original = json.loads(value["content"])
         # A receipt's unavailable evidence records what was missing; it asserts no support to drop.
         dropped: list[tuple[str, dict[str, Any]]] | None = None if model is HandoffReceipt else []
@@ -749,13 +768,15 @@ async def _work_sources(context: _Context, units: _Units) -> None:  # noqa: C901
         context.count("work_sources")
         if not context.write:
             return
-        value = {**value, "content": after.model_dump_json(by_alias=True, exclude_none=False, indent=2)}
+        updated = {**value, "content": after.model_dump_json(by_alias=True, exclude_none=False, indent=2)}
+        # A legacy row keeps its own layout; only its content changes.
+        rewritten = {**root, "content": updated["content"]} if value is root else {**root, "value": updated}
         await connection.execute(
             text(
                 "UPDATE pc_sources SET payload = :payload WHERE scope_id = :scope_id AND source_type = :source_type "
                 "AND source_id = :source_id"
             ),
-            {**key, "payload": rfc8785.dumps({**envelope, "value": value})},
+            {**key, "payload": rfc8785.dumps(rewritten)},
         )
         if isinstance(after, TaskOutcome):
             changed = _outcome_digests(_legacy_item_digests(original), after)
@@ -770,10 +791,10 @@ def _candidate_label(key: Mapping[str, Any]) -> str:
 
 
 async def _candidates(context: _Context, units: _Units) -> None:
-    cited = "pc_artifact_candidate_versions" in context.citation_tables
+    cited = context.candidate_versions in context.citation_tables
     keys = await _keys(
         units,
-        "SELECT scope_id, candidate_id, version FROM pc_artifact_candidate_versions WHERE family <> 'memory' AND "  # noqa: S608
+        f"SELECT scope_id, candidate_id, version FROM {context.candidate_versions} WHERE family <> 'memory' AND "  # noqa: S608
         + (
             "((memory_citations IS NOT NULL AND LENGTH(memory_citations) > 2) "
             "OR CAST(artifact_refs AS CHAR) LIKE '%\"memory\"%')"
@@ -786,7 +807,7 @@ async def _candidates(context: _Context, units: _Units) -> None:
         row = (
             await rows(
                 connection,
-                "pc_artifact_candidate_versions",
+                context.candidate_versions,
                 ("source_refs", "artifact_refs", *((LEGACY_CITATION_COLUMN,) if cited else ())),
                 "WHERE scope_id = :scope_id AND candidate_id = :candidate_id AND version = :version",
                 **key,
@@ -843,7 +864,7 @@ async def _candidates(context: _Context, units: _Units) -> None:
             )
         await connection.execute(
             text(
-                "UPDATE pc_artifact_candidate_versions SET artifact_refs = :refs"  # noqa: S608
+                f"UPDATE {context.candidate_versions} SET artifact_refs = :refs"  # noqa: S608
                 + (", memory_citations = :citations" if cited else "")
                 + " WHERE scope_id = :scope_id AND candidate_id = :candidate_id AND version = :version"
             ),
@@ -932,10 +953,10 @@ async def _dream_inputs_change(  # noqa: C901 - One check over each kind of pinn
         )
         if stored is None:
             continue
-        value = json.loads(bytes(stored)).get("value") or {}
-        model = _WORK_MODELS.get(str((value.get("metadata") or {}).get("kind")))
-        if model is None:
+        work = _stored_work_payload(bytes(stored))
+        if work is None:
             continue
+        model, value, _root = work
         content = json.loads(value["content"])
         if model is HandoffReceipt:
             # These unavailable addresses survive unchanged, so the Source digest stays pinned.
@@ -1057,9 +1078,9 @@ async def _dream_runs(context: _Context, units: _Units) -> None:
 
 async def _unsupported(context: _Context, units: _Units, tables: set[str]) -> None:
     async with units.unit() as connection:
-        if "pc_artifact_candidate_heads" in tables:
+        if context.candidate_heads in tables:
             for row in await rows(
-                connection, "pc_artifact_candidate_heads", ("scope_id", "candidate_id"), "WHERE family = 'memory'"
+                connection, context.candidate_heads, ("scope_id", "candidate_id"), "WHERE family = 'memory'"
             ):
                 context.errors.append(
                     f"Candidate {row['scope_id']}/{row['candidate_id']}: legacy Memory Candidate is unsupported"
@@ -1080,11 +1101,11 @@ async def _unsupported(context: _Context, units: _Units, tables: set[str]) -> No
 async def _decision_applied(context: _Context, units: _Units, decision: CandidateDecision) -> bool:
     """A committed replacement lets the same decision file be reused for a rerun."""
 
-    cited = "pc_artifact_candidate_versions" in context.citation_tables
+    cited = context.candidate_versions in context.citation_tables
     async with units.unit() as connection:
         found = await rows(
             connection,
-            "pc_artifact_candidate_versions",
+            context.candidate_versions,
             ("artifact_refs", *((LEGACY_CITATION_COLUMN,) if cited else ())),
             "WHERE scope_id = :scope_id AND candidate_id = :candidate_id AND version = :version",
             scope_id=decision.scope_id,
@@ -1112,9 +1133,19 @@ async def convert_references(
     async with units.unit() as current:
         tables = await table_names(current)
         citation_tables = frozenset(await legacy_citation_columns(current, tables))
-    context = _Context(collections, decisions, write=database is not None, citation_tables=citation_tables)
+    prefix = "pc_artifact_candidate" if "pc_artifact_candidate_versions" in tables else "pc_candidate"
+    if "pc_artifact_candidate_versions" in tables and "pc_candidate_versions" in tables:
+        return {}, ("ambiguous Candidate tables; finish or recover the Dream migration first",)
+    context = _Context(
+        collections,
+        decisions,
+        write=database is not None,
+        citation_tables=citation_tables,
+        candidate_versions=prefix + "_versions",
+        candidate_heads=prefix + "_heads",
+    )
     await _unsupported(context, units, tables)
-    if "pc_artifact_candidate_versions" in tables:
+    if context.candidate_versions in tables:
         await _candidates(context, units)
     if "pc_dream_runs" in tables:
         await _dream_runs(context, units)
@@ -1256,9 +1287,9 @@ async def residual_issues(  # noqa: C901 - One flat list of independent residual
             "SELECT COUNT(*) FROM pc_artifacts WHERE memory_citations IS NOT NULL AND LENGTH(memory_citations) > 2",
             "Artifacts still hold legacy Memory citations",
         ),
-        "pc_artifact_candidate_versions": (
-            "SELECT COUNT(*) FROM pc_artifact_candidate_versions WHERE "  # noqa: S608
-            + (cited if "pc_artifact_candidate_versions" in citation_tables else "")
+        "pc_candidate_versions": (
+            "SELECT COUNT(*) FROM pc_candidate_versions WHERE "  # noqa: S608
+            + (cited if "pc_candidate_versions" in citation_tables else "")
             + "CAST(artifact_refs AS CHAR) LIKE '%\"memory\"%'",
             "Candidates still hold legacy Memory references",
         ),
@@ -1268,6 +1299,12 @@ async def residual_issues(  # noqa: C901 - One flat list of independent residual
             "terminal Dream runs still use the executable legacy format",
         ),
     }
+    checks["pc_artifact_candidate_versions"] = (
+        "SELECT COUNT(*) FROM pc_artifact_candidate_versions WHERE "  # noqa: S608 - fixed table and predicates
+        + (cited if "pc_artifact_candidate_versions" in citation_tables else "")
+        + "CAST(artifact_refs AS CHAR) LIKE '%\"memory\"%'",
+        "Candidates still hold legacy Memory references",
+    )
     if "pc_dream_runs" in tables and await count(
         "SELECT COUNT(*) FROM pc_dream_runs WHERE status NOT IN ('succeeded', 'failed') "
         "AND CAST(payload AS CHAR) LIKE '%memory_citations%'"
@@ -1295,12 +1332,11 @@ async def residual_issues(  # noqa: C901 - One flat list of independent residual
             ("payload",),
             "WHERE source_type = 'content' AND CAST(payload AS CHAR) LIKE '%memory%'",
         ):
-            value = json.loads(bytes(row["payload"]))["value"]
-            model = _WORK_MODELS.get(str((value.get("metadata") or {}).get("kind")))
-            if model is None:
+            work = _stored_work_payload(bytes(row["payload"]))
+            if work is None:
                 continue
-            content = value["content"]
-            current = json.loads(content)
+            model, value, _root = work
+            current = json.loads(value["content"])
             if model is HandoffReceipt:
                 # Only unavailable addresses may describe an archived collection.
                 current["unavailable_evidence"] = [

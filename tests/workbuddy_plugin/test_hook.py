@@ -593,3 +593,56 @@ def test_prompt_hook_refuses_redirects(
                 )
 
     assert target_headers == []
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        (401, "authentication_failed"),
+        (403, "invalid_response"),
+        (404, "version_mismatch"),
+        (503, "server_unavailable"),
+    ],
+)
+def test_scope_resolution_failure_emits_the_documented_diagnostic(
+    hook_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: int,
+    outcome: str,
+) -> None:
+    paths: list[str] = []
+
+    class RejectedBindingHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            paths.append(self.path)
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(b"untrusted response body")
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            pass
+
+    with _serve(RejectedBindingHandler) as server_url:
+        monkeypatch.setenv("POWERCONTEXT_WORKBUDDY_SERVER_URL", server_url)
+        monkeypatch.setenv("POWERCONTEXT_WORKBUDDY_AUTHORIZATION", "Bearer private-token")
+        output, errors = _run_main(
+            hook_module,
+            monkeypatch,
+            {
+                **_payload("private prompt content"),
+                "cwd": str(tmp_path),
+                "session_id": "private-session",
+            },
+        )
+
+    assert paths == ["/v1/scope-bindings/resolve"]
+    assert json.loads(output)["hookSpecificOutput"]["additionalContext"] == ""
+    event = json.loads(errors)
+    assert event == {
+        "component": "powercontext.workbuddy.recall",
+        "event": "context_prepare",
+        "outcome": outcome,
+        **({"http_status": status} if status not in {401, 503} else {}),
+    }

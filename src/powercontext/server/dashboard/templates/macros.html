@@ -16,7 +16,7 @@ limitations under the License.
 
 {% macro icon(name) %}
 <span class="nav-symbol nav-link-icon" aria-hidden="true">
-  <img class="w-100 h-100" src="/dashboard/static/vendor/icons/{{ {'home':'home','handoff':'arrows-exchange','notes':'notes','methods':'book','profile':'notes','topics':'book','prompts':'notes','usage':'chart-bar'}[name] }}.svg" alt="">
+  <img class="w-100 h-100" src="/dashboard/static/vendor/icons/{{ {'home':'home','handoff':'arrows-exchange','notes':'notes','methods':'book','profile':'notes','topics':'book','prompts':'notes','usage':'chart-bar','review':'notes'}[name] }}.svg" alt="">
 </span>
 {% endmacro %}
 
@@ -47,7 +47,7 @@ limitations under the License.
     <h3 class="card-title fw-normal experience-lesson">{% if data.experience %}<a class="text-reset" href="{{ link('experience') }}">{{ data.experience.lesson|truncate(120, true) }}</a>{% else %}{{ t.experience_empty }}{% endif %}</h3>
     <p class="experience-situation">{{ data.experience.situation|truncate(160, true) if data.experience else t.methods_empty_body }}</p>
     <div class="experience-footer">{% if data.experience %}
-    <div class="source-trail text-secondary small mb-3">{{ data.experience.sources|length }} {{ t.source_count }}</div>
+    <div class="source-trail text-secondary small mb-3">{{ data.experience.source_count if data.experience.source_count is defined else data.experience.sources|length }} {{ t.source_count }}</div>
     <a href="{{ link('experience') }}">{{ t.read_experience }}</a>
     {% endif %}</div>
   </div>

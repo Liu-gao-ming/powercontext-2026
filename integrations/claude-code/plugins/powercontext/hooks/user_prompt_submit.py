@@ -33,21 +33,25 @@ _SCRIPTS_ROOT = _PLUGIN_ROOT / "scripts"
 sys.path.insert(0, str(_PLUGIN_ROOT))
 sys.path.insert(0, str(_SCRIPTS_ROOT))
 
+from bootstrap_state import clear_receipt, load_receipt  # noqa: E402
 from claude_code_settings import ClaudeCodePluginSettings  # noqa: E402
 from hooks import prepared_context as _prepared_context  # noqa: E402
 from hooks.diagnostics import should_emit as _should_emit_diagnostic  # noqa: E402
+from hooks.prompt_privacy import scrub_secrets  # noqa: E402
 from workspace_scope import bind_response_deadline, open_bounded, resolve_scope_id  # noqa: E402
 
 _MAX_CONTEXT_BYTES = _prepared_context.MAX_CONTEXT_BYTES
 _InvalidResponseError = _prepared_context.InvalidPreparedContextResponse
 _validate_prepared_context = _prepared_context.validate_prepared_context
+_bounded_recall_query = _prepared_context.bounded_recall_query
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_SOURCE_LENGTH = 200_000
 _READ_CHUNK_BYTES = 65_536
 _REQUEST_HEADERS = {
+    "X-PowerContext-Dream-Contract": "2",
     "Accept": "application/json",
     "Content-Type": "application/json",
-    "User-Agent": "powercontext-claude-code-plugin/0.1.2",
+    "User-Agent": "powercontext-claude-code-plugin/0.1.3",
 }
 _FAILURE_OUTCOMES = frozenset({"authentication_failed", "version_mismatch", "server_unavailable", "invalid_response"})
 
@@ -115,7 +119,7 @@ def _decode_error_code(raw: bytes) -> str | None:
     return code if isinstance(code, str) else None
 
 
-def main(settings: ClaudeCodePluginSettings | None = None) -> int:
+def main(settings: ClaudeCodePluginSettings | None = None) -> int:  # noqa: C901 - One fail-open hook lifecycle.
     """Process one Claude Code hook payload and fail open."""
 
     try:
@@ -137,24 +141,33 @@ def main(settings: ClaudeCodePluginSettings | None = None) -> int:
             return 0
 
         http_deadline = monotonic() + settings.http_budget_seconds
+        session_id = _payload_identifier(payload, "session_id")
         scope_id = resolve_scope_id(
             cwd,
-            session_id=_payload_identifier(payload, "session_id"),
+            session_id=session_id,
             settings=settings,
             deadline=http_deadline,
         )
+        bootstrap_receipt_id = load_receipt(session_id, scope_id)
+        clear_receipt(session_id)
+        safe_prompt = scrub_secrets(prompt, settings.authorization)
+        query = _bounded_recall_query(safe_prompt)
         context = None
         with suppress(Exception):
             context = _recall_context(
-                prompt,
+                query,
                 scope_id,
                 settings=settings,
                 deadline=http_deadline,
+                bootstrap_receipt_id=bootstrap_receipt_id,
                 emitted_diagnostics=emitted_diagnostics,
                 diagnostic_events=diagnostic_events,
             )
 
-        if settings.capture_prompts and len(prompt) <= _MAX_SOURCE_LENGTH:
+        if safe_prompt != prompt:
+            with suppress(Exception):
+                _emit_context_event("skipped", event_name="capture_source", reason="sensitive_content")
+        elif settings.capture_prompts and len(prompt) <= _MAX_SOURCE_LENGTH:
             try:
                 captured = _capture_prompt(
                     payload,
@@ -209,6 +222,7 @@ def _prepare_context(
     *,
     settings: ClaudeCodePluginSettings,
     deadline: float,
+    bootstrap_receipt_id: str | None = None,
 ) -> Mapping[str, object]:
     return _post_json(
         "/v1/context/prepare",
@@ -218,6 +232,7 @@ def _prepare_context(
             "max_bytes": _MAX_CONTEXT_BYTES,
             **({"include_code": True} if settings.include_code else {}),
             **({"assembly": settings.context_assembly} if settings.context_assembly is not None else {}),
+            **({"bootstrap_receipt_id": bootstrap_receipt_id} if bootstrap_receipt_id is not None else {}),
         },
         settings=settings,
         deadline=deadline,
@@ -392,11 +407,22 @@ def _recall_context(
     *,
     settings: ClaudeCodePluginSettings,
     deadline: float,
+    bootstrap_receipt_id: str | None = None,
     emitted_diagnostics: set[str] | None = None,
     diagnostic_events: list[dict[str, object]] | None = None,
 ) -> str | None:
     try:
-        prepared = _validate_prepared_context(_prepare_context(query, scope_id, settings=settings, deadline=deadline))
+        if bootstrap_receipt_id is None:
+            response = _prepare_context(query, scope_id, settings=settings, deadline=deadline)
+        else:
+            response = _prepare_context(
+                query,
+                scope_id,
+                settings=settings,
+                deadline=deadline,
+                bootstrap_receipt_id=bootstrap_receipt_id,
+            )
+        prepared = _validate_prepared_context(response)
     except _HttpStatusError as error:
         outcome = _http_failure_outcome(error, operation="context_prepare")
         if outcome is not None:
@@ -448,6 +474,7 @@ def _emit_context_event(
     context_status: str | None = None,
     content_bytes: int | None = None,
     recovery: str | None = None,
+    reason: str | None = None,
     emitted_diagnostics: set[str] | None = None,
     diagnostic_events: list[dict[str, object]] | None = None,
 ) -> None:
@@ -471,8 +498,7 @@ def _emit_context_event(
         event["context_status"] = context_status
     if content_bytes is not None:
         event["content_bytes"] = content_bytes
-    if recovery is not None:
-        event["recovery"] = recovery
+    event.update({key: value for key, value in (("recovery", recovery), ("reason", reason)) if value is not None})
     if diagnostic_events is None or outcome not in _FAILURE_OUTCOMES:
         sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
     else:

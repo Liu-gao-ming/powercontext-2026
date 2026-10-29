@@ -45,11 +45,25 @@ curl --fail-with-body -sS http://127.0.0.1:8000/v1/context/prepare \
 mv "$tmp_context" context.md
 ```
 
-Authenticated Servers require the same Authorization header as other API calls. The HTTP envelope still has four
-fields: `schema`, `status`, `content`, and `content_bytes`. Write or inject `content` directly. It is already the
-final text, including the historical-evidence notice, section headings, literal bodies, exact citations, and
+Authenticated Servers require the same Authorization header as other API calls. The HTTP envelope carries
+`schema`, `status`, `content` and `content_bytes`. Write or inject `content` directly. It is already the final
+text, including the historical-evidence notice, section headings, literal bodies, exact citations, and
 truncation flags. An empty result has `status: "empty"`, `content: null`, and `content_bytes: 0`. HTTP 4xx/5xx
 responses or invalid response shapes leave the previous file untouched and return a non-zero exit code.
+
+Add `"explain": true` to the request to also learn whether the preparation lost a retrieval channel it would
+otherwise have used: the response then carries a `reason`, `inference_timeout` when the
+`recall_embedding_timeout_seconds` budget expired and `inference_unavailable` when the provider failed. Those are
+two of the four spellings RFC 1435 gives `SearchGroup.fallback_reason`, namely the two inference failures, and the
+same ones the fallback event logs, so the API and the log never classify one cause two ways. The other two are not
+missing by accident: `none` is carried by the field's absence, and `reused_fts_fallback` is not a cause at this
+level — a later round that reuses a failed round's keyword-only outcome is already explained by that round's
+`inference_*` value, which outranks it. The field
+is absent unless a channel was lost, and absent entirely from a request that does not ask, so the four fields a
+Host validates never change. It names a lost channel, not an empty scope: a keyword-only deployment that never
+asks for vectors never sets it. The same event is logged as `memory.search.embedding_fallback` or
+`topic_memory.search.embedding_fallback`, so an operator keeps the signal even for a Host that never opts in, and
+neither the log nor the reason carries the query.
 
 The equivalent Python request uses the shared Client:
 
@@ -88,9 +102,12 @@ asyncio.run(export_context())
 Default prepare requests without `assembly` also recall Topic Memory from the current Scope when available.
 With explicit `assembly`, select `topic-memory` to include it. `assembly: {}` still selects only Memory and Experience.
 
-Topic recall skips query Embedding when the Scope has no current Topics. During context preparation, each Topic
-query Embedding attempt has a 250 ms budget and falls back to FTS on timeout. The same prepare request reuses that FTS
-choice in recall-gate expansion rounds; a subsequent request can try Embedding again. A slow optional provider does not
+Topic recall skips query Embedding when the Scope has no current Topics. During context preparation, Topic recall
+reuses the Memory query vector when both use the same embedding model and the query fits Topic search (64 distinct
+terms and 8,192 characters); otherwise it embeds its own query. That attempt waits only for what Memory recall left of
+the preparation's `recall_embedding_timeout_seconds` budget (500 ms by default), so a second embedding round trip has
+to fit in the same budget, and falls back to FTS when the budget runs out. The same prepare request reuses that
+FTS choice in recall-gate expansion rounds; a subsequent request can try Embedding again. A slow optional provider does not
 hold up already retrieved Memory. Direct Topic search keeps the configured provider timeout.
 
 Entries retain retrieval order within a family. Existing Memory reranking remains authoritative. Rank can have gaps

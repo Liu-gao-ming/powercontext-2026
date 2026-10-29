@@ -51,14 +51,16 @@ def _samples(rendered):
         (sample.name, sample.labels["family"]): sample.value
         for metric in text_string_to_metric_families(rendered)
         for sample in metric.samples
-        if sample.name.startswith(PREFIX)
+        if sample.name.startswith(PREFIX) and "family" in sample.labels
     }
 
 
 def test_processing_metrics_expose_family_capacity_progress_and_counter_snapshots():
     metrics = ServerMetrics()
     snapshot = _status(scope_id="scope-secret", worker_id="worker-secret", binding_name="binding-secret")
-    metrics.set_processing_families(dict.fromkeys(("memory", "topic-memory", "experience", "profile"), snapshot))
+    metrics.set_processing_families(
+        SimpleNamespace(family_status=dict.fromkeys(("memory", "topic-memory", "experience", "profile"), snapshot))
+    )
 
     rendered = metrics.render().decode()
     samples = _samples(rendered)
@@ -84,21 +86,21 @@ def test_processing_metrics_expose_family_capacity_progress_and_counter_snapshot
     assert instruments[PREFIX + "failed"].type == "counter"
     assert instruments[PREFIX + "timeouts"].type == "counter"
     assert instruments[PREFIX + "unacknowledged_requests"].type == "gauge"
-    assert "latest requested-work discovery pass" in instruments[PREFIX + "unacknowledged_requests"].documentation
+    assert "latest background pending observation" in instruments[PREFIX + "unacknowledged_requests"].documentation
     assert "resets on restart" in instruments[PREFIX + "completed"].documentation
     assert not any(secret in rendered for secret in ("scope-secret", "worker-secret", "binding-secret"))
     assert all(
         set(sample.labels) == {"family"}
         for instrument in instruments.values()
         for sample in instrument.samples
-        if sample.name.startswith(PREFIX)
+        if sample.name.startswith(PREFIX) and "family" in sample.labels
     )
 
     # Scrapes observe cumulative state; they never add it repeatedly.
-    metrics.set_processing_families({"memory": _status(completed=13)})
+    metrics.set_processing_families(SimpleNamespace(family_status={"memory": _status(completed=13)}))
     assert _samples(metrics.render().decode())[(PREFIX + "completed_total", "memory")] == 13
     assert _samples(metrics.render().decode())[(PREFIX + "completed_total", "memory")] == 13
-    metrics.set_processing_families({"memory": _status(completed=0)})
+    metrics.set_processing_families(SimpleNamespace(family_status={"memory": _status(completed=0)}))
     assert _samples(metrics.render().decode())[(PREFIX + "completed_total", "memory")] == 0
 
 
@@ -107,7 +109,9 @@ def test_processing_metrics_expose_family_capacity_progress_and_counter_snapshot
 )
 def test_processing_metrics_reject_noncanonical_family_labels(invalid_family):
     metrics = ServerMetrics()
-    metrics.set_processing_families({invalid_family: _status(), "custom-family": _status()})
+    metrics.set_processing_families(
+        SimpleNamespace(family_status={invalid_family: _status(), "custom-family": _status()})
+    )
 
     samples = _samples(metrics.render().decode())
     assert {family for _, family in samples} == {"custom-family"}
@@ -115,13 +119,15 @@ def test_processing_metrics_reject_noncanonical_family_labels(invalid_family):
 
 def test_processing_metrics_replace_removed_families_and_omit_invalid_numbers():
     metrics = ServerMetrics()
-    metrics.set_processing_families({"memory": _status()})
-    metrics.set_processing_families({"topic-memory": _status()})
+    metrics.set_processing_families(SimpleNamespace(family_status={"memory": _status()}))
+    metrics.set_processing_families(SimpleNamespace(family_status={"topic-memory": _status()}))
     assert {family for _, family in _samples(metrics.render().decode())} == {"topic-memory"}
 
-    metrics.set_processing_families({"memory": {"used_workers": float("nan"), "failed": -1, "ready": "secret"}})
+    metrics.set_processing_families(
+        SimpleNamespace(family_status={"memory": {"used_workers": float("nan"), "failed": -1, "ready": "secret"}})
+    )
     assert _samples(metrics.render().decode()) == {}
-    metrics.set_processing_families({})
+    metrics.set_processing_families(None)
     assert _samples(metrics.render().decode()) == {}
 
 
@@ -130,7 +136,7 @@ def test_existing_metrics_endpoint_refreshes_current_supervisor_snapshot(tmp_pat
     with TestClient(app) as client:
         runtime = app.state.application
         previous = runtime.artifact_processing_supervisor
-        supervisor = SimpleNamespace(family_status={"memory": _status()})
+        supervisor = SimpleNamespace(family_status={"memory": _status()}, status=SimpleNamespace(value="leader"))
         runtime.artifact_processing_supervisor = supervisor
         try:
             first = client.get("/metrics")

@@ -33,10 +33,11 @@ powercontext doctor hermes
 ```
 
 Setup 命令会把 provider 复制到 `$HERMES_HOME/plugins/powercontext`，安装
-`$HERMES_HOME/plugins/powercontext-command`，并在不授予内置工具覆盖权限的情况下启用 slash-command 插件。它不会启动
-Server，也不会在 Hermes 中选择 provider。
+`$HERMES_HOME/plugins/powercontext-command`。除非用户已显式禁用，否则会启用 slash-command 插件，且不授予内置工具覆盖权限。
+未配置 `memory.provider` 时，setup 自动选择 PowerContext；已有 provider 选择（包括显式空值）会保留。
+Setup 不会启动 Server。
 
-运行 Hermes Memory 设置向导，并选择 `PowerContext`：
+需要从现有 provider 切换到 PowerContext，或调整 provider 配置时，运行 Hermes Memory 设置向导并选择 `PowerContext`：
 
 ```bash
 hermes memory setup

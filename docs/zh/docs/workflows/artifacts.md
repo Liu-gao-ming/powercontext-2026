@@ -35,6 +35,15 @@ Replace。缺少 `If-Match` 返回 `428`，ETag 过期返回 `412`；接口不�
 引用结果或向另一个 Agent 交付时，保留家族、Artifact ID 和精确 Revision。
 当前 head 可以前进，历史 Revision 保持不变。
 
+## 使用 Stable Handle 命名精确 Revision
+
+Stable Handle 为一个精确的 Artifact Revision 提供人类可读、Scope 内有效的名称。通过
+`PUT /v1/scopes/{scope_id}/artifact-handles/{family}/{key}` 创建绑定，并通过同一路由的 `GET` 解析绑定。
+
+绑定是永久的。`(scope_id, family, key)` 一旦提交，就不能更新、释放或删除。重复提交完全相同的绑定是幂等操作；
+将同一个 key 绑定到另一个 Artifact Revision 会返回 `409 Conflict`。绑定前应确认 family、Artifact ID、Revision
+和 key；如果错误绑定了某个 key，应改用新的 key。
+
 Artifact 的 `sources` 会保留每个来源的 `source_type` 和 `source_id`，包括 `note` 等动态注册的类型。
 读取列表、详情和历史版本时，应将 `source_type` 作为开放的 Source 名称处理。
 Source ID 会保留采集时接受的 Unicode 字符和内部空格，例如 `用户偏好` 和 `release notes`。
@@ -48,8 +57,8 @@ Topic Memory 也使用上述通用接口：创建和整体替换提交完整的 
 ## 检索相关的当前 head
 
 使用 `POST /v1/scopes/{scope_id}/artifacts/{family}/search` 在一个 Scope 内按相关性检索。
-内置入口支持 Experience、托管 Skill 和 Topic Memory，返回完整内容及精确 Revision；可选评分属于本次搜索响应。
-Family 支持范围、准入、阈值和故障行为见[检索 Artifact](search-artifacts.md)，Topic 的 RRF 控制参数见[融合算法与参数](search-fusion.md)。
+内置入口支持 Experience、托管 Skill、Topic Memory 和 Atomic Memory，返回完整内容及精确 Revision；可选评分属于本次搜索响应。
+Family 支持范围、准入、阈值和故障行为见[检索 Artifact](search-artifacts.md)，Topic 和 Atomic 的 RRF 控制参数见[融合算法与参数](search-fusion.md)。
 
 ## 按对应工作流修改
 

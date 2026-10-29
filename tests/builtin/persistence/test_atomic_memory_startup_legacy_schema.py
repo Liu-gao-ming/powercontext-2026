@@ -38,9 +38,12 @@ from powercontext.server.authz.repository import ACCESS_TABLES, RelationalAccess
 from tests.legacy_memory import add_legacy_citation_columns
 
 
-def test_sqlite_startup_rejects_unmigrated_memory_with_legacy_artifact_head_columns(tmp_path: Path) -> None:
-    database = tmp_path / "legacy-memory.db"
+def test_sqlite_startup_rejects_unmigrated_memory_with_legacy_artifact_head_columns(
+    initialized_sqlite_database: Path,
+) -> None:
+    database = initialized_sqlite_database
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE pc_artifact_heads")
         connection.execute(
             "CREATE TABLE pc_artifact_heads (scope_id TEXT NOT NULL, family TEXT NOT NULL, "
             "artifact_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY (scope_id, family, artifact_id))"
@@ -82,7 +85,9 @@ def test_sqlite_startup_rejects_unmigrated_memory_with_legacy_artifact_head_colu
             await add_legacy_citation_columns(connection)
             # Frozen legacy payloads retain the old collection and entry identities.
             await connection.execute(
-                text("INSERT INTO pc_artifacts VALUES ('project', 'memory', 'memory', 1, :content, NULL)"),
+                text(
+                    "INSERT INTO pc_artifacts (scope_id, family, artifact_id, revision, content, memory_citations) VALUES ('project', 'memory', 'memory', 1, :content, NULL)"
+                ),
                 {"content": content},
             )
             await connection.execute(text("INSERT INTO pc_artifact_heads VALUES ('project', 'memory', 'memory', 1)"))
@@ -140,8 +145,10 @@ def test_sqlite_startup_rejects_unmigrated_memory_with_legacy_artifact_head_colu
 
 
 @pytest.mark.parametrize("entrypoint", ["startup", "apply", "authority"])
-def test_unreleased_atomic_state_table_is_rejected_without_data_loss(tmp_path: Path, entrypoint: str) -> None:
-    database = tmp_path / "unreleased.db"
+def test_unreleased_atomic_state_table_is_rejected_without_data_loss(
+    initialized_sqlite_database: Path, entrypoint: str
+) -> None:
+    database = initialized_sqlite_database
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE pc_atomic_memory_states(artifact_id TEXT, state TEXT)")
         connection.execute("INSERT INTO pc_atomic_memory_states VALUES ('retained', 'merged')")

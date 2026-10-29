@@ -17,6 +17,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 
 from click import unstyle
 from typer.testing import CliRunner
@@ -58,3 +59,40 @@ def test_processing_maintenance_plan_apply_verify_require_maintenance_and_reuse_
     replay = runner.invoke(cli, [*command, "--action", "apply", "--maintenance-confirmed"])
     assert replay.exit_code == 0, replay.output
     assert config.url not in plan.output + applied.output + verified.output + replay.output
+
+
+def _isolate_server_environment(monkeypatch, config: SQLiteConfig) -> None:
+    for key in tuple(os.environ):
+        if key.startswith("POWERCONTEXT_SERVER_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("POWERCONTEXT_SERVER_DATABASE_KIND", "sqlite")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_DATABASE_URL", config.url)
+
+
+def test_processing_maintenance_plan_does_not_create_a_missing_database(tmp_path, monkeypatch):
+    database = tmp_path / "absent" / "maintenance.db"
+    _isolate_server_environment(monkeypatch, SQLiteConfig(url=f"sqlite+aiosqlite:///{database}"))
+
+    result = CliRunner().invoke(create_cli([app]), ["server", "processing-migrate", "--action", "plan"])
+
+    assert result.exit_code != 0
+    assert not database.parent.exists()
+    assert not database.exists()
+
+
+def test_processing_maintenance_plan_leaves_the_stored_journal_mode_unchanged(tmp_path, monkeypatch):
+    path = tmp_path / "maintenance.db"
+    asyncio.run(_create_plain_database(SQLiteConfig(url=f"sqlite+aiosqlite:///{path}", journal_mode="DELETE")))
+    # The command is configured for WAL but must not write that setting while planning.
+    _isolate_server_environment(monkeypatch, SQLiteConfig(url=f"sqlite+aiosqlite:///{path}", journal_mode="WAL"))
+
+    result = CliRunner().invoke(create_cli([app]), ["server", "processing-migrate", "--action", "plan"])
+
+    assert result.exit_code == 0, result.output
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+
+
+async def _create_plain_database(config: SQLiteConfig) -> None:
+    async with SQLiteProfile.open(config, tables=BUILTIN_TABLES):
+        pass

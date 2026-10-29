@@ -27,6 +27,7 @@ from powercontext.builtin.artifacts.handoff.errors import (
     InvalidHandoffGenerationError,
     InvalidHandoffReferenceError,
 )
+from powercontext.builtin.artifacts.handoff.generation import rollover_draft_violation
 from powercontext.builtin.artifacts.handoff.generation_metadata import HandoffGenerationReceipts
 from powercontext.builtin.artifacts.handoff.hints import render_handoff_hint
 from powercontext.builtin.artifacts.handoff.models import (
@@ -109,6 +110,7 @@ class HandoffService:
         draft = await self._generation_pipeline.generate(
             HandoffGenerationRequest(
                 objective=action.objective,
+                rollover_reasons=action.rollover_reasons,
                 evidence=evidence,
                 max_bytes=action.max_bytes,
             )
@@ -400,6 +402,8 @@ class HandoffService:
         content_bytes = len(draft.as_content().model_dump_json(by_alias=True, indent=2).encode())
         if content_bytes > action.max_bytes:
             raise InvalidHandoffGenerationError("budget")
+        if action.rollover_reasons and (violation := rollover_draft_violation(draft)):
+            raise InvalidHandoffGenerationError(violation)
 
     async def _evidence_checks(
         self,

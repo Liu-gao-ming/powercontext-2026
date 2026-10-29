@@ -87,7 +87,7 @@ class ArtifactGovernanceRepository:
         row = (await connection.execute(statement)).mappings().one_or_none()
         if row is None:
             raise RepositoryNotFoundError("artifact-head", (scope_id, family, artifact_id))
-        return _governance(row)
+        return decode_artifact_governance(row)
 
     async def require_summary(
         self, connection: AsyncConnection, scope_id: str, family: str, artifact_id: str, expected: ArtifactGovernance
@@ -221,7 +221,7 @@ def _validate_transition(current: ArtifactLifecycleState, requested: ArtifactLif
         )
 
 
-def _governance(row) -> ArtifactGovernance:
+def decode_artifact_governance(row) -> ArtifactGovernance:
     return ArtifactGovernance(
         artifact=ArtifactRef(
             family=str(row["family"]),

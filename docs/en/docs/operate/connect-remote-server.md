@@ -29,7 +29,7 @@ powercontext setup claude-code --server-url http://192.0.2.10:8000 --allow-insec
 ```
 
 Replace `claude-code` with `codex`, `dsh`, `openclaw`, `opencode`, `pi`, `hermes`, or `workbuddy`.
-The same options work with `setup select --host ...` for its catalog hosts; WorkBuddy uses its dedicated command.
+The same options work with `setup codex dsh` for multiple agents and `config agent codex dsh` for installed connections.
 A declined or missing consent fails before installation starts. A warning is written to stderr, leaving JSON stdout
 parseable. Successful installation saves the endpoint and consent for new sessions; it does not save credentials.
 

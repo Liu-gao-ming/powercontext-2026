@@ -39,7 +39,7 @@ from powercontext.builtin.artifacts.prompt.models import (
     ResolvedPrompt,
 )
 
-PromptHeadReader = Callable[[str, str], Awaitable[Prompt | None]]
+PromptHeadsReader = Callable[[str, tuple[str, ...]], Awaitable[dict[str, Prompt]]]
 DemonstrationGenerator = Callable[
     [PromptDefinition, GeneratePromptDemonstrations], Awaitable[PromptDemonstrationResult]
 ]
@@ -97,19 +97,25 @@ class PromptService:
     def __init__(
         self,
         registry: PromptRegistry,
-        head_reader: PromptHeadReader,
+        heads_reader: PromptHeadsReader,
         generators: dict[str, DemonstrationGenerator] | None = None,
     ) -> None:
         self.registry = registry
-        self._head_reader = head_reader
+        self._heads_reader = heads_reader
         self._generators = dict(generators or {})
 
     async def read_configuration(self, scope_id: str, key: str, /) -> PromptConfiguration:
         """Read defaults and one saved head even when inference is disabled."""
 
-        definition = self.registry.get(key)
-        capability = self.registry.capabilities[key]
-        head = await self._head_reader(scope_id, key)
+        return (await self.read_configurations(scope_id, (key,)))[0]
+
+    async def read_configurations(self, scope_id: str, keys: tuple[str, ...], /) -> tuple[PromptConfiguration, ...]:
+        definitions = tuple(self.registry.get(key) for key in keys)
+        heads = await self._heads_reader(scope_id, keys)
+        return tuple(self._configuration(scope_id, definition, heads.get(definition.key)) for definition in definitions)
+
+    def _configuration(self, scope_id: str, definition: PromptDefinition, head: Prompt | None) -> PromptConfiguration:
+        capability = self.registry.capabilities[definition.key]
         mode = "auto" if head is None else head.content.mode
         builtin = None
         effective = None
@@ -137,7 +143,7 @@ class PromptService:
 
     async def resolve(self, scope_id: str, key: str, /) -> ResolvedPrompt | None:
         definition = self.registry.get(key)
-        head = await self._head_reader(scope_id, key)
+        head = (await self._heads_reader(scope_id, (key,))).get(key)
         if head is not None and head.content.mode == "custom":
             self.registry.require_customization(key, during_inference=True)
         elif self.registry.capabilities[key].status != "supported":

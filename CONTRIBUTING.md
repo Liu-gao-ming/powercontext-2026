@@ -96,7 +96,9 @@ make unit-test
 ```
 
 Use `make e2e-test` for cross-component behavior, `make contract-test` for OpenAPI changes, and
-`make docs-test` for documentation changes. `make test` runs the complete pytest suite.
+`make docs-test` for documentation changes. `make test` runs the complete pytest suite. These pytest targets
+spread tests across one worker per CPU with pytest-xdist; pass `PYTEST_WORKERS=0` to run them in a single process,
+for example when debugging with `pdb`.
 
 Before raising a pull request you should also run tox when a change may affect supported Python versions.
 This requires you to have the relevant Python versions installed. The same version matrix runs in CI.
@@ -112,6 +114,43 @@ git push origin name-of-your-bugfix-or-feature
 7. Submit a pull request through the GitHub website.
 
 # Pull Request Guidelines
+
+## OceanBase migration acceptance
+
+The E2E harness runs Scope search migrations, background listener lifecycle, clean
+Atomic Memory migrations, managed startup consistency, and long-query acceptance
+on three isolated OceanBase runners. Every group collects and validates its full
+test collection before selecting zero-based shard `INDEX/COUNT`. Cases within each shard still run
+serially in separate pytest processes; skips and failures fail the shard.
+
+With the migration OceanBase URL configured as in `.github/workflows/e2e-harness.yml`,
+reproduce the clean migration part of one shard with:
+
+```bash
+uv run --locked python scripts/run_atomic_memory_clean_migration.py \
+  oceanbase --shard 0/3 --output .powercontext/migration-shard-0/clean-migration
+```
+
+Omit `--shard` to run the complete collection. Use `--tests` to select the other
+groups' files from the workflow, or `--collect-only` to inspect the full collection
+without running cases. Every invocation writes `summary.json`; only successful
+execution, including a legitimately empty shard, marks the report complete.
+
+The aggregate check retains the name `Atomic Memory clean migration (OceanBase)`.
+It requires all three runners to succeed and verifies that their reports cover
+every collected node exactly once in each of the five groups. To verify downloaded
+artifacts locally, keep each shard artifact in a separate subdirectory and run:
+
+```bash
+uv run --locked python scripts/check_atomic_memory_migration_shards.py \
+  --reports .powercontext/downloaded-migration-shards --shards 3
+```
+
+Collection-only or incomplete reports cannot satisfy the aggregate check. Include
+links and measured before/after job and workflow times in migration CI PRs, and
+report runner queue time separately from execution time.
+
+## Submission checklist
 
 Before you submit a pull request, check that it meets these guidelines:
 

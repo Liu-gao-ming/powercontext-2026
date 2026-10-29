@@ -39,7 +39,12 @@ REMOTE_SOURCE_OVERRIDE = f"{REMOTE_SOURCE}/e2e/bub/source-overrides.txt"
 REMOTE_TOOL_DIR = "/installed-agent/tools"
 BUB_VERSION = version("bub")
 POWERCONTEXT_VERSION = version("powercontext")
-BUB_ACP_SERVER_VERSION = "0.0.2"
+# Change ACP_SDK_REQUIREMENT together with this version: it repeats the server's own pin of the ACP SDK.
+BUB_ACP_SERVER_VERSION = "0.1.1"
+# bub-acp-server 0.1.1 pins this pre-release. uv accepts a pre-release only when a direct requirement names it, so the
+# install must repeat the pin or it cannot resolve the server at all. A server release that pins another SDK version
+# conflicts with this requirement and fails to install.
+ACP_SDK_REQUIREMENT = "agent-client-protocol==1.0.0rc2"
 STEP_FAILURE_MARKER = "/logs/agent/powercontext-step-failed"
 # Harbor uploads each step's tests to this directory before running the step's verifier and leaves them there.
 STEP_TESTS_DIR = "/tests"
@@ -114,10 +119,7 @@ class PowerContextBubAcpAgent(harbor_acp.AcpAgent):
 
         launcher_path = self.logs_dir / "acp-launch.sh"
         launcher_path.write_text(
-            "#!/usr/bin/env sh\n"
-            "set -eu\n"
-            f'bub_bin=$(dirname "$(readlink -f {REMOTE_BIN_DIR}/bub)")\n'
-            'exec "$bub_bin/bub-acp-server" "$@"\n',
+            f'#!/usr/bin/env sh\nset -eu\nexec {REMOTE_BIN_DIR}/bub acp "$@"\n',
             encoding="utf-8",
         )
         await environment.upload_file(source_path=launcher_path, target_path=self._LAUNCHER_REMOTE_PATH)
@@ -186,6 +188,6 @@ def _install_acp_server_command() -> str:
         f"PATH={runner_bin}:$PATH BUB_HOME={REMOTE_BUB_HOME} CODEX_HOME={REMOTE_CODEX_HOME} "
         f"BUB_PROJECT={REMOTE_BUB_PROJECT} "
         f"{_tool_environment()} {REMOTE_BIN_DIR}/bub install "
-        f"{shlex.quote(f'bub-acp-server=={BUB_ACP_SERVER_VERSION}')} "
+        f"{shlex.quote(f'bub-acp-server=={BUB_ACP_SERVER_VERSION}')} {shlex.quote(ACP_SDK_REQUIREMENT)} "
         f"{shlex.quote(f'bub=={BUB_VERSION}')}"
     )

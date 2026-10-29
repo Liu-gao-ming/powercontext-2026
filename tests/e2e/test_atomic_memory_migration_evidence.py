@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, ForeignKeyConstraint, MetaData, event, insert, inspect, select, text, tuple_
+import rfc8785
+from sqlalchemy import Engine, ForeignKeyConstraint, MetaData, event, insert, inspect, select, text, tuple_, update
 
 from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.atomic_memory import AtomicMemoryContent
@@ -35,6 +36,7 @@ from powercontext.builtin.artifacts.atomic_memory.extraction import (
     AtomicMemoryGenerationPipeline,
 )
 from powercontext.builtin.artifacts.atomic_memory.reconciliation import (
+    AtomicMemoryArtifactEvidence,
     AtomicMemoryReconciliationContent,
     AtomicMemoryReconciliationOutput,
 )
@@ -66,19 +68,22 @@ from powercontext.builtin.persistence.migrations.atomic_memory_references import
     table_names,
 )
 from powercontext.builtin.persistence.migrations.atomic_memory_v1 import (
+    OWNER_DECISIONS_FORMAT,
     AtomicMemoryMigrationError,
     apply_atomic_memory_migration,
+    load_owner_decisions,
+    plan_atomic_memory_migration,
     verify_atomic_memory_migration,
 )
 from powercontext.builtin.persistence.recurrence import RecurrenceRepository
 from powercontext.builtin.persistence.schema import create_tables
 from powercontext.builtin.persistence.tables import (
-    ARTIFACT_CANDIDATE_HEADS_TABLE,
-    ARTIFACT_CANDIDATE_VERSIONS_TABLE,
     ARTIFACT_HEADS_TABLE,
     ARTIFACT_LINEAGE_ARTIFACTS_TABLE,
     ARTIFACT_LINEAGE_SOURCES_TABLE,
     ARTIFACTS_TABLE,
+    CANDIDATE_HEADS_TABLE,
+    CANDIDATE_VERSIONS_TABLE,
     DREAM_RUNS_TABLE,
     MEMORY_ENTRY_HEADS_TABLE,
     MEMORY_ENTRY_VERSIONS_TABLE,
@@ -91,6 +96,7 @@ from powercontext.builtin.runtime.atomic_memory_rebuild import rebuild_atomic_me
 from powercontext.builtin.runtime.config import DatabaseConfig
 from powercontext.builtin.sources.content import ContentSource, ContentSourceTarget
 from powercontext.builtin.work.models import HandoffReceipt, TaskOutcome
+from powercontext.server.authz.repository import RelationalAccessRepository
 from powercontext.sources import SourceMaterialization, SourceRef
 from tests.e2e.atomic_memory_migration_backend import MigrationBackend, migration_index, migration_profile
 from tests.e2e.atomic_memory_migration_fixture import (
@@ -139,6 +145,48 @@ def sqlite_like_does_not_match_blobs() -> Iterator[None]:
 def migrated(migration_backend: MigrationBackend) -> tuple[DatabaseConfig, bytes]:
     config = migration_backend.config
     return config, asyncio.run(_seed_and_migrate(config))
+
+
+@pytest.mark.parametrize("failure", ["memory", "cancel"])
+def test_snapshot_read_failure_preserves_authority_and_allows_restart(
+    migration_backend: MigrationBackend, failure: str
+) -> None:
+    config = migration_backend.config
+
+    async def scenario():
+        await _seed(config)
+        async with migration_profile(config) as profile:
+            async with profile.database.transaction() as connection:
+                original = await _imported_snapshot(connection)
+            interrupted = False
+
+            def interrupt_snapshot(_connection, _cursor, statement, _parameters, _context, _executemany):
+                nonlocal interrupted
+                if interrupted or not statement.startswith("SELECT * FROM pc_sources"):
+                    return
+                interrupted = True
+                if failure == "memory":
+                    raise MemoryError
+                task = asyncio.current_task()
+                assert task is not None
+                task.cancel()
+
+            event.listen(profile.database.engine.sync_engine, "before_cursor_execute", interrupt_snapshot)
+            try:
+                with pytest.raises(MemoryError if failure == "memory" else asyncio.CancelledError):
+                    await apply_atomic_memory_migration(
+                        profile.database, migration_index(config), maintenance_confirmed=True
+                    )
+            finally:
+                event.remove(profile.database.engine.sync_engine, "before_cursor_execute", interrupt_snapshot)
+            assert interrupted
+            async with profile.database.transaction() as connection:
+                assert await _imported_snapshot(connection) == original
+                assert ARCHIVE_TABLE.name not in await table_names(connection)
+        retried = await _migrate(config)
+        assert retried.ready, retried.errors
+
+    asyncio.run(scenario())
 
 
 async def _public_collection_rows(connection) -> list[Any]:
@@ -422,17 +470,180 @@ def test_other_origin_does_not_broaden_migrated_entry_root_groups_or_selection(m
 
 def test_migrated_collection_leaves_public_artifact_reads(migrated) -> None:
     async def scenario() -> None:
-        async with (
-            open_builtin_contexts(BuiltinConfig(database=migrated[0])) as contexts,
-            contexts.database.transaction() as connection,
-        ):
-            assert not await _public_collection_rows(connection)
-        for read in (
-            contexts.records.get_artifact_revision(SCOPE, "memory", COLLECTION, 2),
-            contexts.records.list_artifact_revisions(SCOPE, "memory", COLLECTION, limit=10, cursor=None),
-        ):
-            with pytest.raises(BaseOperationNotSupportedError):
-                await read
+        async with open_builtin_contexts(BuiltinConfig(database=migrated[0])) as contexts:
+            async with contexts.database.transaction() as connection:
+                assert not await _public_collection_rows(connection)
+            for read in (
+                contexts.records.get_artifact_revision(SCOPE, "memory", COLLECTION, 2),
+                contexts.records.list_artifact_revisions(SCOPE, "memory", COLLECTION, limit=10, cursor=None),
+            ):
+                with pytest.raises(BaseOperationNotSupportedError):
+                    await read
+
+    asyncio.run(scenario())
+
+
+def test_enforced_migration_repairs_ownerless_entry_from_explicit_decision(
+    migration_backend: MigrationBackend,
+) -> None:
+    config = migration_backend.config
+
+    async def remove_owner(_contexts, connection) -> None:
+        await connection.execute(
+            text(
+                "DELETE FROM pc_access_owners WHERE owner_kind = 'artifact' AND scope_id = :scope "
+                "AND family = 'memory' AND artifact_id = :memory AND selector_entry_id = 'alpha'"
+            ),
+            {"scope": SCOPE, "memory": COLLECTION},
+        )
+
+    decisions = load_owner_decisions({
+        "format": OWNER_DECISIONS_FORMAT,
+        "decisions": [
+            {
+                "scope_id": SCOPE,
+                "memory_id": COLLECTION,
+                "entry_id": "alpha",
+                "action": "establish",
+                "owner": {"type": "user", "id": "recovered-owner"},
+                "idempotency_key": "recover-owner:alpha",
+            }
+        ],
+    })
+
+    async def scenario() -> None:
+        await _seed(config, remove_owner)
+        refused = await _migrate(config, require_owners=True)
+        assert not refused.ready
+        assert any("alpha" in error and "owner decision" in error for error in refused.errors)
+
+        applied = await _migrate(config, owner_decisions=decisions, require_owners=True)
+        assert applied.ready, applied.errors
+        async with migration_profile(config) as profile, profile.database.transaction() as connection:
+            owner = (
+                await connection.execute(
+                    text(
+                        "SELECT owner_type, owner_id, idempotency_key FROM pc_access_owners "
+                        "WHERE owner_kind = 'artifact' AND scope_id = :scope AND family = 'atomic-memory' "
+                        "AND artifact_id = :artifact"
+                    ),
+                    {"scope": SCOPE, "artifact": _atomic("alpha", 2).artifact_id},
+                )
+            ).one()
+            assert tuple(owner) == ("user", "recovered-owner", "recover-owner:alpha")
+            verified = await verify_atomic_memory_migration(
+                connection,
+                index=migration_index(config),
+                owner_decisions=decisions,
+                require_owners=True,
+            )
+            assert verified.ready, verified.errors
+            assert verified.counts["completed_owner_repairs"] == 1
+
+        repeated = await _migrate(config, owner_decisions=decisions, require_owners=True)
+        assert repeated.ready, repeated.errors
+        repeated_without_file = await _migrate(config, require_owners=True)
+        assert repeated_without_file.ready, repeated_without_file.errors
+
+    asyncio.run(scenario())
+
+
+def test_pending_owner_repair_blocks_plan_and_verify(migration_backend: MigrationBackend) -> None:
+    config = migration_backend.config
+
+    async def remove_owner(_contexts, connection) -> None:
+        await connection.execute(
+            text(
+                "DELETE FROM pc_access_owners WHERE owner_kind = 'artifact' AND scope_id = :scope "
+                "AND family = 'memory' AND artifact_id = :memory AND selector_entry_id = 'alpha'"
+            ),
+            {"scope": SCOPE, "memory": COLLECTION},
+        )
+
+    decisions = load_owner_decisions({
+        "format": OWNER_DECISIONS_FORMAT,
+        "decisions": [
+            {
+                "scope_id": SCOPE,
+                "memory_id": COLLECTION,
+                "entry_id": "alpha",
+                "action": "establish",
+                "owner": {"type": "user", "id": "recovered-owner"},
+                "idempotency_key": "recover-owner:alpha",
+            }
+        ],
+    })
+
+    async def scenario() -> None:
+        await _seed(config, remove_owner)
+        migrated = await _migrate(config)
+        assert migrated.ready, migrated.errors
+        async with migration_profile(config) as profile, profile.database.transaction() as connection:
+            reports = (
+                await plan_atomic_memory_migration(
+                    connection, index=migration_index(config), owner_decisions=decisions, require_owners=True
+                ),
+                await verify_atomic_memory_migration(
+                    connection, index=migration_index(config), owner_decisions=decisions, require_owners=True
+                ),
+            )
+        for report in reports:
+            assert not report.ready
+            assert report.counts["pending_owner_repairs"] == 1
+            assert report.counts["completed_owner_repairs"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_owner_repair_failure_rolls_back_entry_import(
+    migration_backend: MigrationBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = migration_backend.config
+
+    async def remove_owner(_contexts, connection) -> None:
+        await connection.execute(
+            text(
+                "DELETE FROM pc_access_owners WHERE owner_kind = 'artifact' AND scope_id = :scope "
+                "AND family = 'memory' AND artifact_id = :memory AND selector_entry_id = 'alpha'"
+            ),
+            {"scope": SCOPE, "memory": COLLECTION},
+        )
+
+    decisions = load_owner_decisions({
+        "format": OWNER_DECISIONS_FORMAT,
+        "decisions": [
+            {
+                "scope_id": SCOPE,
+                "memory_id": COLLECTION,
+                "entry_id": "alpha",
+                "action": "establish",
+                "owner": {"type": "user", "id": "recovered-owner"},
+                "idempotency_key": "recover-owner:alpha",
+            }
+        ],
+    })
+
+    async def scenario() -> None:
+        await _seed(config, remove_owner)
+        with monkeypatch.context() as patcher:
+
+            async def fail_owner(*_args, **_kwargs):
+                raise RuntimeError("injected owner failure")  # noqa: TRY003 - explicit transactional failure injection.
+
+            patcher.setattr(RelationalAccessRepository, "establish_artifact_owner", fail_owner)
+            with pytest.raises(RuntimeError, match="injected owner failure"):
+                await _migrate(config, owner_decisions=decisions, require_owners=True)
+        async with migration_profile(config) as profile, profile.database.transaction() as connection:
+            count = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM pc_artifact_heads WHERE scope_id = :scope "
+                    "AND family = 'atomic-memory' AND artifact_id = :artifact"
+                ),
+                {"scope": SCOPE, "artifact": _atomic("alpha", 2).artifact_id},
+            )
+            assert count == 0
+        repaired = await _migrate(config, owner_decisions=decisions, require_owners=True)
+        assert repaired.ready, repaired.errors
 
     asyncio.run(scenario())
 
@@ -494,6 +705,10 @@ def test_source_flush_supplies_the_migrated_related_entry_current_content(migrat
             candidate_pipeline=pipeline,
         ) as contexts:
             context = await contexts.get(SCOPE)
+            memory = contexts.atomic_memory.for_scope(SCOPE)
+            original = await memory.get(_atomic("alpha", 2).artifact_id)
+            async with contexts.database.transaction() as connection:
+                imported = await _imported_snapshot(connection)
             await contexts.records.capture_source(SCOPE, "content", "migration-trigger", "Recheck task A and C.", {})
             await context.triggers.flush(limit=20)
             observed = []
@@ -504,8 +719,20 @@ def test_source_flush_supplies_the_migrated_related_entry_current_content(migrat
                         observed.append(tuple(evidence[key] for key in related.evidence_ids))
             assert observed, "The public flush must compare the imported alpha identity."
             for (published,) in observed:
+                assert isinstance(published, AtomicMemoryArtifactEvidence)
                 assert published.artifact_ref == _atomic("alpha", 2)
+                assert published.content.kind == original.artifact.content.kind
                 assert published.content.text == "Tasks A and C were completed."
+            assert await memory.get(original.ref.artifact_id) == original
+            assert (
+                await memory.get(original.ref.artifact_id, revision=original.ref.revision)
+            ).artifact == original.artifact
+            async with contexts.database.transaction() as connection:
+                resolved = await _resolver(contexts).resolve(connection, artifacts=(original.ref,))
+                assert _projected_sources(resolved) == (A, C)
+                assert EA in _projected_artifacts(resolved)
+                assert EB not in _projected_artifacts(resolved)
+                assert await _imported_snapshot(connection) == imported
 
     asyncio.run(scenario())
 
@@ -603,7 +830,7 @@ async def _set_citations(connection, table: str, where: str, citations: list[Any
 
 async def _candidate(connection, candidate_id: str, *, artifact_refs: list[Any], citations: list[Any] | None) -> None:
     await connection.execute(
-        insert(ARTIFACT_CANDIDATE_VERSIONS_TABLE).values(
+        insert(CANDIDATE_VERSIONS_TABLE).values(
             scope_id=SCOPE,
             candidate_id=candidate_id,
             version=1,
@@ -616,14 +843,14 @@ async def _candidate(connection, candidate_id: str, *, artifact_refs: list[Any],
     if citations is not None:
         await _set_citations(
             connection,
-            "pc_artifact_candidate_versions",
+            "pc_candidate_versions",
             "scope_id = :scope AND candidate_id = :candidate",
             citations,
             scope=SCOPE,
             candidate=candidate_id,
         )
     await connection.execute(
-        insert(ARTIFACT_CANDIDATE_HEADS_TABLE).values(
+        insert(CANDIDATE_HEADS_TABLE).values(
             scope_id=SCOPE, candidate_id=candidate_id, family="experience", version=1, status="pending"
         )
     )
@@ -717,6 +944,7 @@ async def _legacy_references(contexts, connection) -> None:
             upstream_revision=1,
         )
     )
+    await _scope_row(connection)
     await _candidate(connection, "cited-candidate", artifact_refs=[], citations=[ALPHA_2])
     await _insert_handoff(connection, "legacy-handoff", _handoff_content(ALPHA_2_CITATION))
     await connection.execute(
@@ -734,7 +962,6 @@ async def _legacy_references(contexts, connection) -> None:
     await connection.execute(
         insert(ARTIFACT_HEADS_TABLE).values(scope_id=SCOPE, family="handoff", artifact_id="legacy-handoff", revision=1)
     )
-    await _scope_row(connection)
     stored = await _work_source(
         contexts, connection, OUTCOME, "task-outcome", "powercontext.task-outcome.v1", LEGACY_OUTCOME
     )
@@ -790,7 +1017,7 @@ def test_migration_converts_exact_citations_and_archives_collection_relationship
             assert not await _public_collection_rows(connection)
             report = await verify_atomic_memory_migration(connection, index=contexts.atomic_memory.index)
             assert report.ready, report.errors
-            for table in ("pc_artifacts", "pc_artifact_candidate_versions"):
+            for table in ("pc_artifacts", "pc_candidate_versions"):
                 columns = await connection.run_sync(lambda sync, name=table: inspect(sync).get_columns(name))
                 assert "memory_citations" not in {column["name"] for column in columns}
 
@@ -865,6 +1092,7 @@ def test_candidate_left_without_evidence_blocks_until_an_explicit_replacement(
     config = migration_backend.config
 
     async def blocked(_contexts, connection) -> None:
+        await _scope_row(connection)
         await _candidate(connection, "collection-candidate", artifact_refs=[_collection(1)], citations=None)
 
     async def scenario() -> None:
@@ -892,8 +1120,8 @@ def test_candidate_left_without_evidence_blocks_until_an_explicit_replacement(
         assert applied.ready, applied.errors
         async with migration_profile(config) as profile, profile.database.transaction() as connection:
             refs = await connection.scalar(
-                select(ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.artifact_refs).where(
-                    ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.candidate_id == "collection-candidate"
+                select(CANDIDATE_VERSIONS_TABLE.c.artifact_refs).where(
+                    CANDIDATE_VERSIONS_TABLE.c.candidate_id == "collection-candidate"
                 )
             )
             assert isinstance(refs, bytes) and json.loads(refs) == [EA.model_dump(mode="json")]
@@ -991,6 +1219,84 @@ def test_work_text_mentioning_legacy_field_names_migrates_unchanged(migration_ba
             )
             assert isinstance(payload, bytes | bytearray | memoryview)
             assert json.loads(json.loads(bytes(payload))["value"]["content"])["message"] == mention
+            report = await verify_atomic_memory_migration(connection, index=contexts.atomic_memory.index)
+            assert report.ready, report.errors
+
+    asyncio.run(scenario())
+
+
+async def _unenvelope(connection, ref: SourceRef) -> None:
+    """Rewrite one stored Source row into the payload layout used before the envelope."""
+
+    where = (SOURCES_TABLE.c.scope_id == SCOPE, SOURCES_TABLE.c.source_id == ref.source_id)
+    payload = await connection.scalar(select(SOURCES_TABLE.c.payload).where(*where))
+    assert isinstance(payload, bytes)
+    await connection.execute(
+        update(SOURCES_TABLE).where(*where).values(payload=rfc8785.dumps(json.loads(bytes(payload))["value"]))
+    )
+
+
+def test_unenveloped_source_mentioning_memory_migrates_unchanged(migration_backend: MigrationBackend) -> None:
+    config = migration_backend.config
+    mention = "Restore durable memory context before accepting this Handoff."
+    capture = SourceRef(source_type="content", source_id="unenveloped-capture")
+
+    async def seeded(contexts, connection) -> None:
+        await contexts.repositories.sources.add(
+            connection,
+            SCOPE,
+            ContentSource(name=capture.source_id, materialization=SourceMaterialization.CAPTURED, content=mention),
+        )
+        await _unenvelope(connection, capture)
+
+    async def scenario() -> None:
+        await _seed_and_migrate(config, seeded)
+        async with (
+            open_builtin_contexts(BuiltinConfig(database=config)) as contexts,
+            contexts.database.transaction() as connection,
+        ):
+            stored = (await contexts.repositories.sources.get(connection, SCOPE, capture)).value
+            assert isinstance(stored, ContentSource) and stored.content == mention
+            report = await verify_atomic_memory_migration(connection, index=contexts.atomic_memory.index)
+            assert report.ready, report.errors
+
+    asyncio.run(scenario())
+
+
+def test_unenveloped_work_source_citations_convert_and_keep_their_layout(
+    migration_backend: MigrationBackend,
+) -> None:
+    config = migration_backend.config
+    alpha = _atomic("alpha", 2)
+    outcome = SourceRef(source_type="content", source_id="legacy-layout-outcome")
+    legacy = {**LEGACY_OUTCOME, "produced_artifacts": [_collection(2)]}
+
+    async def seeded(contexts, connection) -> None:
+        await _scope_row(connection)
+        await _work_source(contexts, connection, outcome, "task-outcome", "powercontext.task-outcome.v1", legacy)
+        await _unenvelope(connection, outcome)
+
+    async def scenario() -> None:
+        await _seed_and_migrate(config, seeded)
+        async with (
+            open_builtin_contexts(BuiltinConfig(database=config)) as contexts,
+            contexts.database.transaction() as connection,
+        ):
+            payload = await connection.scalar(
+                select(SOURCES_TABLE.c.payload).where(
+                    SOURCES_TABLE.c.scope_id == SCOPE, SOURCES_TABLE.c.source_id == outcome.source_id
+                )
+            )
+            assert isinstance(payload, bytes)
+            stored = json.loads(bytes(payload))
+            assert "value" not in stored, "a converted legacy row keeps the layout it was written with"
+            converted = TaskOutcome.model_validate_json(stored["content"])
+            assert converted.observations[0].evidence == (HandoffArtifactCitation(artifact_ref=alpha),)
+            assert converted.produced_artifacts == ()
+            incoming = (await _archive_metadata(connection, 2))["incoming_references"]
+            assert [(item["carrier"], item["value"]) for item in incoming] == [("work_source", _collection(2))]
+            source = (await contexts.repositories.sources.get(connection, SCOPE, outcome)).value
+            assert isinstance(source, ContentSource)
             report = await verify_atomic_memory_migration(connection, index=contexts.atomic_memory.index)
             assert report.ready, report.errors
 

@@ -1,0 +1,72 @@
+# Shared runtime, dependency, and CI changes can affect every consumer.
+# Patterns use Python fnmatch semantics: * also matches path separators.
+full = [
+  "src/**", "openapi/**", "pyproject.toml", "uv.lock", "Makefile", "tox.ini",
+  ".mise.toml", ".pre-commit-config.yaml", ".github/actions/**", ".github/workflows/**",
+  ".github/ci-paths.toml", "scripts/ci_changes.py", "tests/test_ci_changes.py",
+  "tests/conftest.py", "tests/**/conftest.py", "tests/fixtures/**", "integrations/capabilities.toml",
+  "integrations/langchain/pyproject.toml", "integrations/langgraph/pyproject.toml",
+  "integrations/opendal/pyproject.toml",
+]
+
+# These files still receive the always-running quality and license checks.
+ignore = [
+  "AGENTS.md", "REVIEW.md", "CONTRIBUTING.md", "GOVERNANCE.md", "LICENSE", "LICENSES/**",
+  ".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md", ".github/CODEOWNERS",
+]
+
+[suites]
+helm = ["deploy/helm/**", "tests/test_helm*.py", "tests/e2e/helm_*.py"]
+tests = [
+  "tests/**", "integrations/**", "examples/**", "scripts/generate_js_operations.py",
+  "scripts/sync_dsh_plugin_tree.py", "scripts/generate_integration_manifest_docs.py",
+  "scripts/run_atomic_memory_clean_migration.py", "scripts/scan_e2e_evidence.sh",
+  "scripts/check_atomic_memory_migration_shards.py",
+  "scripts/ci_role_smoke.py",
+  # These evaluator suites still live under the root tests/ directory.
+  "evaluation/memory/locomo/**", "evaluation/memory/locomo_plus/**", "evaluation/memory/write_gate/**",
+]
+evaluation = ["evaluation/**"]
+database = [
+  "tests/builtin/persistence/**", "tests/builtin/*native_code*", "tests/builtin/runtime/*recall*",
+  "tests/builtin/runtime/test_statistics.py", "tests/builtin/runtime/test_model_usage_recorder.py",
+  "tests/builtin/runtime/test_prepared_context.py", "tests/e2e/*atomic*", "tests/e2e/*mysql*",
+  "tests/e2e/*native_code*", "tests/e2e/test_recall_sufficiency_gate.py",
+  "tests/e2e/test_context_text_assembly.py", "tests/e2e/test_scope_search_migration.py",
+  "scripts/run_atomic_memory_clean_migration.py",
+  "scripts/check_atomic_memory_migration_shards.py",
+]
+dify = ["integrations/dify/**", "tests/*dify*"]
+hermes = ["integrations/hermes/**", "tests/*hermes*"]
+dsh = ["integrations/dsh/**", "tests/*dsh*", "scripts/generate_js_operations.py", "scripts/sync_dsh_plugin_tree.py"]
+pi = ["integrations/pi/**", "tests/*pi_*"]
+opencode = ["integrations/opencode/**", "tests/*opencode*"]
+openclaw = ["integrations/openclaw/**", "tests/*openclaw*"]
+opendal = ["integrations/opendal/**"]
+website = [
+  "docs/**", "website/**", "assets/**", "README*.md", "scripts/generate_integration_manifest_docs.py",
+  "tests/e2e/test_blog_site.py",
+]
+# Root tests assert exact sentences in published docs, so documentation edits must
+# exercise them without paying for the complete tests matrix.
+docs_tests = ["docs/**", "README*.md"]
+native = ["tests/native/**", "tests/test_service*.py", "tests/test_cursor_secret.py", "tests/test_server.py"]
+harness = [
+  "e2e/**", "integrations/bub/**", "scripts/scan_e2e_evidence.sh", "tests/test_e2e_workflow_contract.py",
+  "tests/e2e/test_atomic_memory_search_authorization_snapshot.py", "tests/e2e/test_atomic_memory_read_snapshot.py",
+  "tests/e2e/test_runtime_server.py",
+]
+# ZCode acceptance also exercises the Pi plugin and cross-host handoff fixtures.
+zcode = [
+  "integrations/zcode/**", "evaluation/zcode_guidance/**", "tests/*zcode*", "integrations/pi/**",
+  "tests/e2e/test_cross_host_work_continuity.py", "tests/e2e/cross_host_work_continuity/**",
+]
+kimi = ["integrations/kimi-code/**", "tests/*kimi*"]
+
+# Packaged guidance and its generators are inputs to the native host tests.
+[shared]
+patterns = [
+  "scripts/integration_guidance*", "scripts/evaluate_integration_guidance.py", "scripts/guidance_templates/**",
+  "tests/test_integration_guidance*", "tests/test_guidance*", "tests/test_setup_rollback.py",
+]
+suites = ["tests", "dify", "hermes", "dsh", "pi", "opencode", "openclaw", "zcode", "kimi"]

@@ -28,12 +28,35 @@ powercontext doctor codex
 未提供新地址时，setup 复用保存的地址。文件与进程中声明的地址冲突时，仍需显式选择：使用 `--server-url`，
 并在重新执行前统一或清除运行时地址覆盖。`--source` 指定插件代码来源，不指定 Server 地址。
 
-配置完成后开启新的 Codex 会话。通过 `/hooks` 查看 PowerContext `UserPromptSubmit` Hook，并在收到提示时授予信任。
+在 Windows 上，安装与诊断会使用 PATH 中解析出的 Codex 可执行入口，包括 npm 的 `.cmd` 启动脚本。
+当前目录中的启动脚本不会优先于 PATH：解析直接枚举 PATH 目录；PATH 中显式写入的 `.` 条目与空条目仍按其位置与语义生效。
+`PATH` 为空字符串时完全不搜索，未设置时回退到系统标准搜索根；两种行为均与 `shutil.which` 一致。
+对于 `.cmd` / `.bat` 入口，PowerContext 会在启动该条命令前拒绝可执行路径或命令参数中的 shell 元字符
+（`& | < > ( ) ^ % ! "`）及 ASCII 控制字符，支持空格和 Unicode。这可避免批处理解释静默改写来源或 ref；
+请使用原生可执行文件，或不含这些字符的启动脚本路径及参数。该限制不作用于原生可执行文件或其他平台。
+不支持的 source/ref 参数会在注册 marketplace 前被拒绝；如果后续命令因返回的 marketplace 名称而被拒绝，
+注册步骤可能已经完成，安装不会因此自动回滚。
+
+### 首次会话 Hook 信任
+
+配置完成后开启新的 Codex 会话。发送第一条消息前，通过 `/hooks` 检查 PowerContext Hook，并在收到提示时授予信任。
+`SessionStart` 解析会话 Scope，并按配置加载启动上下文；`UserPromptSubmit` 准备相关上下文，并独立地将用户输入采集为 Source。
+插件还使用 `PreToolUse` 绑定 MCP 操作的 Scope。插件已加载或 MCP 工具可发现，都不能证明这些 Hook 已执行。
+
+如果跳过或拒绝信任，进入 `/hooks` 检查 PowerContext 条目，按当前宿主提供的操作启用或信任它们。
+如宿主要求开启新会话，按提示操作，在重新验收采集前再次检查 Hook。不同 Codex 版本的控件和提示可能不同。
+如果找不到预期 Hook，按下文诊断安装与宿主支持情况；没有出现信任提示，不代表 Hook 已启用。
+
+`UserPromptSubmit` 未启用时，不会自动召回或采集输入。MCP 连通是另一条路径，不能证明自动行为正常。
+启用后发送一条含独特项目名的决定，确认它进入绑定 Scope 的 Source 日志，再按[记忆验收](../get-started/quickstart.md#4-按所选模式验收记忆)检查后续结果。
+提示词采集默认开启；如果曾主动关闭，先检查[提示词采集配置](#控制提示词采集)。
+
+### 安装与连接诊断
 
 `powercontext doctor codex --json` 通过 `mcp_tools` 报告基础 MCP 连接，通过 `mcp_full_profile` 报告完整工具覆盖。
 完整覆盖要求 Codex 集成 manifest 的 `server-mcp` 中声明的全部能力工具，包括 Memory 维护、Scope 管理和
 Handoff 操作。缺失工具会按名称列出，并使结果降级；工具发现不代表模型就绪、Hook 已执行或具有写入权限。
-具备基础 Memory 支持时，`setup codex` 和 `setup select --host codex` 均可成功，`doctor` 单独报告 full 覆盖不完整。
+Setup 会分别报告安装完成和诊断结果；基础 Memory 支持仍可使用时，`doctor` 可能单独报告 full 覆盖不完整。
 鉴权或基础连接失败仍会使安装失败。
 
 ## 理解自动恢复、Memory 和 Handoff
@@ -52,14 +75,13 @@ Handoff 操作。缺失工具会按名称列出，并使结果降级；工具发
 交接
 ```
 
-`powercontext-project-context` Skill 会把这句话视为创建持久交接里程碑的明确授权。Codex 在同一轮中检查当前对话和仓库，整理目标、
-分支与工作区状态、改动文件、已执行检查、阻塞项、缺失项和下一步，然后在当前 Session Scope 中依次调用
-`handoff_current_work` 和 `commit_handoff`。提交成功后，Codex 返回 exact Handoff Revision；用户不需要再填写交接
-内容或重复确认提交。
+`powercontext-project-context` Skill 检查当前对话和仓库，整理目标、当前状态、已执行检查、遗漏和下一步，
+然后在当前 Session Scope 中调用 `handoff_current_work`。普通交接返回接收方可以使用的完整临时 Handoff，
+不会提交持久 Revision。`交接当前工作` 和 `handoff this work` 使用同一临时交接路径。
 
-`交接当前工作`、`把当前工作交接出去` 和 `handoff this work` 使用相同行为。若只想检查内容而不写入，请明确说
-`预览交接，不要提交`；Skill 此时只在对话中渲染建议内容，不调用写工具。讨论 Handoff 设计或询问 Handoff
-如何工作也不会触发持久化。
+需要持久里程碑时，明确要求“保存持久交接里程碑”。Skill 准备边界后调用 `commit_handoff`，只有提交成功才报告精确 Revision；
+已有明确授权无需再次确认。若只想检查内容而不写入，请说“预览交接，不要提交”；Skill 此时只在对话中渲染建议内容，
+不调用写工具。讨论 Handoff 设计不授权写入。
 
 Session 启动时，Codex 按以下顺序解析 Scope：显式的 `POWERCONTEXT_CODEX_SCOPE_ID`、已有 Session binding、
 host 管理的 workspace binding、Server 默认 Scope。解析出的 Scope 会固定到当前 Session。仓库和目录身份只用于查找
@@ -78,12 +100,49 @@ uv run --frozen --quiet --project "$PLUGIN_ROOT" python "$PLUGIN_ROOT/scripts/sc
 `POWERCONTEXT_CODEX_SCOPE_ID` 仍然优先于这条登记。已经开着的会话保持启动时写下的 Session binding；在该 Git 根新开一场会话后，没有显式变量、也没有更早的 Session binding 时，会使用这条 workspace binding。MCP 的 `set_scope_binding` 只改当前会话，不能代替这条命令。
 
 Codex 开始分析提示词前，Hook 只调用一次 `POST /v1/context/prepare`，请求 8000-byte 总预算。它严格校验
-`powercontext.prepared-context.v1`，并原样注入返回内容。Runtime 负责把 Memory 内容标记为不可信历史、保留
+`powercontext.prepared-context.v1`，并原样注入返回内容。召回 query 在构造请求前先定界：不超过 8192 个字符、
+也不超过 8192 个 UTF-8 字节的 prompt 原样发送；更长的 prompt 改用最近的文本召回，先取末尾 8192 个字符、
+再截到末尾 8192 字节。因此长 prompt 只会收窄 query，不会让召回失败；prompt 采集不受影响，仍按自身上限执行。
+Runtime 负责把 Memory 内容标记为不可信历史、保留
 精确 citation，并完成最终选择与渲染。显式搜索仍可通过 Client 和 MCP 使用，但不会成为第二次自动召回。自动注入的
 内容和 Handoff 都是历史信息；Codex 在据此行动前仍应与当前代码、用户要求和系统指令核对。
 
 Memory 用于长期保存可复用的决策、约束和状态；Handoff 用于临时移交当前任务，不能用几条 Memory 替代。概念边界见
 [理解 Memory 和 Handoff](../workflows/memory-and-handoff.md)，操作步骤见[在 Codex 中交接工作](../workflows/handoff-with-codex.md)。
+
+## 选择启用 Session 启动上下文
+
+启动上下文默认关闭。若要在 Codex 的 `startup`、`resume`、`clear` 或 `compact` 事件中，于第一条 prompt 前加载一份
+小而确定的上下文包，请用以下环境启动 Codex：
+
+```bash
+export POWERCONTEXT_CODEX_BOOTSTRAP_CONTEXT=true
+codex
+```
+
+固定 profile `powercontext.scope-bootstrap.v1` 最多包含 6 个显式标记为 `bootstrap-context` 的 active Atomic Memory
+Artifact；顺序是当前 Scope 优先，其次是最多 8 个直接 Context References。它不会扫描全部 Memory、Source、
+transcript、pending Candidate 或生成的 instruction，也会排除类型类似 secret 的 Memory。所有历史文本都标记为
+不可信，不能覆盖当前的用户、developer、system 或仓库指令。
+
+默认总预算是 4096 UTF-8 bytes，可在 512 到 8192 之间调整：
+
+```bash
+export POWERCONTEXT_CODEX_BOOTSTRAP_MAX_BYTES=6144
+```
+
+系统不会自动选择 Handoff。若要加入当前 Scope 中一个 exact committed Handoff，请在启动 Codex 前提供其不可变身份：
+
+```bash
+export POWERCONTEXT_CODEX_BOOTSTRAP_HANDOFF='{"artifact_id":"HANDOFF_ID","revision":3}'
+```
+
+通过 Atomic Memory Artifact tag API，只把经过审阅、适合每个新 Session 的决策、约束、目标、已验证状态或
+仓库指南标记为 `bootstrap-context`。不含正文的 delivery receipt 让重试保持幂等；成功注入后，第一条普通查询
+会携带该 receipt，Runtime 仅排除正文已完整交付的 exact Atomic Memory revisions；启动时被截短的 Artifact 和
+后续修订版本仍可正常召回。
+准备、校验或回执失败时都会 fail open，不注入任何内容。
+在新的生命周期包建立前发生失败（包括配置非法）时，还会清除之前保存的过期 receipt。
 
 ## Experience 和 Skill 能力
 
@@ -247,7 +306,7 @@ Hook 的 Server 地址从已安装插件 `.mcp.json` 派生，MCP 也读取同�
 桌面 App 不会继承已经运行的终端内部发生的环境变化。在 Windows 上，setup 会把值持久化到当前用户环境，但已
 运行的 Desktop 仍需重启才能继承。运行 `powercontext doctor codex`，再分别确认 Hook 采集成功与 MCP 可用。
 MCP 显示 connected 也不等于 Source 已采集。
-最后完成[Source、主题演进与新会话召回验收](../get-started/quickstart.md#4-用普通对话验收-topic-memory)。
+最后完成[Source、主题演进与新会话召回验收](../get-started/quickstart.md#4-按所选模式验收记忆)。
 
 ## 环境变量
 
@@ -256,6 +315,9 @@ MCP 显示 connected 也不等于 Source 已采集。
 | `POWERCONTEXT_CODEX_ALLOW_INSECURE_HTTP` | `false` | 显式允许 Hook 使用非环回明文 HTTP |
 | `POWERCONTEXT_CODEX_SCOPE_ID` | 未设置 | 显式选择一个已存在 Scope，不再解析 binding 和 Server 默认 Scope |
 | `POWERCONTEXT_CODEX_AUTHORIZATION` | 未设置 | 完整 `Bearer <token>` 运行时覆盖；setup 保存后供后续 Hook 和原生 MCP 连接使用 |
+| `POWERCONTEXT_CODEX_BOOTSTRAP_CONTEXT` | `false` | 在支持的 `SessionStart` 事件中注入精选启动 profile |
+| `POWERCONTEXT_CODEX_BOOTSTRAP_MAX_BYTES` | `4096` | 启动上下文总预算；有效范围为 512 到 8192 bytes |
+| `POWERCONTEXT_CODEX_BOOTSTRAP_HANDOFF` | 未设置 | 一个 exact committed Handoff 的 JSON 身份，例如 `{"artifact_id":"...","revision":3}` |
 | `POWERCONTEXT_CODEX_CAPTURE_PROMPTS` | `true` | 把用户提示词采集为 Source 证据 |
 | `POWERCONTEXT_CODEX_FLUSH_ON_CAPTURE` | `false` | 采集后等待 Source 处理 |
 | `POWERCONTEXT_CODEX_REQUEST_TIMEOUT_SECONDS` | `3` | Hook 单次请求超时 |
@@ -269,3 +331,7 @@ Hook 默认允许环回 HTTP，远程 HTTP 需要显式同意，HTTPS 证书校�
 Codex Hook 外层超时为十秒。Server 不可用或拒绝鉴权时，恢复、采集和 flush 独立降级，不会阻塞 Codex。未显式指定
 Scope 时，插件依次解析 Session binding、workspace binding 和 Server 默认 Scope。进程级配置必须存在于启动
 Codex 的环境中；Windows setup 会把鉴权写入用户环境，但 Desktop 仍需重启才能继承。
+
+## 自动输入隐私
+
+本宿主的捕获默认值、关闭方式、凭据识别局限及独立只读查询行为见[自动 prompt 隐私策略](index.md#自动-prompt-隐私策略)。识别到凭据的输入会跳过捕获，已接受的 Source 正文和事件身份不被改写。

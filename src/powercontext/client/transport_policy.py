@@ -95,6 +95,8 @@ def load_client_settings(host: str) -> dict[str, Any]:
         if not isinstance(saved["allow_insecure_http"], bool):
             raise ValueError("Saved PowerContext allow_insecure_http must be a JSON boolean")  # noqa: TRY003
         result["allow_insecure_http"] = saved["allow_insecure_http"]
+    if host == "dsh" and "profile" in saved:
+        result.update(profile=saved["profile"], dsh_command=saved.get("dsh_command"))
     return result
 
 

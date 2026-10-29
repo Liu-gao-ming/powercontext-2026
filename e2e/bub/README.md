@@ -6,8 +6,8 @@ on Memory collection, grounding, and recall rather than the native task reward.
 
 The common architecture separates workload selection, execution, evidence, Memory evaluation, and reporting. Bub is
 the execution adapter for acceptance workloads because its model, tools, context injection, capture, and checkpoints
-are observable. The OFF/ON comparison can also run on Codex, Claude Code, OpenCode, and Pi, without changing the
-workload or evaluation contracts.
+are observable. The OFF/ON comparison can also run on Codex, Claude Code, OpenCode, Pi, and Kimi Code, without
+changing the workload or evaluation contracts.
 
 Every workload follows one execution path:
 
@@ -126,6 +126,12 @@ make harness-compose-acceptance \
 ARGS='--id locomo-support-group --id project-database-decision'
 ```
 
+For OceanBase, Compose runs public `db-migrate plan/apply/verify` commands before starting the Server, including
+configurations with embedding or Code enabled. The commands use the Server container's configuration, one maintenance
+container, and `/data/migration-state`; ordinary remote Server startup only checks readiness. The harness owns disposable
+volumes and stops business writers during setup. A maintenance failure fails startup rather than allowing a partially
+initialized Server to run.
+
 Each selected workload writes the same layout:
 
 ```text
@@ -168,8 +174,8 @@ covers the workspace only; a file the agent writes elsewhere in the container is
 
 The `paired` command runs each selected workload with PowerContext off and on, in separate containers, and repeats
 this for `--trials` trials. The arm that runs first alternates between trials. `--host` selects the agent host for
-both arms: `bub` by default, `codex`, `claude-code`, `opencode`, or `pi`. Each host uses its own PowerContext
-integration, so ON means what that integration does for its users.
+both arms: `bub` by default, `codex`, `claude-code`, `opencode`, `pi`, or `kimi-code`. Each host uses its own
+PowerContext integration, so ON means what that integration does for its users.
 
 - OFF is the host as a user without PowerContext has it. The agent is not told that PowerContext is off, and it
   cannot find PowerContext: no integration is installed, no PowerContext sources are mounted in its container, and it
@@ -179,20 +185,49 @@ integration, so ON means what that integration does for its users.
 - ON installs the integration, binds it to a new Scope, and gives it the harness Client's Server token. For Bub this
   means the plugin with `capture_events` enabled, so that, like the other host integrations, it captures what the
   user says without relying on the model to call a memory tool. This is not the plugin's default setting. Codex runs
-  with `--enable plugins`, Claude Code has the plugin enabled, OpenCode loads it from its plugins directory, and Pi
-  loads the installed package. In all four, the plugin captures each user prompt and asks for context before each
-  turn, and the plugin's tools (MCP for Codex and Claude Code, native tools for OpenCode and Pi) and Skill are
-  available to the model.
+  with `--enable plugins`, Claude Code has the plugin enabled, OpenCode loads it from its plugins directory, Pi loads
+  the installed package, and Kimi Code loads the plugin registered in its home. In all five, the plugin captures each
+  user prompt and asks for context before each turn, and the plugin's tools (MCP for Codex, Claude Code, and Kimi
+  Code, native tools for OpenCode and Pi) and Skill are available to the model.
 - Everything else is the same in both arms: image, host version, model, reasoning settings, and budget.
 
 Both arms' containers can reach the Server, and the Server keeps the ON arms' Memory across trials. The command
 therefore runs only against a Server that requires authentication: it stops before the first run if the Server lists
 its Scopes to a client without a token. Start the Server with `POWERCONTEXT_SERVER_ACCESS_MODE=enforced` and a
 `POWERCONTEXT_SERVER_AUTH_TOKEN`, and give the harness the same value as `POWERCONTEXT_CLIENT_API_TOKEN`; the harness
-passes it to the ON arm's integration as `POWERCONTEXT_BUB_API_TOKEN` or `POWERCONTEXT_<HOST>_AUTHORIZATION`. The
-harness holds that value in its own environment and gives Harbor a reference to it, so Harbor's job files record the
-reference and no part of the token. The token still lets an ON agent read other Scopes on the same Server, including
-earlier trials'.
+passes it to the ON arm's integration as `POWERCONTEXT_BUB_API_TOKEN`, `POWERCONTEXT_KIMI_TOKEN`, or
+`POWERCONTEXT_<HOST>_AUTHORIZATION`. The harness holds that value in its own environment and gives Harbor a
+reference to it, so Harbor's job files record the reference and no part of the token. The token still lets an ON
+agent read other Scopes on the same Server, including earlier trials', which hold the same workload's answer: the
+integrations keep their own tools on their Scope, but an agent can call the Server with the token from its
+environment.
+
+The harness therefore checks the Server's Access audit, in which an enforced Server records every authorization decision
+on an API or MCP request, allowed or denied. After each ON arm it lists the decisions recorded from just after it
+created the arm's Scope until the arm ended. An ON run reached another Scope when the Server allowed it either of two
+kinds of request: a request on another Scope, its Memory, or its Artifacts, other than one that returns none of them,
+namely reading the Scope's descriptor, its statistics, or its resolved identity, flushing it, or an Access API request,
+such as checking a permission on it, which returns decisions, Bindings, or audit records; or a Handoff Report over every
+Scope or a subtree, which the Server authorizes once for the whole Server but which carries each Scope's latest Handoff.
+A write to another Scope gives the agent nothing, but it shows the integration acting outside its Scope, as when it
+falls back to the Default Scope. Such a run is reported and left out of success rates and paired differences whatever
+its reward, because leaving out only the runs that passed would bias the rest. The arm's observation lists every API or
+MCP decision of that window about another Scope or about the Server as a whole, with its request ID. A request the
+Server rejected, the requests above that return no content, and the Server's other Server-wide operations, such as
+listing Scopes, which return descriptors, settings, or counts, are recorded without excluding the run. A request is
+rejected when the Server denied any check it enforces with the request's ID, on any Scope and under any operation name,
+even after an allowed one: allowed to contribute to a Scope but denied the write, or allowed to review a Candidate but
+denied the write that approving it needs, it fails without touching the Scope's content. A denied probe, such as which
+actions a returned Candidate offers or an Access API permission check, does not reject its request. A flush is also left
+out because a host plugin's own end-of-session flush of the previous ON arm's Scope can still be extracting Memory after
+that arm ended. The Server's background processing records its decisions under its own transport and is not counted. The
+audit cannot tell the agent from the harness, which uses the same token, but the harness touches only the arm's own
+Scope while the arm runs. The check therefore needs a Server that no other client, such as a second paired run or the
+Dashboard, uses during the run, and a Server clock that agrees with the harness's, because the window is compared with
+the Server's timestamps. The audit is named by the Server's `POWERCONTEXT_SERVER_ACCESS_DEPLOYMENT_ID`, which the Server
+does not expose: when the Server sets it, give the harness the same value as `POWERCONTEXT_E2E_ACCESS_DEPLOYMENT_ID`,
+which defaults to the Server's default, `powercontext`. The command stops before the first run when it cannot read that
+audit.
 
 After each ON session the harness records the Scope's Server statistics. When another session follows, it first flushes
 the Scope, standing in for the time that passes between real sessions, and repeats the flush until the Scope has
@@ -210,11 +245,12 @@ An ON run counts only when Server statistics for its Scope show that Sources wer
 (during it, for a single-session workload) and that the integration asked PowerContext for context during it.
 Otherwise it is an integration failure. Whether a flush creates Memory and whether recall returns content are
 PowerContext's own behavior, so the snapshots record them but a run that gets nothing useful still counts as an ON
-attempt. Integration failures and harness or infrastructure errors are reported but left out of success rates and
-paired differences. A session whose model request failed is such an error on every host: Codex and Claude Code exit
-non-zero, Harbor reads OpenCode's error events, and the harness reads Pi's last message, because Pi exits 0 in the
-JSON mode Harbor uses. The harness reads Pi's output through the logs that Harbor's Docker environment mounts and
-stops with an error when the file is not there. An agent timeout counts as a failed attempt in either arm.
+attempt. Integration failures, runs that reached another Scope, and harness or infrastructure errors are reported but
+left out of success rates and paired differences. A session whose model request failed is such an error on every host:
+Codex, Claude Code, and Kimi Code exit non-zero, Harbor reads OpenCode's error events, and the harness reads Pi's last
+message, because Pi exits 0 in the JSON mode Harbor uses. The harness reads Pi's output through the logs that Harbor's
+Docker environment mounts and stops with an error when the file is not there. An agent timeout counts as a failed
+attempt in either arm.
 
 The harness Client waits for each flush, which runs the Server's generation model, so raise its 10-second default
 timeout; the Bub plugin also flushes during a session.
@@ -328,6 +364,38 @@ export OPENROUTER_API_KEY=replace-me
 make harness-paired ARGS='--host pi --trials 2'
 ```
 
+Kimi Code 2.1.1, the version PowerContext's Kimi Code acceptance workflow tests, runs through the harness's own
+agent, because Harbor 0.16's Kimi agent installs the earlier Python `kimi-cli`. The agent installs Node 24.21.0 and
+`@moonshot-ai/kimi-code`, and runs each session with `kimi -p`, which runs every tool without asking. Kimi Code
+installs plugins only from its interactive interface, so the ON arm writes the plugin's copy and registry entry where
+`powercontext setup kimi-code` puts them, configured with the arm's Scope; the agent container sees only the plugin's
+`kimi.plugin.json`, `hooks`, `scripts`, `shared`, and `skills`. The plugin takes the Server token from
+`POWERCONTEXT_KIMI_TOKEN` without the Bearer scheme, reads its Server URL only from that configuration, takes it only
+as an origin, and accepts plain HTTP only on loopback. When `POWERCONTEXT_KIMI_SERVER_URL` is not an HTTP or HTTPS
+origin, every arm therefore ends as an error before its container starts. For a plain-HTTP origin such as
+`host-gateway`, the ON arm runs a relay on `127.0.0.1:47731` in its container and configures the plugin with that
+address. Kimi Code keeps its sessions, the files they edited, a search cache, and logs in its home, so before each
+session in both arms the harness empties the home except for the configuration and the installed plugin, and stops
+the arm if Kimi Code still lists a session afterwards.
+
+The harness selects the model with `POWERCONTEXT_E2E_KIMI_CODE_MODEL` as `openrouter/<model>`, the one provider it
+configures, and passes `POWERCONTEXT_E2E_KIMI_CODE_REASONING_EFFORT`, default `medium`, as Kimi Code's thinking
+effort, which Kimi Code sends as `reasoning_effort`. Kimi Code asks an OpenAI-compatible provider for up to 131,072
+output tokens per request, so the model's context window must hold that besides the prompt; the harness declares a
+262,144-token window. The configuration turns off Kimi Code's telemetry and the extra model request that titles each
+session. The agent passes `OPENROUTER_API_KEY`, and reads each step's tokens from the usage Kimi Code records in the
+session for every model request, the main agent's and any subagent's.
+
+```bash
+export POWERCONTEXT_CLIENT_SERVER_URL=http://127.0.0.1:8000
+export POWERCONTEXT_CLIENT_API_TOKEN=replace-me
+export POWERCONTEXT_CLIENT_TIMEOUT=150
+export POWERCONTEXT_KIMI_SERVER_URL=http://host-gateway:8000
+export POWERCONTEXT_E2E_KIMI_CODE_MODEL=openrouter/qwen/qwen3.7-flash
+export OPENROUTER_API_KEY=replace-me
+make harness-paired ARGS='--host kimi-code --trials 2'
+```
+
 Each arm writes `observation.json`, which includes the per-session Server snapshots for ON, and its Harbor jobs:
 
 ```text
@@ -345,16 +413,19 @@ arm could not be scored; a task that fails in either arm is a result, not a comm
 For each workload and over all of them, the report gives:
 
 - Each arm's passed and scored runs, its success rate with a 95% Wilson score interval, and the runs left out as
-  errors or integration failures.
+  errors, integration failures, or runs that reached another Scope.
 - The mean ON minus OFF score over the trials in which both arms were scored, with a 95% percentile bootstrap
   interval over those pairs (10,000 resamples from a fixed seed, so the same evidence gives the same interval), and
   how many pairs only ON passed, only OFF passed, or tied.
 - Per step and arm, over the same scored runs: the agent's execution time as Harbor measured it, and the input
-  tokens, the cached input tokens among them, output tokens, and cost that Harbor's agent for that host records.
+  tokens, the cached input tokens among them, output tokens, and cost that the host's agent records: Harbor's, or
+  for Kimi Code the harness's own.
   Claude Code, OpenCode, and Pi report their own cost; for Codex, Harbor estimates it from its price table and leaves
-  it out for a model the table lacks. A timed-out run is scored, so its time counts. Bub reports no usage at all,
-  because Harbor reads it from the ACP prompt response and `bub-acp-server` leaves it out (bubbuild/bub-contrib#78),
-  so those cells show `n/a`.
+  it out for a model the table lacks. A timed-out run is scored, so its time counts. For Bub, Harbor reads input and
+  output tokens from the usage `bub-acp-server` returns with each ACP prompt response, summed over the turn's model
+  calls as the model provider reported them. Harbor reads no cached input tokens from an ACP agent, and Bub reports
+  no cost, so those Bub cells show `n/a`, as do the tokens of a Bub step that timed out before its prompt response.
+  Kimi Code reports no cost either, so its cost cells show `n/a`.
 - The Server's usage for the ON arm, as a mean over each scored run's final Scope snapshot: generation and embedding
   requests and tokens, and the Server's own estimate of the tokens of context it returned. The Server has no price
   list, so there is no Server cost. OFF runs have no Scope. A timed-out ON run keeps the snapshots it reached, so
@@ -364,12 +435,13 @@ Each step figure and Server token count is a mean over the runs that reported it
 missing figure as zero. Runs can differ: Harbor reads a step's usage from the host's own output, so a step whose host
 recorded none has no figures, and the Server leaves a Scope's tokens unknown when a model provider did not report
 them. A timed-out step keeps the usage its host recorded before it was stopped, as it keeps its time. Harbor's agents
-for Pi, Claude Code, Codex, and OpenCode do record 0 for a token count missing from a log the host wrote, and the
-report cannot tell that from a real 0. The report shows `n/a` when no run reported a figure and adds its count, as in
-`1,000 (1 of 2 runs)`, when only some did; `paired-report.json` keeps the count of every figure.
+for Pi, Claude Code, Codex, and OpenCode, and the harness's agent for Kimi Code, do record 0 for a token count missing
+from a log the host wrote, and the report cannot tell that from a real 0. The report shows `n/a` when no run
+reported a figure and adds its count, as in `1,000 (1 of 2 runs)`, when only some did; `paired-report.json` keeps
+the count of every figure.
 
 The report is marked preliminary. With two trials the intervals are wide, which is the point: they show how little
-such a pilot can say. The command does not yet check the Default Scope for leaks or run in the fixed Compose harness.
+such a pilot can say. The command does not yet run in the fixed Compose harness.
 
 ### MemoryCode workloads
 
@@ -498,11 +570,12 @@ The agent container sees only the repository files that installation needs: the 
 integration, and none of them in a paired OFF arm. Workload files, answer keys, and benchmark data stay on the host,
 because the agent can search its container. Agent setup uses Bub's supported installation path: `uv tool install`
 installs Bub with the local PowerContext plugin when enabled, then `bub install` adds the ACP server to the same
-environment. Both steps pin Bub to the harness version so installing ACP cannot upgrade the host. Harbor uploads and
-runs its native ACP client. The Terminal-Bench task keeps its original image, setup, verifier, and isolation boundary.
-The harness ignores dataset CPU and memory limits because it evaluates Memory behavior rather than benchmark resource
-compliance. This also keeps the fixed harness usable in nested container runtimes that cannot create additional
-cgroups.
+environment. Both steps pin Bub to the harness version so installing ACP cannot upgrade the host. The ACP step also
+names the pre-release ACP SDK that `bub-acp-server` pins, because uv resolves a pre-release only when a direct
+requirement asks for it. Harbor starts the server with `bub acp` in that environment and runs its native ACP client. The
+Terminal-Bench task keeps its original image, setup, verifier, and isolation boundary. The harness ignores dataset CPU
+and memory limits because it evaluates Memory behavior rather than benchmark resource compliance. This also keeps the
+fixed harness usable in nested container runtimes that cannot create additional cgroups.
 
 Long-horizon acceptance requires observable Memory behavior:
 

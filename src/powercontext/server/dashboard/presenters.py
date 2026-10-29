@@ -17,6 +17,15 @@
 import json
 from typing import Any
 
+from powercontext.server.dashboard.errors import ReadError
+
+
+def set_scope(ctx, descriptor):
+    if descriptor is None:
+        raise ReadError(404, "not_found")
+    ctx["scope_descriptor"] = {name: descriptor[name] for name in ("scope_id", "title", "summary", "parent_scope_id")}
+    ctx["data"].update(title=descriptor["title"], summary=descriptor["summary"])
+
 
 def source_view(source: dict[str, Any] | None) -> dict[str, Any] | None:
     if source is None:

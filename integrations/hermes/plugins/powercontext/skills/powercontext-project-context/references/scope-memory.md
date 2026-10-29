@@ -1,3 +1,5 @@
+
+<!-- POWERCONTEXT-GUIDANCE:START -->
 # Scope and Memory
 
 ## Memory
@@ -15,3 +17,4 @@
 - After a conflict, inspect the current record before retrying; never silently refresh a captured write version.
 
 Automatic hooks attempt bounded context and Source capture; neither substitutes for an explicit Memory save.
+<!-- POWERCONTEXT-GUIDANCE:END -->

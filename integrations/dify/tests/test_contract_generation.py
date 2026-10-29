@@ -77,6 +77,16 @@ def test_unrelated_openapi_changes_leave_all_dify_outputs_unchanged(repository: 
     assert generated_files(repository) == before
 
 
+def test_rollover_reasons_has_a_chinese_parameter_label(repository: Path) -> None:
+    declaration = yaml.safe_load(
+        (repository / "integrations/dify/plugin/tools/pc_handoff_prepare.yaml").read_text(encoding="utf-8")
+    )
+
+    parameter = next(item for item in declaration["parameters"] if item["name"] == "rollover_reasons")
+
+    assert parameter["label"]["zh_Hans"] == "轮换原因"
+
+
 def test_consumed_schema_changes_fail_stale_checks_and_update_outputs(repository: Path) -> None:
     before = generated_files(repository)
     contract = repository / "openapi/powercontext.yaml"

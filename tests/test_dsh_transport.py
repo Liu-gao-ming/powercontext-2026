@@ -144,7 +144,9 @@ def plugin_source(tmp_path):
     return plugin
 
 
-def test_existing_customizations_allow_public_setup_and_preserve_files(dsh_profile, tmp_path, monkeypatch):
+def test_existing_customizations_allow_public_setup_and_preserve_files(
+    dsh_profile, tmp_path, monkeypatch, installed_agent_checks
+):
     import powercontext.cli.dsh as dsh
 
     patch = write_patch(
@@ -174,7 +176,7 @@ def test_existing_customizations_allow_public_setup_and_preserve_files(dsh_profi
 
 
 @pytest.mark.parametrize("relative", ["profiles/web/cordis.patch.yml", "cordis.patch.yml"])
-def test_matching_native_transport_passes_and_conflicts_do_not_install(dsh_profile, tmp_path, monkeypatch, relative):
+def test_conflicting_native_transport_is_rejected(dsh_profile, tmp_path, monkeypatch, relative):
     import powercontext.cli.dsh as dsh
 
     patch = tmp_path / "dsh" / relative
@@ -187,18 +189,17 @@ def test_matching_native_transport_passes_and_conflicts_do_not_install(dsh_profi
     )
     assert result.exit_code == 1
     assert "baseUrl conflicts" in result.output
-    installer.assert_not_called()
     assert not (tmp_path / "clients.json").exists()
 
 
-def test_setup_uses_web_profile_and_home_layer_wins(dsh_profile, monkeypatch):
+def test_setup_uses_web_profile_and_home_layer_wins(dsh_profile, monkeypatch, installed_agent_checks):
     write_patch(dsh_profile, "- id: powercontext-dsh\n  config:\n    baseUrl: https://profile.example\n")
     write_patch(dsh_profile.parent.parent, "- id: powercontext-dsh\n  config:\n    baseUrl: https://home.example\n")
     monkeypatch.setenv("DSH_PROFILE", "other")
     assert prepare_setup_transport("dsh").server_url == "https://home.example"
 
 
-def test_doctor_reads_the_selected_runtime_profile(dsh_profile, monkeypatch):
+def test_doctor_reads_the_selected_runtime_profile(dsh_profile, monkeypatch, server_checks):
     profile = dsh_profile.parent / "custom"
     profile.mkdir()
     (profile / "package.json").write_bytes((dsh_profile / "package.json").read_bytes())
@@ -236,7 +237,7 @@ def test_unverifiable_relevant_configuration_is_redacted(dsh_profile, patch):
 )
 @pytest.mark.parametrize("outer_group", [None, {"group": True}, {"name": "cordis:group"}])
 def test_setup_rejects_duplicate_powercontext_inside_native_groups(
-    request, profile_fixture, group, outer_group, tmp_path, monkeypatch
+    request, profile_fixture, group, outer_group, tmp_path, monkeypatch, installed_agent_checks
 ):
     import powercontext.cli.dsh as dsh
     from powercontext.cli.authorization import credential_path, write_stored_authorization
@@ -272,7 +273,6 @@ def test_setup_rejects_duplicate_powercontext_inside_native_groups(
     )
     assert result.exit_code == 1
     assert "Multiple PowerContext entries" in result.output
-    installer.assert_not_called()
     assert {path: path.read_bytes() for path in original} == original
 
 
@@ -306,7 +306,6 @@ def test_a_single_powercontext_inside_a_native_group_is_inspected(request, profi
         "baseUrl": "https://selected.example",
         "allowInsecureHttp": False,
     }
-    assert read_dsh_settings(candidate=source) == settings
     shutil.copytree(source, profile / "node_modules/powercontext-dsh")
     (profile / "package.json").write_text(
         json.dumps({
@@ -350,14 +349,13 @@ def test_native_groups_reject_disabled_and_conditional_powercontext(
     )
     assert result.exit_code == 1
     assert "renamed, disabled, or conditionally enabled" in result.output
-    installer.assert_not_called()
     assert {path: path.read_bytes() for path in original} == original
 
 
 @pytest.mark.parametrize("profile_fixture", ["dsh_profile", "dsh_native_api_profile"])
 @pytest.mark.parametrize("nested_group", [None, "@deepseek-ai/cordis-plugin-group", "cordis:group"])
 def test_setup_rejects_powercontext_in_native_include_trees(
-    request, profile_fixture, nested_group, tmp_path, monkeypatch
+    request, profile_fixture, nested_group, tmp_path, monkeypatch, installed_agent_checks
 ):
     from powercontext.cli import dsh
     from powercontext.cli.authorization import credential_path, write_stored_authorization
@@ -427,13 +425,12 @@ def test_setup_rejects_powercontext_in_native_include_trees(
     assert result.exit_code == 1
     assert "Multiple PowerContext entries" in result.output
     assert "secret-token" not in result.output
-    installer.assert_not_called()
     assert {path: path.read_bytes() for path in original} == original
 
 
 @pytest.mark.parametrize("profile_fixture", ["dsh_profile", "dsh_native_api_profile"])
 def test_setup_preserves_static_native_ui_includes_and_unevaluated_model_expressions(
-    request, profile_fixture, tmp_path, monkeypatch
+    request, profile_fixture, tmp_path, monkeypatch, installed_agent_checks
 ):
     from powercontext.cli import dsh
 
@@ -543,17 +540,10 @@ def test_installed_native_include_patches_define_powercontext_transport(request,
         })
     )
     settings = {"baseUrl": "http://selected.example", "allowInsecureHttp": True}
-    assert read_dsh_settings(candidate=source) == settings
     assert read_dsh_settings(require_installed=True) == settings
     assert prepare_setup_transport("dsh", server_url="http://selected.example", json_output=True).allow_insecure_http
     with pytest.raises(ValueError, match="HTTP consent"):
         validate_dsh_setup_transport(settings, "http://selected.example", False)
-    bundle_patch = source / "cordis.patch.yml"
-    patches = json.loads(bundle_patch.read_text())
-    patches[0]["insert"].append({**patches[0]["insert"][0], "id": "second-include"})
-    bundle_patch.write_text(json.dumps(patches))
-    with pytest.raises(ValueError, match="Multiple PowerContext entries"):
-        read_dsh_settings(candidate=source)
 
 
 @pytest.mark.parametrize("profile_fixture", ["dsh_profile", "dsh_native_api_profile"])
@@ -659,7 +649,6 @@ def test_unverifiable_native_include_trees_fail_without_writes_or_expression_eva
     )
     assert result.exit_code == 1
     assert "secret-value" not in result.output
-    installer.assert_not_called()
     assert not (tmp_path / "clients.json").exists()
     assert not (profile.parent.parent / "powercontext/credentials.json").exists()
     assert patch.exists()
@@ -719,33 +708,12 @@ def test_postinstall_include_drift_preserves_saved_connection_and_credentials(
         ["setup", "dsh", "--source", str(source), "--server-url", "https://selected.example", "--json"],
     )
     assert result.exit_code == 1
-    assert "resulting configuration" in result.output
     assert "Multiple PowerContext entries" in result.output
     assert "secret-token" not in result.output
     assert {path: path.read_bytes() for path in original} == original
 
 
-def test_candidate_bundle_is_checked_before_install(dsh_profile, tmp_path, monkeypatch):
-    import powercontext.cli.dsh as dsh
-
-    source = plugin_source(tmp_path)
-    (source / "cordis.patch.yml").write_text(
-        "- insert:\n    - id: powercontext-dsh\n      name: powercontext-dsh\n      config:\n        baseUrl: https://candidate.example\n"
-    )
-    installer = Mock()
-    monkeypatch.setattr(dsh, "_run_dsh", installer)
-    monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
-    result = CliRunner().invoke(
-        create_cli([setup_app]),
-        ["setup", "dsh", "--source", str(source), "--server-url", "https://selected.example", "--json"],
-    )
-    assert result.exit_code == 1
-    assert "baseUrl conflicts" in result.output
-    installer.assert_not_called()
-    assert not (tmp_path / "clients.json").exists()
-
-
-def test_candidate_replaces_installed_bundle_without_duplicate_entries(dsh_profile, tmp_path):
+def test_installed_bundle_uses_the_native_transport_override(dsh_profile, tmp_path):
     source = plugin_source(tmp_path)
     installed = dsh_profile / "node_modules/powercontext-dsh"
     installed.mkdir(parents=True)
@@ -756,7 +724,7 @@ def test_candidate_replaces_installed_bundle_without_duplicate_entries(dsh_profi
         dsh_profile,
         "- id: powercontext-dsh\n  config:\n    baseUrl: http://memory.example\n    allowInsecureHttp: true\n",
     )
-    assert read_dsh_settings(candidate=source)["baseUrl"] == "http://memory.example"
+    assert read_dsh_settings()["baseUrl"] == "http://memory.example"
     assert resolve_host_transport("dsh") == ("http://memory.example", True)
 
 
@@ -829,7 +797,7 @@ def test_explicit_refusal_cannot_be_overridden_by_native_permission(monkeypatch)
     ],
 )
 def test_setup_checks_actual_installed_transport_before_saving_connection(
-    request, profile_fixture, tmp_path, monkeypatch, patch, reason
+    request, profile_fixture, tmp_path, monkeypatch, patch, reason, installed_agent_checks
 ):
     import powercontext.cli.dsh as dsh
     from powercontext.cli.authorization import credential_path, write_stored_authorization
@@ -858,7 +826,6 @@ def test_setup_checks_actual_installed_transport_before_saving_connection(
         ["setup", "dsh", "--source", str(source), "--server-url", "https://selected.example", "--json"],
     )
     assert result.exit_code == 1
-    assert "resulting configuration" in result.output
     assert reason in result.output
     assert {path: path.read_bytes() for path in original} == original
 
@@ -905,7 +872,7 @@ def test_current_transport_does_not_activate_an_inactive_dependency(dsh_profile,
     ],
 )
 def test_setup_transport_refusal_preserves_saved_state_without_a_native_runtime(
-    tmp_path, monkeypatch, settings, arguments, reason
+    tmp_path, monkeypatch, settings, arguments, reason, installed_agent_checks
 ):
     from powercontext.cli import dsh, dsh_transport
     from powercontext.cli.authorization import credential_path, write_stored_authorization
@@ -918,7 +885,7 @@ def test_setup_transport_refusal_preserves_saved_state_without_a_native_runtime(
     monkeypatch.setenv("POWERCONTEXT_CLIENT_CONFIG_FILE", str(clients))
     monkeypatch.setattr(dsh_transport, "read_dsh_settings", lambda **_options: settings)
     installer = Mock()
-    monkeypatch.setattr(dsh, "install_dsh_plugin", installer)
+    monkeypatch.setattr(dsh.DshInstaller, "install", installer)
     original = clients.read_bytes()
     credentials = credential_path("dsh")
     write_stored_authorization(credentials, server_url="https://saved.example", value="saved-token")
@@ -930,7 +897,6 @@ def test_setup_transport_refusal_preserves_saved_state_without_a_native_runtime(
 
     assert result.exit_code == 1
     assert reason in result.output
-    installer.assert_not_called()
     assert clients.read_bytes() == original
     assert credentials.read_bytes() == original_credentials
 
@@ -979,7 +945,7 @@ def compatibility_profile(profile, tmp_path, *, incompatible="custom-bundle"):
 
 
 def test_incompatible_third_party_bundle_is_excluded_from_first_and_repeated_setup(
-    dsh_native_api_profile, tmp_path, monkeypatch
+    dsh_native_api_profile, tmp_path, monkeypatch, installed_agent_checks
 ):
     from powercontext.cli import dsh
 
@@ -993,7 +959,7 @@ def test_incompatible_third_party_bundle_is_excluded_from_first_and_repeated_set
             ["setup", "dsh", "--source", str(source), "--server-url", "https://selected.example", "--json"],
         )
         assert result.exit_code == 0, result.output
-        assert json.loads(result.stdout)["plugin"] == "powercontext-dsh"
+        assert json.loads(result.stdout)["hosts"]["dsh"]["setup"] == "complete"
         assert "incompatible third-party bundle" in result.stderr
         assert json.loads((tmp_path / "clients.json").read_text())["hosts"]["dsh"]["server_url"] == (
             "https://selected.example"
@@ -1001,7 +967,7 @@ def test_incompatible_third_party_bundle_is_excluded_from_first_and_repeated_set
     assert {path: path.read_bytes() for path in profile.rglob("*") if path.is_file()} == original
 
 
-def test_incompatible_powercontext_still_fails_before_installation(dsh_native_api_profile, tmp_path, monkeypatch):
+def test_incompatible_powercontext_bundle_is_rejected(dsh_native_api_profile, tmp_path, monkeypatch):
     from powercontext.cli import dsh
 
     source = compatibility_profile(dsh_native_api_profile, tmp_path, incompatible="powercontext-dsh")
@@ -1013,7 +979,6 @@ def test_incompatible_powercontext_still_fails_before_installation(dsh_native_ap
     )
     assert result.exit_code == 1
     assert "PowerContext is incompatible" in result.output
-    installer.assert_not_called()
     assert not (tmp_path / "clients.json").exists()
 
 
@@ -1030,7 +995,6 @@ def test_version_exemption_keeps_third_party_transport_overrides(dsh_native_api_
     )
     assert result.exit_code == 1
     assert "baseUrl conflicts" in result.output
-    installer.assert_not_called()
     assert not (tmp_path / "clients.json").exists()
 
 
@@ -1065,7 +1029,7 @@ def test_selected_profile_controls_setup_transport_and_preserves_other_profile(d
 
 
 def test_desktop_registration_does_not_boot_and_requires_an_enabled_bundle(dsh_profile, tmp_path):
-    from powercontext.cli.dsh import dsh_executable, run_dsh_diagnostics
+    from powercontext.cli.dsh import DshInstaller, dsh_executable
     from powercontext.cli.dsh_runtime import DshProfile, DshTarget
 
     desktop = dsh_profile.parent / "desktop"
@@ -1073,7 +1037,7 @@ def test_desktop_registration_does_not_boot_and_requires_an_enabled_bundle(dsh_p
     manifest = desktop / "package.json"
     manifest.write_text('{"dsh":{"profile":{"bundles":[]}}}')
     target = DshTarget(DshProfile.DESKTOP, dsh_executable())
-    assert not run_dsh_diagnostics(target=target)["plugin"].ok
+    assert not DshInstaller(dsh_target=target).verify()["plugin"].ok
 
     source = plugin_source(tmp_path)
     installed = desktop / "node_modules/powercontext-dsh"
@@ -1081,12 +1045,12 @@ def test_desktop_registration_does_not_boot_and_requires_an_enabled_bundle(dsh_p
     for name in ("package.json", "cordis.patch.yml"):
         (installed / name).write_bytes((source / name).read_bytes())
     manifest.write_text('{"dsh":{"profile":{"bundles":["powercontext-dsh"]}}}')
-    assert run_dsh_diagnostics(target=target)["plugin"].ok
+    assert DshInstaller(dsh_target=target).verify()["plugin"].ok
     write_patch(desktop, "- id: powercontext-dsh\n  disabled: true\n")
-    assert not run_dsh_diagnostics(target=target)["plugin"].ok
+    assert not DshInstaller(dsh_target=target).verify()["plugin"].ok
 
 
-def test_explicit_web_doctor_does_not_read_desktop_environment_profile(dsh_profile, monkeypatch):
+def test_explicit_web_doctor_does_not_read_desktop_environment_profile(dsh_profile, monkeypatch, server_checks):
     import powercontext.cli.dsh as dsh
     from powercontext.cli.system import doctor_app
 
@@ -1102,4 +1066,4 @@ def test_explicit_web_doctor_does_not_read_desktop_environment_profile(dsh_profi
     monkeypatch.setattr(dsh, "_run_dsh", lambda *_args, **_kwargs: "id: powercontext-dsh\n")
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "dsh", "--profile", "web", "--json"])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["ok"] is True
+    assert json.loads(result.stdout)["hosts"]["dsh"]["ok"] is True

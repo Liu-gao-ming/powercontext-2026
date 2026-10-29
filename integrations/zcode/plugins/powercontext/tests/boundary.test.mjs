@@ -163,6 +163,9 @@ test('pause publication survives process interruption and legacy partial pauses 
       }
       assert.equal(flushes, 0, 'No request may precede complete pause publication')
       await new Promise(resolve => setTimeout(resolve, 5100))
+      // The wait leaves the interrupted claim's slot, but how long the cases took decides where it ends in the next
+      // one; a flush refuses a claim in a slot's last second.
+      await leaseWindow()
       const first = cases.shift()
       assert.equal((await flushBoundary(first.input, settings, first.keys, async () => ({ scopeId: 'scope-crash' }),
         AbortSignal.timeout(800), first.data)).state, 'cursor_reached')
@@ -219,9 +222,11 @@ test('pause publication survives process interruption and legacy partial pauses 
     }
   })
 
-test('pending preserves concurrent receipts, pauses unknown writes and bounds tracking capacity', { timeout: 25000 }, async t => {
+test('pending preserves concurrent receipts and pauses unknown writes', { timeout: 25000 }, async t => {
+  // Keep lease slots deterministic while HTTP request deadlines still use real timers.
+  t.mock.timers.enable({ apis: ['Date'], now: 0 })
   const root = await mkdtemp(join(tmpdir(), 'pc-zcode-boundary-'))
-  let flushes = 0, delay = 0, cursor = 1, received
+  let flushes = 0, delay = 0, cursor = 1, received, responseGate, releaseResponse
   const server = createServer(async (req, res) => {
     let raw = ''
     for await (const chunk of req) raw += chunk
@@ -229,6 +234,7 @@ test('pending preserves concurrent receipts, pauses unknown writes and bounds tr
     assert.deepEqual(body, { scope_id: 'scope-boundary' })
     flushes++
     received?.()
+    if (responseGate) await responseGate
     if (delay) await new Promise(resolve => setTimeout(resolve, delay))
     res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify({ status: cursor ? 'processed' : 'idle', previous_cursor: 0,
@@ -250,15 +256,18 @@ test('pending preserves concurrent receipts, pauses unknown writes and bounds tr
     await writeFile(join(data, 'pending', receiptName.replace('receipt-', 'track-')), JSON.stringify(recoveredGuard))
     assert.equal((await queryPending(input, settings, data)).scopes[0].tracking_incomplete, false)
     assert.ok(!(await readdir(join(data, 'pending'))).some(name => name.startsWith('track-')))
-    delay = 300
+    responseGate = new Promise(resolve => { releaseResponse = resolve })
     const requestArrived = new Promise(resolve => { received = resolve })
-    await leaseWindow()
     const flushing = flushBoundary(input, settings, keys, resolveCurrent, AbortSignal.timeout(800), data)
-    await requestArrived
+    await Promise.race([requestArrived, flushing.then(result => {
+      assert.fail(`Flush ended before the request arrived: ${JSON.stringify(result)}`)
+    })])
     const later = await beginCaptureTracking(input, settings, keys, 'scope-boundary', data)
     await later.accepted(2)
     const concurrent = await flushBoundary(input, settings, keys, resolveCurrent, AbortSignal.timeout(800), data)
     assert.ok(['unknown', 'skipped'].includes(concurrent.state))
+    releaseResponse()
+    responseGate = undefined
     assert.equal((await flushing).state, 'cursor_reached') // Only the snapshot target was reached.
     assert.equal(flushes, 1)
     const remaining = (await readdir(join(data, 'pending'))).filter(name => name.startsWith('receipt-'))
@@ -271,12 +280,17 @@ test('pending preserves concurrent receipts, pauses unknown writes and bounds tr
     const unknownData = join(root, 'unknown')
     const unknown = await beginCaptureTracking(input, settings, keys, 'scope-boundary', unknownData)
     await unknown.accepted(3)
-    delay = 1200
-    await leaseWindow()
-    const result = await flushBoundary(input, settings, keys, resolveCurrent, AbortSignal.timeout(800), unknownData)
+    // Abort only after the fixture receives the request so pre-dispatch work cannot turn this into `failed`.
+    const cancel = new AbortController()
+    responseGate = new Promise(resolve => { releaseResponse = resolve })
+    received = () => cancel.abort()
+    const result = await flushBoundary(input, settings, keys, resolveCurrent, cancel.signal, unknownData)
+    received = undefined
+    releaseResponse()
+    responseGate = undefined
     assert.equal(result.state, 'unknown')
     const afterUnknown = flushes
-    await new Promise(resolve => setTimeout(resolve, 5100))
+    t.mock.timers.tick(5100)
     const retried = await flushBoundary(input, settings, keys, resolveCurrent, AbortSignal.timeout(800), unknownData)
     assert.equal(retried.reason, 'unknown_flush_paused')
     assert.equal(flushes, afterUnknown)
@@ -286,7 +300,6 @@ test('pending preserves concurrent receipts, pauses unknown writes and bounds tr
     const status = await queryPending(input, settings, unknownData)
     assert.equal(status.scopes[0].unknown_flush_paused, true)
     assert.equal(status.scopes[0].target_position, 3)
-    await leaseWindow()
     assert.equal(await authorizeUnknownFlushRetry(input, settings, keys, 'scope-boundary', unknownData), 'retry_authorized')
     assert.equal((await queryPending(input, settings, unknownData)).scopes[0].unknown_flush_paused, false)
     for (const name of await readdir(join(unknownData, 'pending'))) {
@@ -301,7 +314,6 @@ test('pending preserves concurrent receipts, pauses unknown writes and bounds tr
     const behind = await beginCaptureTracking(input, settings, keys, 'scope-boundary', behindData)
     await behind.accepted(7)
     cursor = 0; delay = 0
-    await leaseWindow()
     const idle = await flushBoundary(input, settings, keys, resolveCurrent, AbortSignal.timeout(800), behindData)
     assert.equal(idle.state, 'pending')
     assert.equal(idle.current_cursor, 0)
@@ -318,7 +330,20 @@ test('pending preserves concurrent receipts, pauses unknown writes and bounds tr
     const guard = await beginCaptureTracking(input, settings, keys, 'scope-boundary', data)
     assert.equal((await flushBoundary(input, settings, keys, resolveCurrent, AbortSignal.timeout(800), data)).reason, 'tracking_incomplete')
     await guard.rejected()
+  } finally {
+    releaseResponse?.()
+    await new Promise(resolve => server.close(resolve))
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
+// Every insertion preflights existing records; give this filesystem workload its own watchdog.
+test('pending bounds tracking capacity and keeps persisted receipts content-free', { timeout: 120000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pc-zcode-capacity-'))
+  try {
+    const settings = { serverUrl: 'http://127.0.0.1:1', boundaryFlush: true }
+    const input = { sessionId: 'boundary-secret-session', cwd: root }
+    const keys = bindingKeys(input, settings)
     const capacity = join(root, 'capacity')
     const before = performance.now()
     for (let position = 1; position <= 256; position++) {
@@ -327,17 +352,17 @@ test('pending preserves concurrent receipts, pauses unknown writes and bounds tr
     }
     t.diagnostic(`256 receipt writes with bounded preflight: ${(performance.now() - before).toFixed(1)} ms`)
     await assert.rejects(beginCaptureTracking(input, settings, keys, 'scope-boundary', capacity), { message: 'pending_capacity_exceeded' })
-    assert.equal((await flushBoundary(input, settings, keys, resolveCurrent, AbortSignal.timeout(800), capacity)).reason, 'tracking_incomplete')
+    assert.equal((await flushBoundary(input, settings, keys, async () => ({ scopeId: 'scope-boundary' }),
+      AbortSignal.timeout(800), capacity)).reason, 'tracking_incomplete')
     const serialized = (await Promise.all((await readdir(join(capacity, 'pending')))
       .map(name => readFile(join(capacity, 'pending', name), 'utf8')))).join('')
     assert.doesNotMatch(serialized, /boundary-secret-session|Bearer|private prompt/)
   } finally {
-    await new Promise(resolve => server.close(resolve))
     await rm(root, { recursive: true, force: true })
   }
 })
 
-test('real Stop process observes a slow unknown flush and exits without continuing the turn', { timeout: 10000 }, async () => {
+async function checkStopProcess(delayedCleanup) {
   const root = await mkdtemp(join(tmpdir(), 'pc-zcode-stop-'))
   let flushes = 0
   const server = createServer(async (req, res) => {
@@ -362,11 +387,23 @@ test('real Stop process observes a slow unknown flush and exits without continui
     const tracking = await beginCaptureTracking(input, settings, keys, 'scope-boundary', data)
     await tracking.accepted(1)
     await leaseWindow()
+    const preload = join(root, 'transport-cleanup.mjs')
+    if (delayedCleanup) {
+      // Simulate a transport that retains a cleanup handle after an aborted real HTTP request.
+      await writeFile(preload, `
+        const originalFetch = globalThis.fetch
+        globalThis.fetch = async (...args) => {
+          try { return await originalFetch(...args) }
+          catch (error) { setTimeout(() => {}, 2500); throw error }
+        }
+      `)
+    }
     const before = performance.now()
     const result = await new Promise((resolve, reject) => {
       const env = { ...process.env, ZCODE_PLUGIN_DATA: data }
       for (const key of Object.keys(env)) if (key.startsWith('POWERCONTEXT_ZCODE_') || key === 'ZCODE_SESSION_ID') delete env[key]
-      const child = spawn(process.execPath, [join(installed, 'hooks/stop.mjs')], { env, stdio: ['pipe', 'pipe', 'pipe'] })
+      const args = [...(delayedCleanup ? ['--import', pathToFileURL(preload).href] : []), join(installed, 'hooks/stop.mjs')]
+      const child = spawn(process.execPath, args, { env, stdio: ['pipe', 'pipe', 'pipe'] })
       let stdout = '', stderr = ''
       child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk })
       child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk })
@@ -387,4 +424,10 @@ test('real Stop process observes a slow unknown flush and exits without continui
     await new Promise(resolve => server.close(resolve))
     await rm(root, { recursive: true, force: true })
   }
-})
+}
+
+for (const delayedCleanup of [false, true]) {
+  const suffix = delayedCleanup ? ' with delayed transport cleanup' : ''
+  test(`real Stop process observes a slow unknown flush and exits without continuing the turn${suffix}`,
+    { timeout: 10000 }, () => checkStopProcess(delayedCleanup))
+}

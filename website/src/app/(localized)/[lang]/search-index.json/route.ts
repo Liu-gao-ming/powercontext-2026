@@ -16,6 +16,7 @@
 
 import { createFromSource } from 'fumadocs-core/search/server';
 import { notFound } from 'next/navigation';
+import { getSearchCategory } from '@/lib/docs-search';
 import { isLanguage, languages } from '@/lib/i18n';
 import { source } from '@/lib/source';
 
@@ -35,6 +36,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ lan
     getPages: () => source.getPages(lang),
   }, {
     sort: { enabled: false },
+    buildIndex: (page) => ({
+      id: page.url,
+      url: page.url,
+      title: page.data.title,
+      description: page.data.description,
+      tag: getSearchCategory(page.url),
+      structuredData: page.data.structuredData,
+    }),
   });
 
   return search.staticGET();

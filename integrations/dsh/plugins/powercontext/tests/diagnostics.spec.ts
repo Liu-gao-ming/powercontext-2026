@@ -94,6 +94,8 @@ describe('host-visible diagnostic classification', () => {
 describe('published error code filter', () => {
   it('passes a published protocol code through unchanged', () => {
     expect(publicErrorCode('scope_not_found')).toBe('scope_not_found')
+    expect(publicErrorCode('artifact_handle_not_found')).toBe('artifact_handle_not_found')
+
     // Both codes the server returns with HTTP 412, and the one it returns with 409
     // when a Memory is at its capacity budget, reach the caller as themselves.
     expect(publicErrorCode('tag_precondition_failed')).toBe('tag_precondition_failed')

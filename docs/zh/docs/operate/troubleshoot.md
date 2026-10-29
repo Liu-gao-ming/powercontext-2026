@@ -11,12 +11,12 @@ description: 诊断 PowerContext 安装、Server、数据库和宿主集成问�
 powercontext doctor
 ```
 
-该命令检查安装包、Server liveness 和 Server readiness；只有所有检查均为 `ok` 时才以状态码 0 退出。
-`degraded` 表示仍可使用，但不算完整诊断成功。自动化场景可添加 `--json`，顶层结果和每个检查都会包含
-`ok` 与 `status`。可单独检查可选的宿主集成：
+该命令检查已保存的 Agent 及其 Server；未保存连接时检查安装包和 Server。只有所有检查均为 `ok` 时才以状态码 0 退出。
+`degraded` 表示仍可使用，但不算完整诊断成功。自动化场景可添加 `--json`，查看整体 `ok` 结果
+和各项诊断状态。可显式选择要检查的宿主集成：
 
 ```bash
-powercontext doctor integrations
+powercontext doctor codex dsh
 powercontext doctor codex
 powercontext doctor claude-code
 powercontext doctor dsh
@@ -26,8 +26,8 @@ powercontext doctor pi
 powercontext doctor hermes
 ```
 
-`doctor integrations` 会打印全部一级宿主。CLI 不在 PATH 上时该行是 `missing`，不会让整条命令失败；已安装但异常的
-宿主仍会以状态码 1 退出。单宿主命令（如 `doctor codex`）在该 CLI 缺失时仍然失败。
+`doctor` 默认检查已保存的 Agent 连接，没有已保存连接时检查安装包和 Server。显式名称用于选择检查对象。
+选中的 Agent 缺少必需 CLI 或检查异常时，命令以状态码 1 退出，其余选中 Agent 仍会得到各自结果。
 
 ## 安装时无法读取 Git 地址
 
@@ -59,12 +59,12 @@ command -v hermes
 必要时把 uv tool bin 目录加入 `PATH`。宿主 CLI 不可用时，`powercontext setup codex`、
 `powercontext setup claude-code`、`powercontext setup dsh`、`powercontext setup openclaw`、
 `powercontext setup opencode`、`powercontext setup pi` 和 `powercontext setup hermes` 都会报告错误，而不会尝试安装。
-`powercontext setup select` 只安装你选中的宿主。某个选中宿主未安装时，该行失败，但不会阻塞其余选中项；
+`powercontext setup codex dsh` 只安装你选中的宿主。某个选中宿主未安装时，该行失败，但不会阻塞其余选中项；
 未选中的宿主即使已在 `PATH` 上也不会安装。
 
 ## 插件缺失或版本不一致
 
-先在不涉及 Server 的情况下确认集成故障：
+检查选中的集成及其 Server 连接：
 
 ```bash
 powercontext doctor codex
@@ -250,16 +250,17 @@ collation，但不会包含数据库 URL 或凭据。
    删除它。由于 `pc_scopes.parent_scope_id` 自引用 `pc_scopes`，导出的 `pc_scopes` 数据必须让祖先 Scope 记录排在
    后代记录之前。
    源数据库早于三张 Skill 生命周期表（`pc_skill_packages`、`pc_agent_skill_targets` 和
-   `pc_skill_publications`）、Profile 表或 `pc_receipt_migration_review` 时，应从对应层删除缺失的表。
-
-   旧版本没有 `pc_topic_memory_work_budgets` 时可从清单移除该表；若该表存在，必须与 Cursor 一起恢复，
-   保留已消耗的失败额度，避免迁移后重置累计成本。
+   `pc_skill_publications`）、Profile 表、`pc_topic_memory_work_budgets`、`pc_topic_memory_work_blocks`、
+   `pc_recall_effort_daily`、`pc_receipt_migration_review`、`pc_context_bootstrap_receipts` 或
+   `pc_decision_observations` 时，应从对应层删除缺失的表。
+   如果存在 work-budget 表，必须与 Cursor 一起恢复，保留已消耗的失败额度，避免迁移后重置累计成本。
+   work-attempt 表也应一起恢复，保留阻塞身份、诊断信息与已接受的重试回执。
 
    第 1 层包含父表和无外键的表：
 
    ```bash
    obloader <connection-options> -D <new-database> --csv \
-      --table 'pc_scopes,pc_source_journal_heads,pc_sources,pc_artifacts,pc_source_cursors,pc_memory_source_windows,pc_artifact_processing_leases,pc_artifact_processing_binding_states,pc_artifact_processing_pending,pc_artifact_processing_auto_wave_targets,pc_artifact_processing_sequences,pc_artifact_processing_intents,pc_topic_memory_processing_targets,pc_artifact_processing_schema,pc_artifact_processing_migration_receipts,pc_topic_memory_work_budgets,pc_topic_memory_retrieval_shape,pc_connector_checkpoints,pc_source_definition_manifests,pc_external_skill_registrations,pc_skill_packages,pc_agent_skill_targets,pc_skill_publications,pc_model_usage_daily,pc_recall_token_daily,pc_recall_effort_daily,pc_receipt_migration_review' \
+      --table 'pc_scopes,pc_source_journal_heads,pc_sources,pc_artifacts,pc_portable_restore_receipts,pc_source_cursors,pc_memory_source_windows,pc_artifact_processing_leases,pc_artifact_processing_binding_states,pc_artifact_processing_pending,pc_artifact_processing_auto_wave_targets,pc_artifact_processing_sequences,pc_artifact_processing_intents,pc_topic_memory_processing_targets,pc_artifact_processing_schema,pc_artifact_processing_migration_receipts,pc_topic_memory_work_budgets,pc_topic_memory_work_blocks,pc_topic_memory_retrieval_shape,pc_connector_checkpoints,pc_source_definition_manifests,pc_external_skill_registrations,pc_skill_packages,pc_agent_skill_targets,pc_skill_publications,pc_model_usage_daily,pc_recall_token_daily,pc_recall_effort_daily,pc_receipt_migration_review,pc_decision_observations,pc_lexical_projection_versions' \
      -f <export-directory>
    ```
 
@@ -267,7 +268,7 @@ collation，但不会包含数据库 URL 或凭据。
 
    ```bash
    obloader <connection-options> -D <new-database> --csv \
-     --table 'pc_dream_runs,pc_scope_context_references,pc_scope_external_references,pc_scope_creation_requests,pc_scope_settings,pc_scope_bindings,pc_artifact_heads,pc_artifact_lineage_sources,pc_artifact_lineage_artifacts,pc_artifact_publications,pc_artifact_candidate_versions,pc_topic_memory_revision_publications,pc_memory_entry_versions' \
+     --table 'pc_dream_runs,pc_context_bootstrap_receipts,pc_scope_context_references,pc_scope_external_references,pc_scope_creation_requests,pc_scope_settings,pc_scope_bindings,pc_artifact_handles,pc_artifact_heads,pc_artifact_lineage_sources,pc_artifact_lineage_artifacts,pc_artifact_publications,pc_candidate_versions,pc_topic_memory_revision_publications,pc_memory_entry_versions' \
      -f <export-directory>
    ```
 
@@ -275,7 +276,7 @@ collation，但不会包含数据库 URL 或凭据。
 
    ```bash
    obloader <connection-options> -D <new-database> --csv \
-      --table 'pc_artifact_candidate_heads,pc_topic_memory_active_topics,pc_topic_memory_active_chunks,pc_memory_entry_heads,pc_artifact_tags,pc_recurrence_match,pc_recurrence_observation' \
+      --table 'pc_candidate_heads,pc_topic_memory_active_topics,pc_topic_memory_active_chunks,pc_memory_entry_heads,pc_artifact_tags,pc_recurrence_match,pc_recurrence_observation' \
      -f <export-directory>
    ```
 

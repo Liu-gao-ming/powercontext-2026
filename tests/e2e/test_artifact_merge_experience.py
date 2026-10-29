@@ -39,9 +39,9 @@ from powercontext.builtin.persistence.oceanbase import OceanBaseConfig, OceanBas
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.records import ArtifactWrite, BaseOperationNotSupportedError
 from powercontext.builtin.runtime import (
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     BuiltinConfig,
-    GetArtifactCandidateRequest,
+    GetCandidateRequest,
     ProposeExperienceRequest,
     RuntimeConfig,
     open_builtin_runtime,
@@ -231,12 +231,10 @@ def test_experience_management_merge_freezes_inputs_preserves_history_and_candid
                     )
             with pytest.raises(InvalidArtifactLifecycleError):
                 await runtime.review.for_scope(scope).approve(
-                    ApproveArtifactCandidateRequest(
-                        candidate_id=candidate.candidate_id, expected_version=candidate.version
-                    )
+                    ApproveCandidateRequest(candidate_id=candidate.candidate_id, expected_version=candidate.version)
                 )
             pending = await runtime.review.for_scope(scope).get(
-                GetArtifactCandidateRequest(candidate_id=candidate.candidate_id)
+                GetCandidateRequest(candidate_id=candidate.candidate_id)
             )
             assert pending.status == "pending" and pending.version == candidate.version
             assert (await merge.get(a.ref.artifact_id)).artifact == a.artifact

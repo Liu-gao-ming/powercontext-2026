@@ -31,10 +31,10 @@ limitations under the License.
       {% if page == 'methods' or parent_page == 'methods' %}<input type="hidden" name="kind" value="{{ page if parent_page else method_kind }}">{% endif %}
       {% include 'components/scope-options.html' %}
       <noscript><button class="btn mt-2" type="submit">{{ t.apply }}</button></noscript>
-      {% if errors.get('scopes') %}<p class="small mt-2">{{ t.scope_list_unavailable }}</p>{% endif %}
+      <p class="small mt-2" data-scope-error {% if not errors.get('scopes') %}hidden{% endif %}>{{ t.scope_list_unavailable }}</p>
     </form>
     <ul class="navbar-nav w-100" aria-label="{{ t.navigation }}">
-      {% for item in ['home', 'handoff', 'notes', 'methods', 'profile', 'topics', 'prompts', 'usage'] %}
+      {% for item in ['home', 'handoff', 'notes', 'methods', 'profile', 'topics', 'prompts', 'review', 'usage'] %}
       {% set active = page == item or parent_page == item %}
       <li class="nav-item {% if active %}active{% endif %}"><a href="{{ link(item) }}" class="nav-link {% if active %}active{% endif %}" {% if active %}aria-current="page"{% endif %}>
         {{ icon(item) }}<span class="nav-link-title">{{ t[item] }}</span>

@@ -22,7 +22,10 @@ from pydantic import ValidationError
 from pydantic_core import InitErrorDetails
 
 from powercontext.artifacts.fusion import FusionSelection, RrfParameters, parse_fusion_parameters
+from powercontext.builtin.artifacts.search import lexical_query_words, lexical_terms_with_spans
 from powercontext.builtin.artifacts.topic_memory.models import (
+    MAX_TOPIC_MEMORY_QUERY_LENGTH,
+    MAX_TOPIC_MEMORY_QUERY_TERMS,
     TopicArtifactSearchRequest,
     TopicMemoryCapabilities,
     TopicMemoryMatchedBy,
@@ -34,6 +37,34 @@ TOPIC_MODE_CHANNELS: dict[TopicMemoryUsedSearchMode, tuple[TopicMemoryMatchedBy,
     "vector": ("topic_vector", "detail_vector"),
     "hybrid": ("topic_fts", "topic_vector", "detail_fts", "detail_vector"),
 }
+
+
+def bounded_topic_memory_query(query: str) -> str:
+    """Bound Topic recall without discarding quoted evidence."""
+
+    trimmed = query.strip()
+    words = tuple(dict.fromkeys(word for word, _start, _end in lexical_terms_with_spans(trimmed)))
+    if len(trimmed) <= MAX_TOPIC_MEMORY_QUERY_LENGTH and len(words) <= MAX_TOPIC_MEMORY_QUERY_TERMS:
+        return trimmed
+
+    selected: list[str] = []
+    characters = 0
+    for word in dict.fromkeys(lexical_query_words(trimmed)):
+        # Quoting keeps an explicitly requested stopword searchable after reconstruction.
+        term = f'"{word}"'
+        additional = len(term) + int(bool(selected))
+        if characters + additional > MAX_TOPIC_MEMORY_QUERY_LENGTH:
+            continue
+        selected.append(term)
+        characters += additional
+        if len(selected) == MAX_TOPIC_MEMORY_QUERY_TERMS:
+            break
+    if selected:
+        return " ".join(selected)
+    return (
+        " ".join(words[:MAX_TOPIC_MEMORY_QUERY_TERMS])[:MAX_TOPIC_MEMORY_QUERY_LENGTH]
+        or trimmed[:MAX_TOPIC_MEMORY_QUERY_LENGTH]
+    )
 
 
 def topic_search_error(path: tuple[str | int, ...], message: str) -> ValidationError:

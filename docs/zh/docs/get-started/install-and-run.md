@@ -1,6 +1,6 @@
 ---
 title: 安装和运行
-description: 安装 PowerContext 1.2.0，并运行本地 Server。
+description: 安装 PowerContext 1.4.1，并运行本地 Server。
 ---
 
 # 安装和运行
@@ -22,12 +22,12 @@ Windows 的 CLI、Server 和个人服务支持为试验性；各 Agent Host 仍�
 
 ## 选择版本
 
-本页使用 PowerContext 1.2.0。包与 Agent 集成保持版本一致：
-Python 包版本为 `1.2.0`，对应 Git tag 为 `powercontext-v1.2.0`。
+本页使用 PowerContext 1.4.1。包与 Agent 集成保持版本一致：
+Python 包版本为 `1.4.1`，对应 Git tag 为 `powercontext-v1.4.1`。
 
 ```bash
-uv tool install --force "powercontext[cli,server]==1.2.0"
-powercontext setup codex --ref powercontext-v1.2.0
+uv tool install --force "powercontext[cli,server]==1.4.1"
+powercontext setup codex --ref powercontext-v1.4.1
 ```
 
 宿主支持范围和维护状态见[能力矩阵](../integrations/capabilities.md)。
@@ -39,14 +39,17 @@ powercontext setup codex --ref powercontext-v1.2.0
 [`uv`](https://docs.astral.sh/uv/)，然后从 PyPI 安装 PowerContext：
 
 ```bash
-uv tool install --force "powercontext[cli,server]==1.2.0"
+uv tool install --force "powercontext[cli,server]==1.4.1"
 ```
 
 如需从源码安装同一版本：
 
 ```bash
-uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@powercontext-v1.2.0"
+uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@powercontext-v1.4.1"
 ```
+
+只连接远程 Server 的机器安装 `cli` extra 即可使用 `setup`、`doctor` 和远程内容命令。运行本地 Server 或使用
+`service` 命令时，还需安装 `server`。如果命令 provider 缺少依赖，CLI 会报告 provider 和缺失模块，便于修复安装。
 
 Git 安装命令不会留下需要自行管理的仓库工作副本。Git 会沿用本机的凭据配置，包括 credential helper 和 SSH 设置。
 如需使用 SSH，请把 HTTPS URL 换成当前环境允许的 Git URL。`--force` 还会从所选 Git ref 当前指向的 commit
@@ -112,7 +115,7 @@ powercontext server run --env-file /path/to/powercontext.env
 后端。安装或替换工具时加入可选的 seekDB extra：
 
 ```bash
-uv tool install --force "powercontext[cli,server,seekdb]==1.2.0"
+uv tool install --force "powercontext[cli,server,seekdb]==1.4.1"
 ```
 
 从 SQLite 切换时，需要从 Server 进程环境中删除 `POWERCONTEXT_SERVER_DATABASE_URL`；seekDB 不接受显式的
@@ -157,34 +160,44 @@ Agent 诊断见[各自的集成文档](../integrations/index.md)；Server 状态
 
 ## 更新或替换安装
 
-升级已有部署前，先备份数据库和配置。1.1.0 会在 Server 启动时升级旧标签表约束，以支持 Topic Memory 标签。
-先停止旧 Server 实例，再启动一个升级后的实例，待结构升级完成后再启动其他实例。对于 1.0.0 之前的数据库，
-如果尚未完成[Artifact 处理迁移](../operate/artifact-processing-migration.md)，还需要先执行该迁移。
-Server、客户端和 Agent 集成需一起升级。Dashboard 需要显式启用，本地使用可选择静态 Bearer 认证，
-见[部署 Server](../operate/deploy-server.md)；远程明文 HTTP 连接需要客户端明确同意，
-见[连接远程 Server](../operate/connect-remote-server.md)。
+<!-- upgrade-support:start -->
+1.3.0 和 1.4.0 升级必须通过 SQLite、seekDB 和 OceanBase 的完整 Server 验收。当前迁移路径尚未验证，请勿升级已有数据库。
+<!-- upgrade-support:end -->
 
-升级到 1.2.0：
+已有部署应保持当前可用版本，等待来源版本及后端具备已验收的升级路径。试用新建部署时，请使用独立程序环境、
+数据库位置和端口。替换程序包不会完成数据库迁移；备份也不能使不受支持的迁移变为可用。
+
+支持声明由发布矩阵和安装包验收共同检查，详见[准备发布](../../development/releasing.md)。
+[Artifact 处理迁移](../operate/artifact-processing-migration.md)和
+[Atomic Memory 迁移](../operate/atomic-memory-migration.md)各自的验证结果不代表完整 Server 就绪。
+
+升级已有数据库前，请先检查 [Dream 协调升级要求](../workflows/review-dream-revisions.md#协调升级)。
+统一 Candidate 路由将 `/v1/artifact-candidates/*` 替换为 `/v1/candidates/*`，不提供别名，Dream 客户端要求契约 2。
+已有 Dream 存储需排空未完成任务后显式迁移。[完整 Server 迁移](../operate/database-migrations.md)要求
+`state=ready` 和 `server_ready=true`；局部 Artifact 或 Atomic Memory 验证不能替代它。不要绕过迁移门禁。
+
+安装 1.4.1 到独立环境以试用新建部署：
 
 ```bash
-uv tool install --force "powercontext[cli,server]==1.2.0"
+uv venv /path/to/powercontext-preview
+uv pip install --python /path/to/powercontext-preview/bin/python "powercontext[cli,server]==1.4.1"
 ```
 
-使用其他 Git ref 替换现有工具：
+在独立环境安装其他 Git ref：
 
 ```bash
-uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@<ref>"
+uv pip install --python /path/to/powercontext-preview/bin/python "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@<ref>"
 ```
 
-按[各自的集成文档](../integrations/index.md)更新已安装宿主，并使用同一个 ref。更新后重启 Server，再开启新的宿主会话。只要没有修改
-`POWERCONTEXT_HOME` 或数据库 URL，现有 SQLite 数据会继续保留。
+连接新建部署的客户端及 Agent 集成应使用匹配的 ref。保留原部署的数据库位置和配置，不要用原数据库测试新版启动。
+Windows 的虚拟环境解释器位于 `Scripts/python.exe`。
 
 ## 为 Python 项目安装角色
 
 如果应用需要导入异步 Client SDK，应把它加入该应用自己的环境：
 
 ```bash
-uv add "powercontext[client]==1.2.0"
+uv add "powercontext[client]==1.4.1"
 ```
 
 进程内 Python 组合使用 `builtin`，服务使用 `server`，Python SDK 使用 `client`，基于 Server 的命令行使用

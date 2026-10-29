@@ -52,7 +52,7 @@ _MAX_CANDIDATE_EVIDENCE = 32
 _CANDIDATE_EVIDENCE_VALIDATOR = f"""
     @model_validator(mode="after")
     def _reject_excess_candidate_evidence(self):
-        if len(self.source_refs) + len(self.artifact_refs) > {_MAX_CANDIDATE_EVIDENCE}:
+        if len(self.source_refs or ()) + len(self.artifact_refs or ()) > {_MAX_CANDIDATE_EVIDENCE}:
             raise ValueError(  # noqa: TRY003
                 "source_refs and artifact_refs together must not exceed {_MAX_CANDIDATE_EVIDENCE} references"
             )

@@ -16,14 +16,22 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, ClassVar, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from powercontext.errors import InvalidArtifactReferenceError
-from powercontext.limits import MAX_ARTIFACT_FAMILY_LENGTH, MAX_ARTIFACT_ID_LENGTH, MAX_SCOPE_ID_LENGTH
+from powercontext.limits import (
+    MAX_ARTIFACT_FAMILY_LENGTH,
+    MAX_ARTIFACT_HANDLE_KEY_LENGTH,
+    MAX_ARTIFACT_ID_LENGTH,
+    MAX_SCOPE_ID_LENGTH,
+)
 from powercontext.sources.models import SourceRef
+
+_HANDLE_KEY_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 ContentT = TypeVar("ContentT", covariant=True)
 _LEGACY_MEMORY_FAMILY = "memory"
@@ -52,6 +60,39 @@ class ArtifactRef(BaseModel):
         maximum = MAX_ARTIFACT_FAMILY_LENGTH if info.field_name == "family" else MAX_ARTIFACT_ID_LENGTH
         if len(value) > maximum:
             raise InvalidArtifactReferenceError(info.field_name, f"must not exceed {maximum} characters")
+        return value
+
+
+class StableHandle(BaseModel):
+    """A human-copyable, scope-local handle for an Artifact revision."""
+
+    family: str
+    key: str
+
+    @field_validator("family")
+    @classmethod
+    def validate_family(cls, value: str) -> str:
+        _validate_reference_part("family", value)
+        if len(value) > MAX_ARTIFACT_FAMILY_LENGTH:
+            raise InvalidArtifactReferenceError(
+                "family",
+                f"must not exceed {MAX_ARTIFACT_FAMILY_LENGTH} characters",
+            )
+        return value
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        if len(value) > MAX_ARTIFACT_HANDLE_KEY_LENGTH:
+            raise InvalidArtifactReferenceError(
+                "key",
+                f"must not exceed {MAX_ARTIFACT_HANDLE_KEY_LENGTH} characters",
+            )
+        if _HANDLE_KEY_PATTERN.fullmatch(value) is None:
+            raise InvalidArtifactReferenceError(
+                "key",
+                "must contain lowercase ASCII letters, digits, and single hyphens",
+            )
         return value
 
 

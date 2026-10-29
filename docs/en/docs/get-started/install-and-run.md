@@ -1,6 +1,6 @@
 ---
 title: Install and run
-description: Install PowerContext 1.2.0 and run the local Server.
+description: Install PowerContext 1.4.1 and run the local Server.
 ---
 
 # Install and run
@@ -24,12 +24,12 @@ Embedded seekDB is unavailable on Windows.
 
 ## Choose a version
 
-These instructions use PowerContext 1.2.0. Keep the package and Agent integration on
-the same version: package `1.2.0` and Git tag `powercontext-v1.2.0`.
+These instructions use PowerContext 1.4.1. Keep the package and Agent integration on
+the same version: package `1.4.1` and Git tag `powercontext-v1.4.1`.
 
 ```bash
-uv tool install --force "powercontext[cli,server]==1.2.0"
-powercontext setup codex --ref powercontext-v1.2.0
+uv tool install --force "powercontext[cli,server]==1.4.1"
+powercontext setup codex --ref powercontext-v1.4.1
 ```
 
 Check the [capability matrix](../integrations/capabilities.md) for host support and maintenance status.
@@ -41,14 +41,18 @@ You need Python 3.11 or newer, Git, and [`uv`](https://docs.astral.sh/uv/) on ma
 PowerContext from PyPI:
 
 ```bash
-uv tool install --force "powercontext[cli,server]==1.2.0"
+uv tool install --force "powercontext[cli,server]==1.4.1"
 ```
 
 For a source installation of the same version:
 
 ```bash
-uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@powercontext-v1.2.0"
+uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@powercontext-v1.4.1"
 ```
+
+For a machine that only connects to a remote Server, the `cli` extra includes `setup`, `doctor`, and remote content
+commands. Add `server` to run a local Server or use the `service` commands. If a command provider has a missing
+dependency, the CLI reports the provider and missing module so the installation can be repaired.
 
 The Git command does not leave a repository checkout for you to manage. Git uses its normal credential configuration,
 including credential helpers and SSH settings. For an SSH-based install, replace the HTTPS URL with the Git URL
@@ -122,7 +126,7 @@ Embedded seekDB is available on Linux and macOS when a compatible `pylibseekdb` 
 support this embedded backend. Install or replace the tool with the optional seekDB extra:
 
 ```bash
-uv tool install --force "powercontext[cli,server,seekdb]==1.2.0"
+uv tool install --force "powercontext[cli,server,seekdb]==1.4.1"
 ```
 
 When switching from SQLite, remove `POWERCONTEXT_SERVER_DATABASE_URL` from the Server process environment. An explicit
@@ -170,37 +174,49 @@ For a long-running process, Docker, authentication, or remote access, continue w
 
 ## Update or replace an installation
 
-Before upgrading an existing deployment, back up its database and configuration. Version 1.1.0 upgrades legacy
-tag-table constraints during Server startup to support Topic Memory tags. Stop the old Server instances and start
-one upgraded instance first so the schema upgrade completes before other instances connect. Databases from before
-1.0.0 also need the [Artifact processing migration](../operate/artifact-processing-migration.md) if it has not already
-been completed. Upgrade the Server, clients, and Agent integrations together.
-The Dashboard must be explicitly enabled; static Bearer authentication is optional for local use. See
-[Deploy the Server](../operate/deploy-server.md). Remote plaintext HTTP connections require explicit client consent;
-see [Connect to a remote Server](../operate/connect-remote-server.md).
+<!-- upgrade-support:start -->
+Upgrades from 1.3.0 and 1.4.0 require passing full Server acceptance on SQLite, seekDB and OceanBase. These migration paths are not yet verified; do not upgrade existing databases.
+<!-- upgrade-support:end -->
 
-To upgrade to 1.2.0:
+Keep existing deployments on their working version until their source version and backend have an accepted upgrade
+path. To evaluate a fresh installation, use a separate program environment, database location, and port. Replacing
+the installed package does not migrate its database. Backups do not make an unsupported migration supported.
+
+The support declaration is checked against the release matrix and installed-artifact acceptance; see
+[Preparing a release](../../development/releasing.md). Domain-specific
+[Processing](../operate/artifact-processing-migration.md) and
+[Atomic Memory](../operate/atomic-memory-migration.md) maintenance guides do not establish full Server readiness.
+
+Review the [Dream coordinated upgrade requirements](../workflows/review-dream-revisions.md#coordinated-upgrade)
+before upgrading an existing database. The unified Candidate routes replace `/v1/artifact-candidates/*` with
+`/v1/candidates/*` without aliases, and Dream Clients require contract 2. Existing Dream storage needs an explicit
+migration after unfinished runs have drained. [Full Server migration](../operate/database-migrations.md) requires
+`state=ready` and `server_ready=true`; partial Artifact or Atomic Memory verification cannot replace it. Do not bypass
+the migration gate.
+
+To install 1.4.1 in a separate environment for a fresh deployment:
 
 ```bash
-uv tool install --force "powercontext[cli,server]==1.2.0"
+uv venv /path/to/powercontext-preview
+uv pip install --python /path/to/powercontext-preview/bin/python "powercontext[cli,server]==1.4.1"
 ```
 
-To replace the installed tool with another Git ref:
+To install another Git ref in the separate environment:
 
 ```bash
-uv tool install --force "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@<ref>"
+uv pip install --python /path/to/powercontext-preview/bin/python "powercontext[cli,server] @ git+https://github.com/oceanbase/powercontext.git@<ref>"
 ```
 
-Update each installed host using its [integration guide](../integrations/index.md) and the same ref. Restart the Server and open a new host session
-after updating. Existing SQLite data remains in the user data directory unless `POWERCONTEXT_HOME` or the database URL
-changes.
+Use the matching ref for clients and Agent integrations connected to the fresh deployment. Preserve the original
+deployment's database location and configuration; do not point the new Server at it as an installation check.
+On Windows, the virtual environment interpreter is at `Scripts/python.exe`.
 
 ## Install a Python role
 
 An application that imports the async Client SDK should add it to that application's environment:
 
 ```bash
-uv add "powercontext[client]==1.2.0"
+uv add "powercontext[client]==1.4.1"
 ```
 
 Use `builtin` for in-process Python composition, `server` for the service, `client` for the Python SDK, or `cli` for

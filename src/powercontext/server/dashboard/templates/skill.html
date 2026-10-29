@@ -21,7 +21,7 @@ limitations under the License.
 {% if data.skill %}
 <article class="reading-sheet">
   <div>
-  <a class="back-link d-block mb-4" href="{{ link('methods', kind='skill') }}">← {{ t.back_methods }}</a>
+  <a class="back-link d-block mb-4" href="{{ return_to or link('methods', kind='skill') }}">← {{ t.back_methods }}</a>
   <header class="reading-heading"><span class="method-type text-secondary small">{{ t.skill_reading }} · {{ data.title }} · {{ t.revision }} {{ data.skill.revision }}</span><h1>{{ data.skill.name }}</h1><p>{{ data.skill.description }}</p></header>
     <div class="reading-body">
       <section><h2>{{ t.skill_instructions }}</h2><p class="source-text">{{ data.skill.instructions or t.skill_body_unavailable }}</p></section>
@@ -32,6 +32,7 @@ limitations under the License.
     </div>
   </div>
 </article>
+{% include 'components/revision-history.html' %}
 {% include 'components/evidence-modal.html' %}
 {% else %}
 <section class="card"><div class="empty"><h1>{{ t.methods_empty }}</h1><p>{{ t.methods_empty_body }}</p></div></section>

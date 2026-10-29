@@ -24,13 +24,17 @@ import powercontext.http as http_models
 from powercontext.http import (
     AcknowledgeHandoffRequest,
     ActivateHandoffRequest,
-    ApproveArtifactCandidateRequest,
-    ArtifactCandidate,
+    ApproveCandidateRequest,
     ArtifactCreated,
     ArtifactReference,
     ArtifactRevision,
+    BootstrapContext,
+    BootstrapContextRequest,
+    BootstrapDeliveryReceipt,
+    Candidate,
     CaptureContentSourceRequest,
     CaptureContentSourceResponse,
+    CaptureWorkingNoteRequest,
     CommitHandoffRequest,
     CommittedHandoff,
     ContinueHandoffRequest,
@@ -57,6 +61,7 @@ from powercontext.http import (
     HandoffCurrentWorkRequest,
     HandoffDraft,
     HandoffResolution,
+    HandoffRolloverReason,
     ImportExternalSkillRequest,
     ListArtifactsRequest,
     ListExternalSkillsRequest,
@@ -70,9 +75,10 @@ from powercontext.http import (
     PrepareHandoffRequest,
     ProposeExperienceRequest,
     ProposeSkillRequest,
+    RecordBootstrapDeliveryRequest,
     RecordTaskOutcomeRequest,
     ResolveExternalSkillRequest,
-    ReviseArtifactCandidateRequest,
+    ReviseCandidateRequest,
     ScanExternalSkillsRequest,
     ScanExternalSkillsResponse,
     ScopedStats,
@@ -90,8 +96,10 @@ from powercontext.http import (
 from powercontext.http._generated.operations import (
     ACKNOWLEDGE_HANDOFF,
     ACTIVATE_HANDOFF,
-    APPROVE_ARTIFACT_CANDIDATE,
+    API_VERSION,
+    APPROVE_CANDIDATE,
     CAPTURE_CONTENT_SOURCE,
+    CAPTURE_WORKING_NOTE,
     COMMIT_HANDOFF,
     CONTINUE_HANDOFF,
     CREATE_ARTIFACT,
@@ -107,8 +115,8 @@ from powercontext.http._generated.operations import (
     GENERATE_EXPERIENCE,
     GENERATE_SKILL,
     GET_ARTIFACT,
-    GET_ARTIFACT_CANDIDATE,
     GET_ARTIFACT_REVISION,
+    GET_CANDIDATE,
     GET_EXPERIENCE,
     GET_MEMORY_CAPACITY,
     GET_MEMORY_ENTRY,
@@ -120,13 +128,14 @@ from powercontext.http._generated.operations import (
     GET_TOPIC_MEMORY,
     HANDOFF_CURRENT_WORK,
     IMPORT_EXTERNAL_SKILL,
-    LIST_ARTIFACT_CANDIDATES,
     LIST_ARTIFACTS,
+    LIST_CANDIDATES,
     LIST_EXTERNAL_SKILLS,
     LIST_MANAGED_SKILLS,
     LIST_MEMORY_CHANGES,
     LIST_MEMORY_ENTRIES,
     LIST_REMOTE_SKILL_TARGETS,
+    PREPARE_BOOTSTRAP_CONTEXT,
     PREPARE_CONTEXT,
     PREPARE_HANDOFF,
     PROPOSE_EXPERIENCE,
@@ -135,16 +144,17 @@ from powercontext.http._generated.operations import (
     PUBLISH_ARTIFACT,
     PUBLISH_REMOTE_SKILL,
     RECONCILE_REMOTE_SKILLS,
+    RECORD_BOOTSTRAP_DELIVERY,
     RECORD_REMOTE_SKILL_RECEIPT,
     RECORD_SKILL_USAGE,
     RECORD_TASK_OUTCOME,
-    REJECT_ARTIFACT_CANDIDATE,
+    REJECT_CANDIDATE,
     REMEMBER_MEMORY,
     RENAME_REMOTE_SKILL_TARGET,
     REPLACE_ARTIFACT,
     RESOLVE_EXTERNAL_SKILL,
     RETIRE_MEMORY_ENTRY,
-    REVISE_ARTIFACT_CANDIDATE,
+    REVISE_CANDIDATE,
     REVISE_MEMORY_ENTRY,
     REVOKE_REMOTE_SKILL_TARGET,
     SCAN_EXTERNAL_SKILLS,
@@ -188,7 +198,7 @@ def test_contract_uses_the_namespaced_request_id_header() -> None:
 def test_server_info_contract_is_observable_and_forward_compatible() -> None:
     contract = yaml.safe_load(CONTRACT_PATH.read_text())
 
-    assert contract["info"]["version"] == "1.2.0"
+    assert contract["info"]["version"] == API_VERSION
     operation = contract["paths"]["/v1/server-info"]["get"]
     assert operation["operationId"] == "get_server_info"
     assert operation["x-powercontext-access"] == {
@@ -317,6 +327,7 @@ def test_capabilities_report_semantics_without_runtime_tuning_values() -> None:
 
     assert set(properties) == {
         "artifact_dreaming",
+        "artifact_dreaming_operations",
         "source_types",
         "artifact_families",
         "memory_extraction",
@@ -340,6 +351,9 @@ def test_capture_operation_declares_its_typed_accepted_exchange() -> None:
     assert CAPTURE_CONTENT_SOURCE.request_type is CaptureContentSourceRequest
     assert CAPTURE_CONTENT_SOURCE.response_type is CaptureContentSourceResponse
     assert CAPTURE_CONTENT_SOURCE.success_status == 202
+    assert CAPTURE_WORKING_NOTE.request_type is CaptureWorkingNoteRequest
+    assert CAPTURE_WORKING_NOTE.response_type is CaptureContentSourceResponse
+    assert CAPTURE_WORKING_NOTE.success_status == 202
 
 
 def test_topic_memory_operations_use_strict_public_shapes_without_retrieval_controls() -> None:
@@ -522,24 +536,63 @@ def test_prepared_context_is_a_generic_typed_operation_outside_the_mcp_memory_to
         "query",
         "max_bytes",
         "assembly",
+        "bootstrap_receipt_id",
         "include_code",
+        "explain",
     }
-    assert set(schemas["PreparedContext"]["properties"]) == {"schema", "status", "content", "content_bytes"}
+    assert set(schemas["PreparedContext"]["properties"]) == {
+        "schema",
+        "status",
+        "content",
+        "content_bytes",
+        "reason",
+    }
+    # ``reason`` is a cause code, not a retrieval result: it must stay out of the ban below while
+    # remaining optional, so a Host written before it existed still validates an injected response.
+    assert "reason" not in schemas["PreparedContext"]["required"]
+    assert schemas["PreparedContext"]["properties"]["reason"]["nullable"] is True
+    # ``explain`` is how a caller asks for it, so the default stays the four-field envelope.
+    assert schemas["PrepareContextRequest"]["properties"]["explain"]["default"] is False
+    assert "explain" not in schemas["PrepareContextRequest"]["required"]
     assert not {"memory", "mode", "selection"} & set(schemas["PreparedContext"]["properties"])
+
+
+def test_bootstrap_context_has_typed_prepare_and_delivery_operations() -> None:
+    assert PREPARE_BOOTSTRAP_CONTEXT.path == "/v1/context/bootstrap"
+    assert PREPARE_BOOTSTRAP_CONTEXT.request_type is BootstrapContextRequest
+    assert PREPARE_BOOTSTRAP_CONTEXT.response_type is BootstrapContext
+    assert PREPARE_BOOTSTRAP_CONTEXT.success_status == 200
+    assert RECORD_BOOTSTRAP_DELIVERY.path == "/v1/context/bootstrap/receipts"
+    assert RECORD_BOOTSTRAP_DELIVERY.request_type is RecordBootstrapDeliveryRequest
+    assert RECORD_BOOTSTRAP_DELIVERY.response_type is BootstrapDeliveryReceipt
+
+    contract = yaml.safe_load(CONTRACT_PATH.read_text())
+    schemas = contract["components"]["schemas"]
+    assert schemas["BootstrapContextRequest"]["properties"]["enabled"]["default"] is False
+    assert schemas["BootstrapContextRequest"]["properties"]["max_bytes"]["maximum"] == 8192
+    assert schemas["BootstrapContext"]["properties"]["items"]["maxItems"] == 7
+    assert schemas["BootstrapContextLifecycle"]["enum"] == [
+        "startup",
+        "resume",
+        "clear",
+        "compact",
+        "restore",
+        "fork",
+    ]
 
 
 def test_experience_skill_and_review_operations_are_typed_and_family_routed() -> None:
     review_operations = (
-        LIST_ARTIFACT_CANDIDATES,
-        GET_ARTIFACT_CANDIDATE,
-        APPROVE_ARTIFACT_CANDIDATE,
-        REJECT_ARTIFACT_CANDIDATE,
-        REVISE_ARTIFACT_CANDIDATE,
+        LIST_CANDIDATES,
+        GET_CANDIDATE,
+        APPROVE_CANDIDATE,
+        REJECT_CANDIDATE,
+        REVISE_CANDIDATE,
     )
 
     assert PROPOSE_EXPERIENCE.path == "/v1/experience/propose"
     assert PROPOSE_EXPERIENCE.request_type is ProposeExperienceRequest
-    assert PROPOSE_EXPERIENCE.response_type is ArtifactCandidate
+    assert PROPOSE_EXPERIENCE.response_type is Candidate
     assert PROPOSE_EXPERIENCE.success_status == 201
     assert GENERATE_EXPERIENCE.path == "/v1/experience/generate"
     assert GENERATE_EXPERIENCE.request_type is GenerateExperienceRequest
@@ -548,15 +601,15 @@ def test_experience_skill_and_review_operations_are_typed_and_family_routed() ->
     assert GET_EXPERIENCE.path == "/v1/experience/get"
     assert PROPOSE_SKILL.path == "/v1/skill/propose"
     assert PROPOSE_SKILL.request_type is ProposeSkillRequest
-    assert PROPOSE_SKILL.response_type is ArtifactCandidate
+    assert PROPOSE_SKILL.response_type is Candidate
     assert PROPOSE_SKILL.success_status == 201
     assert GENERATE_SKILL.path == "/v1/skill/generate"
     assert GENERATE_SKILL.request_type is GenerateSkillRequest
     assert GENERATE_SKILL.response_type is GeneratedCandidateResponse
     assert GENERATE_SKILL.success_status == 200
     assert GET_SKILL.path == "/v1/skill/get"
-    assert all(operation.path.startswith("/v1/artifact-candidates/") for operation in review_operations)
-    assert APPROVE_ARTIFACT_CANDIDATE.request_type is ApproveArtifactCandidateRequest
+    assert all(operation.path.startswith("/v1/candidates/") for operation in review_operations)
+    assert APPROVE_CANDIDATE.request_type is ApproveCandidateRequest
 
     contract = yaml.safe_load(CONTRACT_PATH.read_text())
     schemas = contract["components"]["schemas"]
@@ -572,19 +625,19 @@ def test_experience_skill_and_review_operations_are_typed_and_family_routed() ->
         "metadata",
         "allowed_tools",
     }
-    assert schemas["ListArtifactCandidatesRequest"]["properties"]["limit"] == {
+    assert schemas["ListCandidatesRequest"]["properties"]["limit"] == {
         "type": "integer",
         "minimum": 1,
         "maximum": 100,
         "default": 50,
     }
     for schema_name in (
-        "ArtifactCandidate",
+        "Candidate",
         "ProposeExperienceRequest",
         "GenerateExperienceRequest",
         "ProposeSkillRequest",
         "GenerateSkillRequest",
-        "ReviseArtifactCandidateRequest",
+        "ReviseCandidateRequest",
     ):
         properties = schemas[schema_name]["properties"]
         assert properties["source_refs"]["maxItems"] == 32
@@ -675,7 +728,7 @@ def test_candidate_transport_rejects_combined_evidence_over_limit() -> None:
     with pytest.raises(ValidationError, match="together must not exceed 32"):
         ProposeExperienceRequest.model_validate(over_limit)
     with pytest.raises(ValidationError, match="together must not exceed 32"):
-        ReviseArtifactCandidateRequest.model_validate({
+        ReviseCandidateRequest.model_validate({
             **over_limit,
             "candidate_id": "cand-1",
             "expected_version": 1,
@@ -703,6 +756,29 @@ def test_handoff_operations_expose_the_complete_explicit_lifecycle() -> None:
     assert COMMIT_HANDOFF.response_type is CommittedHandoff
     assert CONTINUE_HANDOFF.request_type is ContinueHandoffRequest
     assert CONTINUE_HANDOFF.response_type is HandoffResolution
+
+
+def test_handoff_prepare_and_activation_accept_advisory_rollover_reasons() -> None:
+    citation = {
+        "kind": "source",
+        "source_ref": {"name": "content", "source_id": "turn-1"},
+    }
+
+    prepare = PrepareHandoffRequest.model_validate({
+        "scope_id": "project",
+        "objective": "Continue the current work in a fresh session.",
+        "rollover_reasons": ["user_requested", "context_quality"],
+        "evidence": [citation],
+    })
+    activation = ActivateHandoffRequest.model_validate({
+        "scope_id": "project",
+        "boundary_source": citation["source_ref"],
+        "objective": "Continue the current work in a fresh session.",
+        "rollover_reasons": ["host_context_budget"],
+    })
+
+    assert prepare.rollover_reasons == [HandoffRolloverReason.USER_REQUESTED, HandoffRolloverReason.CONTEXT_QUALITY]
+    assert activation.rollover_reasons == [HandoffRolloverReason.HOST_CONTEXT_BUDGET]
 
 
 def test_work_operations_expose_the_high_level_continuity_loop() -> None:
@@ -807,6 +883,8 @@ def test_base_access_contract_includes_revision_history_and_tags() -> None:
         ("/v1/scopes/{scope_id}/sources", "get"): "list_sources",
         ("/v1/scopes/{scope_id}/sources/{source_type}/{source_id}", "get"): "get_source",
         ("/v1/scopes/{scope_id}/artifacts", "post"): "create_artifact",
+        ("/v1/scopes/{scope_id}/artifact-handles/{family}/{key}", "get"): "resolve_artifact_handle",
+        ("/v1/scopes/{scope_id}/artifact-handles/{family}/{key}", "put"): "bind_artifact_handle",
         ("/v1/scopes/{scope_id}/artifacts/{family}", "get"): "list_artifacts",
         ("/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}", "get"): "get_artifact",
         ("/v1/scopes/{scope_id}/artifacts/{family}/{artifact_id}", "put"): "replace_artifact",
@@ -823,7 +901,9 @@ def test_base_access_contract_includes_revision_history_and_tags() -> None:
     actual_operations = {
         (path, method): operation["operationId"]
         for path, path_item in paths.items()
-        if path.startswith("/v1/scopes/{scope_id}/sources") or path.startswith("/v1/scopes/{scope_id}/artifacts")
+        if path.startswith("/v1/scopes/{scope_id}/sources")
+        or path.startswith("/v1/scopes/{scope_id}/artifacts")
+        or path.startswith("/v1/scopes/{scope_id}/artifact-handles")
         for method, operation in path_item.items()
     }
     assert actual_operations == expected_operations

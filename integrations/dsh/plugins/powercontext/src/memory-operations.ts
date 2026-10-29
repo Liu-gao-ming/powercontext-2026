@@ -46,7 +46,7 @@ function atomicReference(value: unknown): AtomicReference {
   return { family: 'atomic-memory', artifact_id: ref.artifact_id, revision: ref.revision }
 }
 
-/** Translate the maintained Memory tool names at their identity and write boundary. */
+/** Translate maintained control-plane Memory operations at their identity and write boundary. */
 export async function requestMemoryOperation(
   client: PowerContextClient,
   operationId: OperationId,
@@ -76,7 +76,7 @@ export async function requestMemoryOperation(
   if (operationId === 'revise_memory_entry') {
     if (typeof body.if_match !== 'string' || body.if_match !== `"revision:${ref.revision}"`) {
       throw new MemoryOperationError('invalid_request',
-        'Use the content ETag returned by pc_memory_get for this exact current revision.')
+        'Read this exact current Atomic Memory revision and copy its returned content ETag unchanged.')
     }
     return client.request('replace_artifact', {
       ...identity,
@@ -85,7 +85,7 @@ export async function requestMemoryOperation(
     }, signal)
   }
   if (typeof body.state_version !== 'number' || !Number.isSafeInteger(body.state_version) || body.state_version < 0) {
-    throw new MemoryOperationError('invalid_request', 'Supply the current state_version from search, list or pc_memory_state.')
+    throw new MemoryOperationError('invalid_request', 'Supply the current state_version returned by search, list or the Atomic Memory state read.')
   }
   return client.request('change_atomic_memory_lifecycle', {
     scope_id: scopeId,

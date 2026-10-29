@@ -194,6 +194,8 @@ _BASE_ENVIRONMENT: dict[str, str] = {
     "POWERCONTEXT_SERVER_RUNTIME_MEMORY_EXTRACTION_PROFILE": "coding",
     "POWERCONTEXT_SERVER_INFERENCE_GENERATION_TIMEOUT_SECONDS": "30",
     "POWERCONTEXT_SERVER_INFERENCE_GENERATION_MAX_REQUESTS": "2",
+    "POWERCONTEXT_SERVER_INFERENCE_GENERATION_STREAMING": "disabled",
+    "POWERCONTEXT_SERVER_INFERENCE_GENERATION_STREAM_IDLE_TIMEOUT_SECONDS": "60",
     "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_NORMALIZATION": "unit",
     "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_BATCH_SIZE": "10",
     "POWERCONTEXT_SERVER_INFERENCE_EMBEDDING_TIMEOUT_SECONDS": "30",
@@ -272,6 +274,80 @@ class WizardLanguage(StrEnum):
 
     ENGLISH = "en"
     CHINESE = "zh"
+
+
+@app.command("agent")
+def configure_agents(
+    context: typer.Context,
+    agents: Annotated[list[str] | None, typer.Argument(help="Installed agents to configure.")] = None,
+    server_url: Annotated[str | None, typer.Option(help="Server URL for the selected agents.")] = None,
+    allow_insecure_http: Annotated[bool | None, typer.Option("--allow-insecure-http/--no-allow-insecure-http")] = None,
+    capture_prompts: Annotated[
+        bool | None,
+        typer.Option(
+            "--capture-prompts/--no-capture-prompts",
+            help="Claude Code, Kimi Code and ZCode only; omission preserves the capture preference.",
+        ),
+    ] = None,
+    scope_id: Annotated[str | None, typer.Option(help="Existing Scope ID for Kimi Code.")] = None,
+    workspace_scope: Annotated[
+        bool,
+        typer.Option("--workspace-scope", help="Kimi Code: resolve workspace bindings, then the Server default Scope."),
+    ] = False,
+    boundary_flush: Annotated[bool | None, typer.Option("--boundary-flush/--no-boundary-flush")] = None,
+    profile: Annotated[
+        str | None,
+        typer.Option(help="DSH profile or Kimi MCP profile: minimal, recommended, full; omission preserves it."),
+    ] = None,
+    dsh_command: Annotated[Path | None, typer.Option(help="DSH launcher path.")] = None,
+    env_file: Annotated[Path | None, typer.Option(help="Setup environment file; defaults to .env.")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Update existing agent connections without installing or activating plugins."""
+    from powercontext.cli.authorization import validate_setup_authorization
+    from powercontext.cli.dsh_runtime import DshProfile, resolve_dsh_target
+    from powercontext.cli.hosts import native_options, report_agents, select_hosts, validate_native_options
+    from powercontext.cli.installation import installers
+    from powercontext.cli.transport import prepare_setup_transport, setup_environment_file
+
+    token = setup_environment_file.set(env_file)
+    context.call_on_close(lambda: setup_environment_file.reset(token))
+    selected = select_hosts(agents, json_output=json_output)
+    validate_native_options(
+        selected,
+        capture_prompts=capture_prompts,
+        scope_id=scope_id,
+        workspace_scope=workspace_scope or None,
+        boundary_flush=boundary_flush,
+        profile=profile,
+        dsh_command=dsh_command,
+    )
+
+    def configure(host):
+        validate_setup_authorization(host)
+        options = native_options(
+            host,
+            capture_prompts=capture_prompts,
+            scope_id=scope_id,
+            workspace_scope=workspace_scope or None,
+            boundary_flush=boundary_flush,
+            profile=profile,
+        )
+        if host == "dsh":
+            options["dsh_target"] = resolve_dsh_target(
+                DshProfile(profile) if profile is not None else None, dsh_command
+            )
+        connection = prepare_setup_transport(
+            host,
+            server_url=server_url,
+            allow_insecure_http=allow_insecure_http,
+            json_output=json_output,
+            dsh_target=options.get("dsh_target"),
+        )
+        result = installers()[host](**options).configure(connection)
+        return {"status": "configured", "result": result}
+
+    report_agents(selected, configure, json_output=json_output)
 
 
 @app.command("init")

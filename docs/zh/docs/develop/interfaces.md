@@ -116,14 +116,14 @@ Pi transcript。召回、采集和边界 flush 都会正常降级；显式持久
 运行带 Scope 的内容命令前，将 `POWERCONTEXT_SCOPE_ID` 设置为 `create_scope` 返回的已有 ID。
 
 ```text
-powercontext setup <host>
-powercontext setup select --host codex --host dsh
+powercontext setup [agents...]
+powercontext setup codex dsh
+powercontext config agent codex dsh --server-url https://memory.example
 powercontext config init --output .env
 powercontext config show --env-file .env
 powercontext config validate --env-file .env
 powercontext doctor
-powercontext doctor <host>
-powercontext doctor integrations
+powercontext doctor codex dsh
 powercontext server run
 powercontext server run --env-file .env
 powercontext ready
@@ -149,14 +149,22 @@ powercontext external-skill import --scope-id "$POWERCONTEXT_SCOPE_ID" --fingerp
 `config` 命令组用于生成、脱敏显示和校验显式环境文件。CLI 不会隐式搜索该文件；使用 `config show`、
 `config validate` 或 `server run` 时需要通过 `--env-file` 传入。配置优先级和凭据处理规则见[配置](../operate/configuration.md)。
 
-`<host>` 可以是 `codex`、`claude-code`、`dsh`、`hermes`、`openclaw`、`opencode`、`pi` 或
-`workbuddy`。`setup select` 和 `doctor integrations` 使用的一级宿主目录包含上述除 WorkBuddy 外的所有宿主；
-WorkBuddy 仍可通过显式的 `setup workbuddy` 和 `doctor workbuddy` 命令使用。
+Agent 可以是 `codex`、`claude-code`、`dsh`、`hermes`、`kimi-code`、`openclaw`、`opencode`、`pi`、`workbuddy` 或 `zcode`。
+`powercontext setup` 提供交互选择；显式 Agent 名称支持非交互和多 Agent 安装。
+Setup 会安装、配置、按宿主能力启用插件并运行 doctor。各 Agent 的失败互相隔离；诊断失败时仍会报告已完成的安装。
 
-`powercontext doctor` 检查安装包和 Server，不要求任何集成。`powercontext doctor integrations` 打印全部一级宿主的只读矩阵；
-CLI 不在 PATH 上时该行是 `missing`，不会让整条命令失败。各个 `powercontext doctor <host>` 命令在对应 CLI
-缺失时仍会失败。矩阵保留每个宿主专有的全部集成检查，包括 OpenCode 独立的 `plugin` 与 `skill` 结果。
-DSH 检查 `dump-config` 是否列出 `powercontext-dsh`；Pi 检查 CLI 是否列出 PowerContext package。
+`powercontext config agent [agents...]` 更新已安装连接，不会重新安装或启用插件。
+`powercontext doctor [agents...]` 检查选中的 Agent；未指定时检查已保存的连接。
+没有已保存连接时，doctor 检查安装包和 Server。选中的 Agent 缺少必需 CLI 时，其检查失败。
+Doctor 保留宿主专有检查，包括 OpenCode 独立的 `plugin` 与 `skill` 结果。DSH 检查原生注册；Pi 检查已注册的 package。
+
+Candidate 的统一 HTTP 路径为 `/v1/candidates/list`、`get`、`history`、`revise`、`approve`、`reject`（均为 POST）。
+通过 `candidate_kind=artifact|tag` 区分类型；旧 Artifact Candidate 路径直接移除，调用方必须同步升级。
+Artifact 批准返回真实版本引用，Tag 批准返回标签集和 ETag，不生成正文版本。
+
+MCP 继续暴露审核决策操作。启用权限控制时，Server 要求 `scope.review`，但不禁止有权限的提案人批准自己的 Candidate。
+MCP 工具注解供宿主执行确认策略，不强制人工确认。权限模式与审核者分离方式见
+[审核权限](../workflows/review-candidates.md#审核权限)。
 
 `candidate` 命令组提供面向人工的 Review Inbox。列出、检查、修订、批准和拒绝的操作步骤见
 [审核 Candidate](../workflows/review-candidates.md)。
@@ -188,13 +196,22 @@ Skill generation 还必须声明 provenance 形态：
 - `usage`：引用精确 target Skill 和有界 usage Source。
 
 这些 generation operation 需要配置 `POWERCONTEXT_SERVER_INFERENCE_GENERATION_MODEL`。已经拥有完整类型化内容和
-精确证据的人或 integration 仍可使用低阶 `propose_*` operation。两条路径都不能自行批准 Candidate。
+精确证据的人或 integration 仍可使用低阶 `propose_*` operation。两条路径返回的都是 pending 内容，批准需要单独调用审核操作。
 Experience 经 Review 批准后，确定性的 `searchable_text` 会写入现有通用 Artifact head 并进入 backend 可重建 FTS
 索引，从而可在同一 scope 内被 `PreparedContext` 召回。pending/rejected Candidate、所有 managed Skill 和历史
 Experience Revision 仍不会进入 PreparedContext。
 
 证据、Candidate version、approved Revision、召回和导出的关系见
 [Experience 与 Skill 生命周期](../workflows/experience-and-skill-lifecycle.md)。
+
+## 后台 Atomic Memory 处理
+
+内置 Source-window 定时任务会先比较 journal 位置与自身持久化的消费游标，再激活 Scope。已经完全消费的
+journal 跳过 Scope 处理；仍有缓冲窗口时，即使没有新的 Source，后续 tick 也会继续选择该 Scope。
+发现阶段只提供候选：选中 Scope 后仍执行鉴权和 cursor/window 检查；发现之后提交的新捕获会在后续 tick 可见。
+
+该选择方式只用于内置 Source-window 策略。直接组装 Runtime 并传入自定义 Scope selector 时，仍使用该
+selector；Experience 孵化继续使用独立的游标和定时任务。
 
 ## 后台 Experience 孵化
 
@@ -264,9 +281,14 @@ Discovery 不进入 Review。显式调用 `import_external_skill` 并提供精�
 Scalar API reference，在 `/openapi.json` 提供 OpenAPI 文档，在 `/health/ready` 提供就绪检查，在
 `/v1/capabilities` 提供能力信息，并默认在 `/mcp` 提供 Streamable HTTP MCP。启用 Bearer authentication 后，
 Scalar reference 仍可公开访问，但其中描述的 operation 继续遵守各自的认证要求。HTTP 是完整应用契约，MCP 是
-面向 Agent 的 Source 采集、Memory 维护、工作连续性、scope Handoff Report 查询和 Candidate Review 精选子集。五个
+面向 Agent 的 Source 采集、Memory 维护、工作连续性、scope Handoff Report 查询和 Candidate Review 精选子集。六个
 Candidate Review operation 通过 HTTP 和 MCP 使用相同的 validation、`expected_version` 并发校验和 approval transaction。Experience/Skill generation、
 exact read、external Registry operation 和低阶 proposal operation 仍只通过 HTTP 提供。
+
+MCP 使用无状态 Streamable HTTP，不签发 MCP 会话 ID。启用认证时，每个请求均使用自身经过验证的身份和当前
+组成员关系。Scope、Memory 和 Handoff 仍持久化在 Runtime 中。升级后请重新连接 MCP 客户端；不提供跨请求的
+SSE 流恢复。
+
 所有检查通过时 readiness 为 HTTP 200 的 `ready`；只有已配置的推理检查失败时为 HTTP 200 的 `degraded`；
 Runtime 或数据库失败时为 HTTP 503 的 `not_ready`。依赖检查使用 `ready`、`unavailable`、`timeout` 或
 `misconfigured`；有意不绑定 Runtime 时，`runtime` 检查使用 `not_ready`。

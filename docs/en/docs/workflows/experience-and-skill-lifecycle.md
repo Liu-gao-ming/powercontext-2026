@@ -5,9 +5,10 @@ description: Learn how evidence becomes reviewed Experience and managed Skill Ar
 
 # Experience and Skill lifecycle
 
-Experience and managed Skill content passes through the same review boundary. Evidence supports a proposal, a human
-reviews one exact Candidate version, and approval creates an immutable Artifact Revision. Generation never approves
-its own result.
+Experience and managed Skill content passes through the same review boundary. Evidence supports a proposal, a reviewer
+inspects one exact Candidate version, and approval creates an immutable Artifact Revision. Generation returns pending
+content; approval requires a separate operation. The reviewer may be an authorized Agent, including the proposer.
+For human review, [separate submission and review permissions](review-candidates.md#separate-agent-submission-from-review).
 
 ## Evidence comes first
 
@@ -25,6 +26,10 @@ immutable versions. Revising it appends a complete replacement proposal as the n
 
 Reviewers act on the version they inspected. `expected_version` prevents an approval, rejection, or revision from
 silently applying after another writer changes the Candidate. Approval and rejection are terminal states.
+
+After authorization, approving an already rejected Candidate returns a terminal-state error before validating its
+target or evidence or requesting embeddings. Repeating approval of an approved Candidate with the same version
+returns its stored result. A rejection that races with preparation still prevents publication at commit time.
 
 A Candidate is not an Artifact Revision:
 

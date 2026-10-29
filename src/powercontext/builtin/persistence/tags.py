@@ -139,56 +139,76 @@ class RelationalTagService:
     async def replace(
         self, scope_id: str, target: TagTarget, tags: tuple[str, ...], *, expected_etag: str, execution_context=None
     ) -> ArtifactTagSet:
-        desired = normalize_tags(tags)
         async with self._database.transaction() as connection:
-            # Acquire the database write lock before any reads. In particular,
-            # SELECT FOR UPDATE alone cannot serialize empty-set writes on SQLite.
-            locked = await connection.execute(
-                update(ARTIFACT_HEADS_TABLE)
-                .where(
-                    ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
-                    ARTIFACT_HEADS_TABLE.c.family == target.family,
-                    ARTIFACT_HEADS_TABLE.c.artifact_id == target.artifact_id,
-                )
-                .values(revision=ARTIFACT_HEADS_TABLE.c.revision)
+            return await self.replace_in_transaction(
+                connection, scope_id, target, tags, expected_etag=expected_etag, execution_context=execution_context
             )
-            if locked.rowcount != 1:
-                raise BaseValueNotFoundError("artifact", target)
-            await self._target_reference(connection, scope_id, target)
-            if target.family == "atomic-memory" and self._atomic_write_authorizer is not None:
-                await self._atomic_write_authorizer(connection, scope_id, target.artifact_id, execution_context)
-            latest = await self._read(connection, scope_id, target, current=True)
-            current = tag_set(scope_id, target, latest.tags)
-            if not hmac.compare_digest(expected_etag.encode("utf-8"), current.etag.encode("utf-8")):
-                raise TagPreconditionError
-            previous = normalize_tags(current.tags)
-            identity = _identity(scope_id, target)
-            removed = previous.keys() - desired.keys()
-            if removed:
+
+    async def lock_target(self, connection: AsyncConnection, scope_id: str, target: TagTarget) -> None:
+        locked = await connection.execute(
+            update(ARTIFACT_HEADS_TABLE)
+            .where(
+                ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                ARTIFACT_HEADS_TABLE.c.family == target.family,
+                ARTIFACT_HEADS_TABLE.c.artifact_id == target.artifact_id,
+            )
+            .values(revision=ARTIFACT_HEADS_TABLE.c.revision)
+        )
+        if locked.rowcount != 1:
+            raise BaseValueNotFoundError("artifact", target)
+
+    async def read_in_transaction(
+        self, connection: AsyncConnection, scope_id: str, target: TagTarget
+    ) -> ArtifactTagSet:
+        return await self._read(connection, scope_id, target, current=True)
+
+    async def replace_in_transaction(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        target: TagTarget,
+        tags: tuple[str, ...],
+        *,
+        expected_etag: str,
+        execution_context=None,
+    ) -> ArtifactTagSet:
+        desired = normalize_tags(tags)
+        await self.lock_target(connection, scope_id, target)
+        await self._target_reference(connection, scope_id, target)
+        if target.family == "atomic-memory" and self._atomic_write_authorizer is not None:
+            await self._atomic_write_authorizer(connection, scope_id, target.artifact_id, execution_context)
+        latest = await self._read(connection, scope_id, target, current=True)
+        current = tag_set(scope_id, target, latest.tags)
+        if not hmac.compare_digest(expected_etag.encode("utf-8"), current.etag.encode("utf-8")):
+            raise TagPreconditionError
+        previous = normalize_tags(current.tags)
+        identity = _identity(scope_id, target)
+        removed = previous.keys() - desired.keys()
+        if removed:
+            await connection.execute(
+                delete(ARTIFACT_TAGS_TABLE).where(_where(identity), ARTIFACT_TAGS_TABLE.c.tag_key.in_(removed))
+            )
+        assigned_at = self._clock()
+        for key, label in desired.items():
+            if key not in previous:
                 await connection.execute(
-                    delete(ARTIFACT_TAGS_TABLE).where(_where(identity), ARTIFACT_TAGS_TABLE.c.tag_key.in_(removed))
+                    insert(ARTIFACT_TAGS_TABLE).values(
+                        **identity,
+                        tag_key=key,
+                        tag_key_hash=sha256(key.encode("utf-8")).digest(),
+                        tag=label,
+                        assigned_at=assigned_at,
+                    )
                 )
-            assigned_at = self._clock()
-            for key, label in desired.items():
-                if key not in previous:
-                    await connection.execute(
-                        insert(ARTIFACT_TAGS_TABLE).values(
-                            **identity,
-                            tag_key=key,
-                            tag_key_hash=sha256(key.encode("utf-8")).digest(),
-                            tag=label,
-                            assigned_at=assigned_at,
-                        )
-                    )
-                elif label != previous[key]:
-                    await connection.execute(
-                        update(ARTIFACT_TAGS_TABLE)
-                        .where(_where(identity), ARTIFACT_TAGS_TABLE.c.tag_key == key)
-                        .values(tag=label)
-                    )
-            if target.family == "atomic-memory" and self._projection_hook is not None:
-                await self._projection_hook(connection, scope_id, target.artifact_id, tuple(desired))
-            return tag_set(scope_id, target, tags)
+            elif label != previous[key]:
+                await connection.execute(
+                    update(ARTIFACT_TAGS_TABLE)
+                    .where(_where(identity), ARTIFACT_TAGS_TABLE.c.tag_key == key)
+                    .values(tag=label)
+                )
+        if target.family == "atomic-memory" and self._projection_hook is not None:
+            await self._projection_hook(connection, scope_id, target.artifact_id, tuple(desired))
+        return tag_set(scope_id, target, tags)
 
     async def query(self, scope_id: str, query: TagQuery, *, caller: str = "runtime") -> TagQueryPage:
         binding = sha256(
@@ -204,68 +224,55 @@ class RelationalTagService:
         ).hexdigest()
         after = self._decode_cursor(query.cursor, binding)
         table = ARTIFACT_TAGS_TABLE
+        heads = ARTIFACT_HEADS_TABLE
         order = (table.c.family, table.c.target_type, table.c.artifact_id, table.c.target_id)
         items: list[TaggedTarget] = []
         keys: list[tuple[str, ...]] = []
         async with self._database.transaction() as connection:
             await _begin_read_snapshot(connection)
-            heads: dict[tuple[str, str], tuple[Artifact[Any], str]] = {}
-            while len(items) <= query.limit:
-                statement = (
-                    select(*order)
-                    .where(
-                        table.c.scope_id == scope_id,
-                        table.c.tag_key_hash.in_(_key_hashes(query)),
-                        table.c.tag_key.in_(query.keys),
-                        table.c.family.in_(query.families),
-                        table.c.target_type.in_(query.target_types),
-                        tuple_(*order) > tuple_(*(literal(value) for value in after)),
+            statement = (
+                select(*order, heads.c.revision)
+                .select_from(
+                    table.join(
+                        heads,
+                        and_(
+                            heads.c.scope_id == table.c.scope_id,
+                            heads.c.family == table.c.family,
+                            heads.c.artifact_id == table.c.artifact_id,
+                        ),
                     )
-                    .group_by(*order)
-                    .having(func.count() == len(query.keys) if query.match == "all" else func.count() > 0)
-                    .order_by(*order)
-                    .limit(100)
                 )
-                rows = (await connection.execute(statement)).all()
-                for row in rows:
-                    key = tuple(str(value) for value in row)
-                    family, _target_type, artifact_id, _target_id = key
-                    target = ArtifactTagTarget(family=cast(Any, family), artifact_id=artifact_id)
-                    head_key = (family, artifact_id)
-                    if head_key not in heads:
-                        head_row = (
-                            await connection.execute(
-                                select(
-                                    ARTIFACT_HEADS_TABLE.c.revision,
-                                    ARTIFACT_HEADS_TABLE.c.lifecycle_state,
-                                ).where(
-                                    ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
-                                    ARTIFACT_HEADS_TABLE.c.family == family,
-                                    ARTIFACT_HEADS_TABLE.c.artifact_id == artifact_id,
-                                )
-                            )
-                        ).one_or_none()
-                        if head_row is None:
-                            continue
-                        ref = ArtifactRef(family=family, artifact_id=artifact_id, revision=head_row.revision)
-                        heads[head_key] = (
-                            await self._artifacts.get(connection, scope_id, ref),
-                            str(head_row.lifecycle_state),
-                        )
-                    artifact, lifecycle = heads[head_key]
-                    if not query.include_inactive and lifecycle != "active":
-                        continue
-                    reference = artifact.as_ref()
-                    labels = await self._read(connection, scope_id, target)
-                    items.append(TaggedTarget(**labels.model_dump(), reference=reference))
-                    keys.append(key)
-                    if len(items) > query.limit:
-                        break
-                if not rows or len(rows) < 100:
-                    break
-                after = tuple(str(value) for value in rows[-1])
-        cursor = self._encode_cursor(keys[query.limit - 1], binding) if len(items) > query.limit else None
-        return TagQueryPage(items=tuple(items[: query.limit]), next_cursor=cursor)
+                .where(
+                    table.c.scope_id == scope_id,
+                    table.c.tag_key_hash.in_(_key_hashes(query)),
+                    table.c.tag_key.in_(query.keys),
+                    table.c.family.in_(query.families),
+                    table.c.target_type.in_(query.target_types),
+                    tuple_(*order) > tuple_(*(literal(value) for value in after)),
+                )
+                .group_by(*order, heads.c.revision)
+                .having(func.count() == len(query.keys) if query.match == "all" else func.count() > 0)
+                .order_by(*order)
+                .limit(query.limit + 1)
+            )
+            if not query.include_inactive:
+                statement = statement.where(heads.c.lifecycle_state == "active")
+            rows = (await connection.execute(statement)).all()
+            artifacts: dict[tuple[str, str], Artifact[Any]] = {}
+            for row in rows[: query.limit]:
+                key = tuple(str(value) for value in row[:4])
+                family, _target_type, artifact_id, _target_id = key
+                target = ArtifactTagTarget(family=cast(Any, family), artifact_id=artifact_id)
+                head_key = (family, artifact_id)
+                if head_key not in artifacts:
+                    ref = ArtifactRef(family=family, artifact_id=artifact_id, revision=int(row[4]))
+                    artifacts[head_key] = await self._artifacts.get(connection, scope_id, ref)
+                reference = artifacts[head_key].as_ref()
+                labels = await self._read(connection, scope_id, target)
+                items.append(TaggedTarget(**labels.model_dump(), reference=reference))
+                keys.append(key)
+        cursor = self._encode_cursor(keys[-1], binding) if len(rows) > query.limit else None
+        return TagQueryPage(items=tuple(items), next_cursor=cursor)
 
     async def _read(
         self, connection: AsyncConnection, scope_id: str, target: TagTarget, *, current=False

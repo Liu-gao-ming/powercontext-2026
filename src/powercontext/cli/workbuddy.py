@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shlex
@@ -24,32 +23,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from collections.abc import Callable
-from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from powercontext.cli.git_source import (
-    InvalidGitHubSourceError,
-    clone_github_source,
+from powercontext.cli.guidance import (
+    ENTRY_NAME,
+    HOST_GUIDANCE,
+    SKILL_DIRECTORY,
+    GuidanceError,
+    refresh_skill,
+    write_if_changed,
 )
-from powercontext.cli.git_source import (
-    github_clone_url as _github_clone_url,
-)
-from powercontext.cli.git_source import (
-    is_local_source as _is_local_source,
-)
+from powercontext.cli.installation import publish, write_json
 from powercontext.cli.system import Diagnostic, DiagnosticStatus, SetupError
+from powercontext.cli.transport import configure_connection
 from powercontext.paths import powercontext_data_dir
 
 WORKBUDDY_HOME_ENV = "WORKBUDDY_HOME"
 WORKBUDDY_PLUGIN_NAME = "powercontext"
-WORKBUDDY_PLUGIN_RELATIVE = Path("integrations") / "workbuddy" / "plugins" / "powercontext"
+WORKBUDDY_PLUGIN_RELATIVE = Path(HOST_GUIDANCE["workbuddy"].plugin)
 WORKBUDDY_HOOKS_DIRNAME = "hooks"
-WORKBUDDY_SKILLS_DIRNAME = "skills"
-WORKBUDDY_SKILL_NAME = "powercontext-project-context"
+WORKBUDDY_SKILLS_DIRNAME = SKILL_DIRECTORY.parent.name
+WORKBUDDY_SKILL_NAME = ENTRY_NAME
 WORKBUDDY_SKILL_MANIFEST = ".powercontext.json"
 WORKBUDDY_PYTHON_PLACEHOLDER = "${POWERCONTEXT_PYTHON}"
 WORKBUDDY_SCOPE_BINDING_PLACEHOLDER = "${POWERCONTEXT_SCOPE_BINDING_SCRIPT}"
@@ -60,135 +56,25 @@ WORKBUDDY_HOOK_MODULES = (
     "workbuddy_settings.py",
     "powercontext_client_config.py",
     "prepared_context.py",
+    "prompt_privacy.py",
 )
 WORKBUDDY_SCRIPT_MODULES = ("__init__.py", "workspace_scope.py")
 WORKBUDDY_SERVER_URL_ENV = "POWERCONTEXT_WORKBUDDY_SERVER_URL"
 WORKBUDDY_AUTHORIZATION_ENV = "POWERCONTEXT_WORKBUDDY_AUTHORIZATION"
 WORKBUDDY_MCP_URL = f"${{{WORKBUDDY_SERVER_URL_ENV}:-http://127.0.0.1:8000}}/mcp"
 WORKBUDDY_MCP_AUTHORIZATION = f"${{{WORKBUDDY_AUTHORIZATION_ENV}:-}}"
-WORKBUDDY_LEGACY_MCP_URL = "http://127.0.0.1:8000/mcp"
 WORKBUDDY_MCP_DESCRIPTION = "PowerContext agent memory & handoff MCP server (local service on port 8000)"
 WORKBUDDY_HOOK_STATUS_MESSAGE = "Syncing PowerContext"
 WORKBUDDY_HOOK_TIMEOUT = 30
 
 
-@dataclass(frozen=True, slots=True)
-class WorkBuddySetupResult:
-    plugin: str
-    plugin_path: str
-    workbuddy_home: str
-    hooks_dir: str
-    data_dir: str
-    authorization_state: str = "not_attempted"
-
-
-def install_workbuddy_plugin(*, source: str, ref: str, server_url: str | None = None) -> WorkBuddySetupResult:
-    """Install the PowerContext hooks, MCP server, and Skill into WorkBuddy's user directory."""
-
-    data_dir = powercontext_data_dir()
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise SetupError.data_directory(data_dir, error) from error
-
-    plugin_dir = resolve_workbuddy_plugin_dir(source=source, ref=ref)
-    require_workbuddy_plugin(plugin_dir)
-
-    home = workbuddy_home()
-    hooks_dir = home / WORKBUDDY_HOOKS_DIRNAME
-    skills_dir = home / WORKBUDDY_SKILLS_DIRNAME
-    skill_dir = skills_dir / WORKBUDDY_SKILL_NAME
-    settings_file = home / "settings.json"
-    mcp_file = home / "mcp.json"
-
-    try:
-        home.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise SetupError.workbuddy_home_unavailable(home, error) from error
-
-    require_replaceable_workbuddy_skill(skill_dir)
-    settings_snapshot = _read_bytes_or_none(
-        settings_file,
-        io_error=lambda error: SetupError.workbuddy_settings_write(settings_file, error),
-    )
-    mcp_snapshot = _read_bytes_or_none(
-        mcp_file,
-        io_error=lambda error: SetupError.workbuddy_mcp_write(mcp_file, error),
-    )
-    hooks_backup = _snapshot_directory(hooks_dir)
-    skill_backup = _snapshot_directory(skill_dir)
-    try:
-        _install_hook_files(plugin_dir, hooks_dir)
-        _merge_workbuddy_settings(settings_file, hooks_dir)
-        _merge_workbuddy_mcp(mcp_file, server_url=server_url)
-        _install_workbuddy_skill(plugin_dir, skills_dir, hooks_dir)
-    except BaseException:
-        _restore_file(settings_file, settings_snapshot)
-        _restore_file(mcp_file, mcp_snapshot)
-        _restore_directory(hooks_dir, hooks_backup)
-        _restore_directory(skill_dir, skill_backup)
-        raise
-    finally:
-        _remove_path(hooks_backup)
-        _remove_path(skill_backup)
-
-    from powercontext.cli.authorization import (
-        configure_stored_authorization,
-        setup_authorization_value,
-    )
-
-    return WorkBuddySetupResult(
-        plugin=WORKBUDDY_PLUGIN_NAME,
-        plugin_path=str(plugin_dir),
-        workbuddy_home=str(home),
-        hooks_dir=str(hooks_dir),
-        data_dir=str(data_dir),
-        authorization_state=configure_stored_authorization(
-            "workbuddy",
-            server_url=server_url or "http://127.0.0.1:8000",
-            value=setup_authorization_value("workbuddy"),
-        ),
-    )
-
-
-def resolve_workbuddy_plugin_dir(*, source: str, ref: str) -> Path:
-    """Return the WorkBuddy plugin directory from a local or remote checkout."""
-
-    if _is_local_source(source):
-        return plugin_dir_from_checkout(Path(source).expanduser().resolve())
-    return plugin_dir_from_checkout(_materialize_remote_checkout(source, ref))
-
-
-def plugin_dir_from_checkout(root: Path) -> Path:
-    """Accept either the plugin directory or a PowerContext repository root."""
-
-    if _is_workbuddy_plugin(root):
-        return root
-    plugin = root / WORKBUDDY_PLUGIN_RELATIVE
-    if _is_workbuddy_plugin(plugin):
-        return plugin
-    raise SetupError.missing_workbuddy_plugin(root)
-
-
 def require_workbuddy_plugin(path: Path) -> None:
     """Reject a directory that cannot provide the WorkBuddy hooks, MCP, and Skill."""
 
-    if not _is_workbuddy_plugin(path):
-        raise SetupError.missing_workbuddy_plugin(path)
-
-
-def run_workbuddy_diagnostics() -> dict[str, Diagnostic]:
-    """Collect diagnostics for the optional WorkBuddy integration."""
-
-    home = workbuddy_home()
-    hooks_dir = home / WORKBUDDY_HOOKS_DIRNAME
-    skill_file = home / WORKBUDDY_SKILLS_DIRNAME / WORKBUDDY_SKILL_NAME / "SKILL.md"
-    return {
-        "hooks": _hooks_diagnostic(hooks_dir),
-        "settings": _settings_diagnostic(home / "settings.json"),
-        "mcp": _mcp_diagnostic(home / "mcp.json"),
-        "skill": _skill_diagnostic(skill_file),
-    }
+    if not all((path / "hooks" / name).is_file() for name in WORKBUDDY_HOOK_MODULES) or not all(
+        (path / "scripts" / name).is_file() for name in WORKBUDDY_SCRIPT_MODULES
+    ):
+        raise SetupError(f"PowerContext WorkBuddy plugin was not found under {path}.")  # noqa: TRY003
 
 
 def workbuddy_home() -> Path:
@@ -196,32 +82,6 @@ def workbuddy_home() -> Path:
 
     configured = os.environ.get(WORKBUDDY_HOME_ENV, "").strip()
     return Path(configured).expanduser().resolve() if configured else (Path.home() / ".workbuddy").resolve()
-
-
-def github_clone_url(source: str) -> str:
-    """Accept a GitHub slug or repository URL and return a clone URL."""
-
-    try:
-        return _github_clone_url(source)
-    except InvalidGitHubSourceError:
-        raise SetupError.invalid_workbuddy_source(source) from None
-
-
-def checkout_target(source: str, ref: str) -> Path:
-    """Resolve a source and Git ref to a directory under the WorkBuddy checkout cache."""
-
-    root = (powercontext_data_dir() / "checkouts" / "workbuddy").resolve()
-    if not ref or ref in {".", ".."} or "\x00" in ref:
-        raise SetupError.invalid_workbuddy_ref(ref)
-    source_key = hashlib.sha256(github_clone_url(source).encode("utf-8")).hexdigest()[:16]
-    target = (root / source_key / ref).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError as error:
-        raise SetupError.invalid_workbuddy_ref(ref) from error
-    if target == root:
-        raise SetupError.invalid_workbuddy_ref(ref)
-    return target
 
 
 def _install_hook_files(plugin_dir: Path, hooks_dir: Path) -> None:
@@ -234,7 +94,7 @@ def _install_hook_files(plugin_dir: Path, hooks_dir: Path) -> None:
             shutil.copy2(source_hooks / name, hooks_dir / name)
         shutil.copy2(plugin_dir / "scripts" / "workspace_scope.py", hooks_dir / WORKBUDDY_SCOPE_RESOLVER)
     except OSError as error:
-        raise SetupError.workbuddy_hooks_write(hooks_dir, error) from error
+        raise SetupError(f"Cannot install PowerContext WorkBuddy hooks at {hooks_dir}: {error}") from error  # noqa: TRY003
 
 
 def _merge_workbuddy_settings(settings_file: Path, hooks_dir: Path) -> None:
@@ -242,23 +102,25 @@ def _merge_workbuddy_settings(settings_file: Path, hooks_dir: Path) -> None:
 
     settings = _load_json_object(
         settings_file,
-        invalid=lambda: SetupError.invalid_workbuddy_settings(settings_file),
-        io_error=lambda error: SetupError.workbuddy_settings_write(settings_file, error),
+        invalid=lambda: SetupError(
+            f"WorkBuddy settings at {settings_file} must contain a JSON object with a hooks mapping."
+        ),
+        io_error=lambda error: SetupError(f"Cannot update WorkBuddy settings at {settings_file}: {error}"),
     )
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
-        raise SetupError.invalid_workbuddy_settings(settings_file)
+        raise SetupError(f"WorkBuddy settings at {settings_file} must contain a JSON object with a hooks mapping.")  # noqa: TRY003
     hooks_dict = cast(dict[str, Any], hooks)
     matchers = hooks_dict.setdefault("UserPromptSubmit", [])
     if not isinstance(matchers, list):
-        raise SetupError.invalid_workbuddy_settings(settings_file)
+        raise SetupError(f"WorkBuddy settings at {settings_file} must contain a JSON object with a hooks mapping.")  # noqa: TRY003
 
     _upsert_powercontext_hook(cast(list[Any], matchers), hooks_dir, settings_file)
 
     try:
-        _write_json_atomically(settings_file, settings)
+        write_json(settings_file, settings)
     except OSError as error:
-        raise SetupError.workbuddy_settings_write(settings_file, error) from error
+        raise SetupError(f"Cannot update WorkBuddy settings at {settings_file}: {error}") from error  # noqa: TRY003
 
 
 def _merge_workbuddy_mcp(mcp_file: Path, *, server_url: str | None = None) -> None:
@@ -266,12 +128,16 @@ def _merge_workbuddy_mcp(mcp_file: Path, *, server_url: str | None = None) -> No
 
     config = _load_json_object(
         mcp_file,
-        invalid=lambda: SetupError.invalid_workbuddy_mcp(mcp_file),
-        io_error=lambda error: SetupError.workbuddy_mcp_write(mcp_file, error),
+        invalid=lambda: SetupError(
+            f"WorkBuddy MCP configuration at {mcp_file} must contain a JSON object with an mcpServers mapping."
+        ),
+        io_error=lambda error: SetupError(f"Cannot update WorkBuddy MCP configuration at {mcp_file}: {error}"),
     )
     servers = config.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
-        raise SetupError.invalid_workbuddy_mcp(mcp_file)
+        raise SetupError(  # noqa: TRY003
+            f"WorkBuddy MCP configuration at {mcp_file} must contain a JSON object with an mcpServers mapping."
+        )
     servers_dict = cast(dict[str, Any], servers)
 
     existing = servers_dict.get(WORKBUDDY_PLUGIN_NAME)
@@ -284,9 +150,9 @@ def _merge_workbuddy_mcp(mcp_file: Path, *, server_url: str | None = None) -> No
         servers_dict[WORKBUDDY_PLUGIN_NAME] = entry
 
     try:
-        _write_json_atomically(mcp_file, config)
+        write_json(mcp_file, config)
     except OSError as error:
-        raise SetupError.workbuddy_mcp_write(mcp_file, error) from error
+        raise SetupError(f"Cannot update WorkBuddy MCP configuration at {mcp_file}: {error}") from error  # noqa: TRY003
 
 
 def _workbuddy_mcp_entry(existing: Any) -> dict[str, Any]:
@@ -297,7 +163,8 @@ def _workbuddy_mcp_entry(existing: Any) -> dict[str, Any]:
         "description": WORKBUDDY_MCP_DESCRIPTION,
         "disabled": False,
     }
-    if isinstance(existing, dict) and not _is_legacy_workbuddy_mcp_entry(existing):
+    if isinstance(existing, dict):
+        entry["disabled"] = existing.get("disabled", False)
         existing_url = existing.get("url")
         if isinstance(existing_url, str) and existing_url.strip():
             entry["url"] = existing_url
@@ -307,19 +174,9 @@ def _workbuddy_mcp_entry(existing: Any) -> dict[str, Any]:
     return entry
 
 
-def _is_legacy_workbuddy_mcp_entry(existing: dict[str, Any]) -> bool:
-    return existing == {
-        "type": "http",
-        "url": WORKBUDDY_LEGACY_MCP_URL,
-        "headers": {},
-        "description": WORKBUDDY_MCP_DESCRIPTION,
-        "disabled": False,
-    }
-
-
 def require_replaceable_workbuddy_skill(target: Path) -> None:
     if target.exists() and not _owned_workbuddy_skill(target):
-        raise SetupError.workbuddy_skill_conflict(target)
+        raise SetupError(f"WorkBuddy Skill path {target} already exists and is not owned by PowerContext.")  # noqa: TRY003
 
 
 def _owned_workbuddy_skill(path: Path) -> bool:
@@ -337,23 +194,24 @@ def _install_workbuddy_skill(plugin_dir: Path, skills_dir: Path, hooks_dir: Path
     target = skills_dir / WORKBUDDY_SKILL_NAME
     try:
         skills_dir.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(source, target)
-        for skill_markdown in target.rglob("*.md"):
-            content = skill_markdown.read_text(encoding="utf-8")
-            content = content.replace(WORKBUDDY_PYTHON_PLACEHOLDER, _shell_argument(_python_executable()))
-            content = content.replace(
-                WORKBUDDY_SCOPE_BINDING_PLACEHOLDER,
-                _shell_argument((hooks_dir / WORKBUDDY_SCOPE_RESOLVER).as_posix()),
-            )
-            skill_markdown.write_text(content, encoding="utf-8")
-        (target / WORKBUDDY_SKILL_MANIFEST).write_text(
-            json.dumps({"schema": 1, "owner": "powercontext", "integration": "workbuddy"}, indent=2) + "\n",
-            encoding="utf-8",
+        refresh_skill(
+            source,
+            target,
+            replacements={
+                WORKBUDDY_PYTHON_PLACEHOLDER: _shell_argument(_python_executable()),
+                WORKBUDDY_SCOPE_BINDING_PLACEHOLDER: _shell_argument((hooks_dir / WORKBUDDY_SCOPE_RESOLVER).as_posix()),
+            },
+        )
+        write_if_changed(
+            target / WORKBUDDY_SKILL_MANIFEST,
+            (json.dumps({"schema": 1, "owner": "powercontext", "integration": "workbuddy"}, indent=2) + "\n").encode(
+                "utf-8"
+            ),
         )
     except OSError as error:
-        raise SetupError.workbuddy_skill_write(target, error) from error
+        raise SetupError(f"Cannot install PowerContext WorkBuddy skill at {target}: {error}") from error  # noqa: TRY003
+    except GuidanceError as error:
+        raise SetupError(str(error)) from error
 
 
 def _upsert_powercontext_hook(matchers: list[Any], hooks_dir: Path, settings_file: Path) -> None:
@@ -367,13 +225,13 @@ def _upsert_powercontext_hook(matchers: list[Any], hooks_dir: Path, settings_fil
     }
     for matcher in matchers:
         if not isinstance(matcher, dict):
-            raise SetupError.invalid_workbuddy_settings(settings_file)
+            raise SetupError(f"WorkBuddy settings at {settings_file} must contain a JSON object with a hooks mapping.")  # noqa: TRY003
         matcher_dict = cast(dict[str, Any], matcher)
         group = matcher_dict.get("hooks")
         if group is None:
             continue
         if not isinstance(group, list):
-            raise SetupError.invalid_workbuddy_settings(settings_file)
+            raise SetupError(f"WorkBuddy settings at {settings_file} must contain a JSON object with a hooks mapping.")  # noqa: TRY003
         group_list = cast(list[Any], group)
         for index, existing in enumerate(group_list):
             if isinstance(existing, dict) and _is_powercontext_hook(cast(dict[str, Any], existing)):
@@ -442,6 +300,8 @@ def _mcp_diagnostic(mcp_file: Path) -> Diagnostic:
             status=DiagnosticStatus.FAILED,
             detail="PowerContext WorkBuddy MCP server is not registered in mcp.json",
         )
+    if servers[WORKBUDDY_PLUGIN_NAME].get("disabled") is True:
+        return Diagnostic(DiagnosticStatus.FAILED, "PowerContext MCP is disabled; enable it in WorkBuddy")
     return Diagnostic(status=DiagnosticStatus.OK, detail=str(mcp_file))
 
 
@@ -479,38 +339,6 @@ def _settings_have_powercontext_hook(settings: dict[str, Any]) -> bool:
     return False
 
 
-def _is_workbuddy_plugin(path: Path) -> bool:
-    hooks = path / WORKBUDDY_HOOKS_DIRNAME
-    scripts = path / "scripts"
-    skill_markdown = path / WORKBUDDY_SKILLS_DIRNAME / WORKBUDDY_SKILL_NAME / "SKILL.md"
-    return (
-        all((hooks / name).is_file() for name in WORKBUDDY_HOOK_MODULES)
-        and all((scripts / name).is_file() for name in WORKBUDDY_SCRIPT_MODULES)
-        and skill_markdown.is_file()
-    )
-
-
-def _materialize_remote_checkout(source: str, ref: str) -> Path:
-    target = checkout_target(source, ref)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = _new_staging_directory(target)
-    shutil.rmtree(staging)
-    try:
-        _clone_github_source(source, ref, staging)
-        _replace_directory(staging, target)
-    except BaseException:
-        _remove_path(staging)
-        raise
-    return target
-
-
-def _clone_github_source(source: str, ref: str, target: Path) -> None:
-    try:
-        clone_github_source(source, ref, target)
-    except InvalidGitHubSourceError:
-        raise SetupError.invalid_workbuddy_source(source) from None
-
-
 def _load_json_object(
     path: Path,
     *,
@@ -530,98 +358,65 @@ def _load_json_object(
     return cast(dict[str, Any], payload)
 
 
-def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
-    _write_bytes_atomically(path, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+__all__ = ["WORKBUDDY_PLUGIN_NAME", "require_workbuddy_plugin", "workbuddy_home"]
 
 
-def _write_bytes_atomically(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.write(descriptor, content)
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        os.replace(temporary, path)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        with suppress(FileNotFoundError):
-            temporary.unlink()
+class WorkBuddyInstaller:
+    def install(self, source):
+        root = workbuddy_home()
+        require_replaceable_workbuddy_skill(root / WORKBUDDY_SKILLS_DIRNAME / WORKBUDDY_SKILL_NAME)
+        with source.package("workbuddy") as package:
+            require_workbuddy_plugin(package)
+            hooks = root / WORKBUDDY_HOOKS_DIRNAME
+            skill = root / WORKBUDDY_SKILLS_DIRNAME / WORKBUDDY_SKILL_NAME
+            root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".powercontext-", dir=root) as temporary:
+                staging = Path(temporary)
+                staged_hooks, staged_skills = staging / "hooks", staging / "skills"
+                if skill.exists():
+                    shutil.copytree(skill, staged_skills / WORKBUDDY_SKILL_NAME, symlinks=True)
+                settings_file = root / "settings.json"
+                _install_hook_files(package, staged_hooks)
+                _install_workbuddy_skill(package, staged_skills, hooks)
+                candidate = staging / "settings.json"
+                if settings_file.exists():
+                    shutil.copy2(settings_file, candidate)
+                _merge_workbuddy_settings(candidate, hooks)
+                replacements = [
+                    (staged_hooks / name, hooks / name) for name in (*WORKBUDDY_HOOK_MODULES, WORKBUDDY_SCOPE_RESOLVER)
+                ]
+                replacements.append((staged_skills / WORKBUDDY_SKILL_NAME, skill))
+                publish(replacements, {settings_file: candidate.read_bytes()})
+            return {
+                "plugin": WORKBUDDY_PLUGIN_NAME,
+                "plugin_path": str(root),
+                "workbuddy_home": str(root),
+                "hooks_dir": str(hooks),
+                "data_dir": str(powercontext_data_dir()),
+            }
 
+    def configure(self, connection):
+        if not (workbuddy_home() / "hooks" / WORKBUDDY_HOOK_MODULES[0]).is_file():
+            raise SetupError("PowerContext is not installed in workbuddy; run powercontext setup workbuddy")  # noqa: TRY003
+        root = workbuddy_home()
+        path = root / "mcp.json"
+        with tempfile.TemporaryDirectory(prefix=".powercontext-", dir=root) as temporary:
+            candidate = Path(temporary) / "mcp.json"
+            if path.exists():
+                shutil.copy2(path, candidate)
+            _merge_workbuddy_mcp(candidate, server_url=connection.server_url)
+            state = configure_connection(connection, writes={path: candidate.read_bytes()})
+        return {"authorization_state": state}
 
-def _read_bytes_or_none(path: Path, *, io_error: Callable[[OSError], SetupError]) -> bytes | None:
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        raise io_error(error) from error
+    def verify(self) -> dict[str, Diagnostic]:
+        """Collect diagnostics for the optional WorkBuddy integration."""
 
-
-def _snapshot_directory(path: Path) -> Path | None:
-    if not path.is_dir():
-        return None
-    backup = Path(tempfile.mkdtemp(prefix=f".{path.name}-rollback-"))
-    shutil.rmtree(backup)
-    shutil.copytree(path, backup)
-    return backup
-
-
-def _restore_file(path: Path, original: bytes | None) -> None:
-    if original is None:
-        path.unlink(missing_ok=True)
-        return
-    _write_bytes_atomically(path, original)
-
-
-def _restore_directory(path: Path, backup: Path | None) -> None:
-    _remove_path(path)
-    if backup is not None and backup.is_dir():
-        shutil.copytree(backup, path)
-
-
-def _new_staging_directory(target: Path) -> Path:
-    return Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))
-
-
-def _replace_directory(staging: Path, target: Path) -> None:
-    backup = target.with_name(f".{target.name}.backup-{uuid.uuid4().hex}")
-    moved_old = False
-    try:
-        if target.exists() or target.is_symlink():
-            os.replace(target, backup)
-            moved_old = True
-        os.replace(staging, target)
-    except BaseException:
-        if moved_old and not (target.exists() or target.is_symlink()) and backup.exists():
-            os.replace(backup, target)
-        raise
-    finally:
-        _remove_path(staging)
-        _remove_path(backup)
-
-
-def _remove_path(path: Path | None) -> None:
-    if path is None:
-        return
-    if path.is_symlink() or path.is_file():
-        path.unlink(missing_ok=True)
-    elif path.is_dir():
-        shutil.rmtree(path)
-
-
-__all__ = [
-    "WORKBUDDY_PLUGIN_NAME",
-    "WorkBuddySetupResult",
-    "checkout_target",
-    "github_clone_url",
-    "install_workbuddy_plugin",
-    "plugin_dir_from_checkout",
-    "require_workbuddy_plugin",
-    "resolve_workbuddy_plugin_dir",
-    "run_workbuddy_diagnostics",
-    "workbuddy_home",
-]
+        home = workbuddy_home()
+        hooks_dir = home / WORKBUDDY_HOOKS_DIRNAME
+        skill_file = home / WORKBUDDY_SKILLS_DIRNAME / WORKBUDDY_SKILL_NAME / "SKILL.md"
+        return {
+            "hooks": _hooks_diagnostic(hooks_dir),
+            "settings": _settings_diagnostic(home / "settings.json"),
+            "mcp": _mcp_diagnostic(home / "mcp.json"),
+            "skill": _skill_diagnostic(skill_file),
+        }

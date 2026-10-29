@@ -63,6 +63,8 @@ header:
     - '**/py.typed'
     - 'src/powercontext/http/_generated/**'
     # Vendored distributions retain their upstream licenses and copyright notices.
+    - 'LICENSES/**'
+    - 'src/powercontext/builtin/artifacts/lexical_data/*.txt'
     - 'src/powercontext/server/dashboard/static/vendor/**'
     - '.gitattributes'
     - '**/*.service.in'

@@ -22,6 +22,9 @@ from pydantic import ValidationError
 
 from powercontext.artifacts import ArtifactRef
 from powercontext.artifacts.search import ArtifactSearchOutcome
+from powercontext.builtin.artifacts.atomic_memory.models import (
+    AtomicMemoryContent as RuntimeAtomicMemoryContent,
+)
 from powercontext.builtin.artifacts.atomic_memory.models import AtomicMemoryMutationResult
 from powercontext.builtin.artifacts.experience import (
     Experience,
@@ -37,6 +40,7 @@ from powercontext.builtin.artifacts.handoff.generation_metadata import (
 )
 from powercontext.builtin.artifacts.profile.models import ProfileCandidateProposal as RuntimeProfileCandidateProposal
 from powercontext.builtin.artifacts.profile.models import ProfileWriteContent as RuntimeProfileWriteContent
+from powercontext.builtin.artifacts.prompt.models import PromptContent as RuntimePromptContent
 from powercontext.builtin.artifacts.skill import (
     ExternalSkillProviderScan,
     Skill,
@@ -50,9 +54,16 @@ from powercontext.builtin.artifacts.skill import (
     ExternalSkillResolution as RuntimeExternalSkillResolution,
 )
 from powercontext.builtin.artifacts.topic_memory import PublishedTopicMemory, TopicMemorySearchResult
+from powercontext.builtin.artifacts.topic_memory.models import TopicMemoryContent as RuntimeTopicMemoryContent
+from powercontext.builtin.catalog_changes.models import (
+    CatalogChangeCandidate as RuntimeTagCandidate,
+)
+from powercontext.builtin.catalog_changes.models import (
+    CatalogChangeProposal as RuntimeTagProposal,
+)
 from powercontext.builtin.persistence.artifact_governance import ArtifactGovernance
-from powercontext.builtin.review import ArtifactCandidate as RuntimeArtifactCandidate
-from powercontext.builtin.review import ArtifactCandidatePage as RuntimeArtifactCandidatePage
+from powercontext.builtin.review import Candidate as RuntimeCandidate
+from powercontext.builtin.review import CandidatePage as RuntimeCandidatePage
 from powercontext.builtin.review import CandidateStatus as RuntimeCandidateStatus
 from powercontext.builtin.review.generation import (
     GeneratedCandidateResult as RuntimeGeneratedCandidateResult,
@@ -61,6 +72,7 @@ from powercontext.builtin.review.generation import SkillGenerationOrigin as Runt
 from powercontext.builtin.runtime import (
     ActivateHandoff,
     CaptureSource,
+    CaptureWorkingNote,
     Handoff,
     HandoffActivation,
     HandoffArtifactCitation,
@@ -82,8 +94,11 @@ from powercontext.builtin.runtime import (
     TopicMemoryFlushResult,
 )
 from powercontext.builtin.runtime import (
-    ApproveArtifactCandidateRequest as RuntimeApproveArtifactCandidateRequest,
+    ApproveCandidateRequest as RuntimeApproveCandidateRequest,
 )
+from powercontext.builtin.runtime import BootstrapContext as RuntimeBootstrapContext
+from powercontext.builtin.runtime import BootstrapContextRequest as RuntimeBootstrapContextRequest
+from powercontext.builtin.runtime import BootstrapDeliveryReceipt as RuntimeBootstrapDeliveryReceipt
 from powercontext.builtin.runtime import (
     CommitConnectorCheckpoint as RuntimeCommitConnectorCheckpoint,
 )
@@ -97,7 +112,7 @@ from powercontext.builtin.runtime import (
     GenerateSkillRequest as RuntimeGenerateSkillRequest,
 )
 from powercontext.builtin.runtime import (
-    GetArtifactCandidateRequest as RuntimeGetArtifactCandidateRequest,
+    GetCandidateRequest as RuntimeGetCandidateRequest,
 )
 from powercontext.builtin.runtime import (
     GetExperienceRequest as RuntimeGetExperienceRequest,
@@ -108,19 +123,20 @@ from powercontext.builtin.runtime import (
     ImportExternalSkillRequest as RuntimeImportExternalSkillRequest,
 )
 from powercontext.builtin.runtime import (
-    ListArtifactCandidatesRequest as RuntimeListArtifactCandidatesRequest,
+    ListCandidatesRequest as RuntimeListCandidatesRequest,
 )
 from powercontext.builtin.runtime import ListExternalSkillsRequest as RuntimeListExternalSkillsRequest
 from powercontext.builtin.runtime import (
     ProposeExperienceRequest as RuntimeProposeExperienceRequest,
 )
 from powercontext.builtin.runtime import ProposeSkillRequest as RuntimeProposeSkillRequest
+from powercontext.builtin.runtime import RecordBootstrapDeliveryRequest as RuntimeRecordBootstrapDeliveryRequest
 from powercontext.builtin.runtime import (
-    RejectArtifactCandidateRequest as RuntimeRejectArtifactCandidateRequest,
+    RejectCandidateRequest as RuntimeRejectCandidateRequest,
 )
 from powercontext.builtin.runtime import ResolveExternalSkillRequest as RuntimeResolveExternalSkillRequest
 from powercontext.builtin.runtime import (
-    ReviseArtifactCandidateRequest as RuntimeReviseArtifactCandidateRequest,
+    ReviseCandidateRequest as RuntimeReviseCandidateRequest,
 )
 from powercontext.builtin.runtime import SearchTopicMemoryRequest as RuntimeSearchTopicMemoryRequest
 from powercontext.builtin.runtime import (
@@ -129,6 +145,7 @@ from powercontext.builtin.runtime import (
 from powercontext.builtin.runtime import (
     SubmitSourceObservation as RuntimeSubmitSourceObservation,
 )
+from powercontext.builtin.runtime import WorkingNoteKind as RuntimeWorkingNoteKind
 from powercontext.builtin.runtime.atomic_memory import AtomicMemoryPage, AtomicMemorySearchPage
 from powercontext.builtin.sources import ExternalSkillImportMode as RuntimeExternalSkillImportMode
 from powercontext.builtin.work import (
@@ -157,15 +174,20 @@ from powercontext.builtin.work import WorkSourceReceipt as RuntimeWorkSourceRece
 from powercontext.http import (
     AcknowledgeHandoffRequest,
     ActivateHandoffRequest,
-    ApproveArtifactCandidateRequest,
-    ArtifactCandidate,
-    ArtifactCandidatePage,
+    ApproveCandidateRequest,
     ArtifactReference,
+    BootstrapDeliveryReceipt,
+    Candidate,
+    CandidateAudit,
     CandidateFamily,
+    CandidateKind,
+    CandidatePage,
     CandidateStatus,
     CaptureContentSourceRequest,
     CaptureContentSourceResponse,
     CaptureStatus,
+    CaptureWorkingNoteRequest,
+    CatalogChangeProposal,
     CommitConnectorCheckpointRequest,
     CommittedHandoff,
     ConnectorCheckpointState,
@@ -184,7 +206,7 @@ from powercontext.http import (
     GeneratedCandidateStatus,
     GenerateExperienceRequest,
     GenerateSkillRequest,
-    GetArtifactCandidateRequest,
+    GetCandidateRequest,
     GetConnectorCheckpointRequest,
     GetExperienceRequest,
     GetSkillRequest,
@@ -199,7 +221,7 @@ from powercontext.http import (
     HandoffSchema,
     HandoffSelection,
     ImportExternalSkillRequest,
-    ListArtifactCandidatesRequest,
+    ListCandidatesRequest,
     ListExternalSkillsRequest,
     ListExternalSkillsResponse,
     ListMemoryEntriesResponse,
@@ -212,12 +234,13 @@ from powercontext.http import (
     PrepareHandoffRequest,
     ProfileCandidateProposal,
     ProfileWriteContent,
+    PromptContent,
     ProposeExperienceRequest,
     ProposeSkillRequest,
     RecordTaskOutcomeRequest,
-    RejectArtifactCandidateRequest,
+    RejectCandidateRequest,
     ResolveExternalSkillRequest,
-    ReviseArtifactCandidateRequest,
+    ReviseCandidateRequest,
     ScanExternalSkillsResponse,
     ScopedStats,
     SearchArtifactsResponse,
@@ -238,6 +261,7 @@ from powercontext.http import (
     SubmitSourceObservationRequest,
     TaskCheck,
     TopicMemoryArtifact,
+    TopicMemoryDreamProposal,
     TopicMemoryFlushStatus,
     TopicMemoryMatchedBy,
     TopicMemoryUsedSearchMode,
@@ -245,6 +269,11 @@ from powercontext.http import (
     WorkSourceKind,
     WorkSourceReceipt,
 )
+from powercontext.http import (
+    AtomicMemoryWriteContent as AtomicMemoryContent,
+)
+from powercontext.http import BootstrapContext as TransportBootstrapContext
+from powercontext.http import BootstrapContextRequest as TransportBootstrapContextRequest
 from powercontext.http import ConnectorBinding as HttpConnectorBinding
 from powercontext.http import (
     FailureRecord as TransportFailureRecord,
@@ -296,6 +325,7 @@ from powercontext.http import (
 from powercontext.http import (
     PreparedHandoff as TransportPreparedHandoff,
 )
+from powercontext.http import RecordBootstrapDeliveryRequest as TransportRecordBootstrapDeliveryRequest
 from powercontext.http import RepairSurface as TransportRepairSurface
 from powercontext.server.atomic_memory import record_response
 from powercontext.sources import (
@@ -313,8 +343,6 @@ from powercontext.sources import SourceRef
 def artifact_search_response(outcome: ArtifactSearchOutcome, /, *, include_scores: bool) -> SearchArtifactsResponse:
     """Serialize actual Artifact content while retaining the Family's final match order."""
 
-    if outcome.artifacts is None:
-        raise ValueError("public Artifact search requires complete Artifacts")  # noqa: TRY003
     results: list[dict[str, Any]] = []
     for match, artifact in zip(outcome.matches, outcome.artifacts, strict=True):
         item: dict[str, Any] = {
@@ -344,6 +372,19 @@ def capture_request(value: CaptureContentSourceRequest) -> CaptureSource:
         content=value.content,
         metadata={} if value.metadata is None else value.metadata,
     )
+
+
+def working_note_capture_request(value: CaptureWorkingNoteRequest) -> CaptureWorkingNote:
+    try:
+        return CaptureWorkingNote(
+            source_id=value.source_id,
+            content=value.content,
+            session_id=value.session_id,
+            note_kind=RuntimeWorkingNoteKind(value.note_kind.value),
+            expires_at=value.expires_at,
+        )
+    except (TypeError, ValueError, ValidationError) as error:
+        raise InvalidRuntimeRequestError("working-note") from error
 
 
 def create_work_contract_request(value: CreateWorkContractRequest) -> RuntimeCreateWorkContract:
@@ -599,8 +640,9 @@ def get_skill_request(value: GetSkillRequest) -> RuntimeGetSkillRequest:
     return RuntimeGetSkillRequest(artifact=runtime_artifact_reference(value.artifact))
 
 
-def list_candidates_request(value: ListArtifactCandidatesRequest) -> RuntimeListArtifactCandidatesRequest:
-    return RuntimeListArtifactCandidatesRequest(
+def list_candidates_request(value: ListCandidatesRequest) -> RuntimeListCandidatesRequest:
+    return RuntimeListCandidatesRequest(
+        candidate_kind=None if value.candidate_kind is None else value.candidate_kind.value,
         status=RuntimeCandidateStatus(value.status.value),
         family=None if value.family is None else value.family.value,
         cursor=value.cursor,
@@ -608,32 +650,64 @@ def list_candidates_request(value: ListArtifactCandidatesRequest) -> RuntimeList
     )
 
 
-def get_candidate_request(value: GetArtifactCandidateRequest) -> RuntimeGetArtifactCandidateRequest:
-    return RuntimeGetArtifactCandidateRequest(candidate_id=value.candidate_id)
+def get_candidate_request(value: GetCandidateRequest) -> RuntimeGetCandidateRequest:
+    return RuntimeGetCandidateRequest(candidate_id=value.candidate_id)
 
 
-def approve_candidate_request(value: ApproveArtifactCandidateRequest) -> RuntimeApproveArtifactCandidateRequest:
-    return RuntimeApproveArtifactCandidateRequest(
+def approve_candidate_request(value: ApproveCandidateRequest) -> RuntimeApproveCandidateRequest:
+    return RuntimeApproveCandidateRequest(
         candidate_id=value.candidate_id,
         expected_version=value.expected_version,
     )
 
 
-def reject_candidate_request(value: RejectArtifactCandidateRequest) -> RuntimeRejectArtifactCandidateRequest:
-    return RuntimeRejectArtifactCandidateRequest(
+def reject_candidate_request(value: RejectCandidateRequest) -> RuntimeRejectCandidateRequest:
+    return RuntimeRejectCandidateRequest(
         candidate_id=value.candidate_id,
         expected_version=value.expected_version,
         reason=value.reason,
     )
 
 
-def revise_candidate_request(value: ReviseArtifactCandidateRequest) -> RuntimeReviseArtifactCandidateRequest:
-    return RuntimeReviseArtifactCandidateRequest(
+def revise_candidate_request(value: ReviseCandidateRequest) -> RuntimeReviseCandidateRequest:
+    from powercontext.builtin.review.errors import InvalidCandidateError
+
+    tag = isinstance(value.proposal, CatalogChangeProposal)
+    if (value.sources is not None or value.artifacts is not None) and not tag:
+        raise InvalidCandidateError("evidence", "sources/artifacts are only accepted for Tag proposals")
+    if (value.sources is not None and "source_refs" in value.model_fields_set) or (
+        value.artifacts is not None and "artifact_refs" in value.model_fields_set
+    ):
+        raise InvalidCandidateError("evidence", "use one spelling for each evidence collection")
+    sources = (
+        None if value.source_refs is None else tuple(runtime_source_reference(source) for source in value.source_refs)
+    )
+    artifacts = (
+        None
+        if value.artifact_refs is None
+        else tuple(runtime_artifact_reference(artifact) for artifact in value.artifact_refs)
+    )
+    if tag:
+        sources = (
+            (None if "source_refs" not in value.model_fields_set else sources)
+            if value.sources is None
+            else tuple(
+                SourceRef(source_type=source.source_type, source_id=source.source_id) for source in value.sources
+            )
+        )
+        artifacts = (
+            (None if "artifact_refs" not in value.model_fields_set else artifacts)
+            if value.artifacts is None
+            else tuple(runtime_artifact_reference(ref) for ref in value.artifacts)
+        )
+    return RuntimeReviseCandidateRequest(
         candidate_id=value.candidate_id,
         expected_version=value.expected_version,
-        proposal=reviewed_content(value.proposal),
-        sources=tuple(runtime_source_reference(source) for source in value.source_refs),
-        artifacts=tuple(runtime_artifact_reference(artifact) for artifact in value.artifact_refs),
+        proposal=RuntimeTagProposal.model_validate_json(value.proposal.model_dump_json())
+        if tag
+        else reviewed_content(value.proposal),
+        sources=sources,
+        artifacts=artifacts,
         target=None if value.target is None else runtime_artifact_reference(value.target),
         reason=value.reason,
     )
@@ -651,10 +725,23 @@ def prepare_context_request(value: TransportPrepareContextRequest) -> PrepareCon
     return PrepareContextRequest.model_validate_json(value.model_dump_json(exclude={"scope_id"}, exclude_unset=True))
 
 
+def bootstrap_context_request(value: TransportBootstrapContextRequest) -> RuntimeBootstrapContextRequest:
+    return RuntimeBootstrapContextRequest.model_validate_json(
+        value.model_dump_json(exclude={"scope_id"}, exclude_unset=True)
+    )
+
+
+def record_bootstrap_delivery_request(
+    value: TransportRecordBootstrapDeliveryRequest,
+) -> RuntimeRecordBootstrapDeliveryRequest:
+    return RuntimeRecordBootstrapDeliveryRequest.model_validate_json(value.model_dump_json(exclude={"scope_id"}))
+
+
 def activate_handoff_request(value: ActivateHandoffRequest) -> ActivateHandoff:
     return ActivateHandoff(
         boundary_source=runtime_source_reference(value.boundary_source),
         objective=value.objective,
+        rollover_reasons=tuple(reason.value for reason in value.rollover_reasons),
         evidence=tuple(runtime_handoff_citation(citation) for citation in value.evidence),
         max_bytes=value.max_bytes,
     )
@@ -673,6 +760,7 @@ def handoff_activation_response(value: HandoffActivation) -> TransportHandoffAct
 def prepare_handoff_request(value: PrepareHandoffRequest) -> PrepareHandoff:
     return PrepareHandoff(
         objective=value.objective,
+        rollover_reasons=tuple(reason.value for reason in value.rollover_reasons),
         evidence=tuple(runtime_handoff_citation(citation) for citation in value.evidence),
         max_bytes=value.max_bytes,
     )
@@ -801,12 +889,25 @@ def topic_memory_response(value: PublishedTopicMemory) -> TopicMemoryArtifact:
 
 
 def prepared_context_response(value: PreparedContext) -> TransportPreparedContext:
-    return TransportPreparedContext.model_validate({
+    payload: dict[str, object] = {
         "schema": PreparedContextSchema(value.schema_version),
         "status": PreparedContextStatus(value.status),
         "content": value.content,
         "content_bytes": value.content_bytes,
-    })
+    }
+    if value.reason is not None:
+        # Named on purpose rather than dumped: the four fields above are what every Host validates,
+        # so this key appears only on a preparation that asked for it with ``explain``.
+        payload["reason"] = value.reason
+    return TransportPreparedContext.model_validate(payload)
+
+
+def bootstrap_context_response(value: RuntimeBootstrapContext) -> TransportBootstrapContext:
+    return TransportBootstrapContext.model_validate_json(value.model_dump_json(by_alias=True))
+
+
+def bootstrap_delivery_response(value: RuntimeBootstrapDeliveryReceipt) -> BootstrapDeliveryReceipt:
+    return BootstrapDeliveryReceipt.model_validate_json(value.model_dump_json())
 
 
 def entries_response(value: AtomicMemoryPage) -> ListMemoryEntriesResponse:
@@ -819,8 +920,33 @@ def mutation_response(value: AtomicMemoryMutationResult) -> MemoryMutationRespon
     return MemoryMutationResponse(changed=value.changed, records=[record_response(item) for item in value.records])
 
 
-def candidate_response(value: RuntimeArtifactCandidate[Any]) -> ArtifactCandidate:
-    return ArtifactCandidate(
+def candidate_response(value: RuntimeCandidate[Any] | RuntimeTagCandidate) -> Candidate:
+    if isinstance(value, RuntimeTagCandidate):
+        return Candidate.model_validate({
+            "candidate_kind": "tag",
+            "candidate_id": value.candidate_id,
+            "version": value.version,
+            "family": CandidateFamily(value.proposal.target.family),
+            "status": CandidateStatus(value.status),
+            "proposal": CatalogChangeProposal.model_validate_json(value.proposal.model_dump_json()),
+            "source_refs": [source_reference(ref) for ref in value.sources],
+            "artifact_refs": [artifact_reference(ref) for ref in value.artifacts],
+            "target": None,
+            "reason": value.reason,
+            "result_artifact": None,
+            "decision_reason": value.decision_reason,
+            "audit": None
+            if value.audit is None
+            else CandidateAudit.model_validate(value.audit.model_dump(mode="json")),
+            "result": None
+            if value.result is None
+            else {**value.result.model_dump(mode="json"), "etag": value.result.etag},
+            "operation": value.operation,
+            "origin": value.origin,
+            "dream_run_id": value.dream_run_id,
+        })
+    return Candidate(
+        candidate_kind=CandidateKind.ARTIFACT,
         candidate_id=value.candidate_id,
         version=value.version,
         family=CandidateFamily(value.family),
@@ -832,6 +958,7 @@ def candidate_response(value: RuntimeArtifactCandidate[Any]) -> ArtifactCandidat
         reason=value.reason,
         result_artifact=None if value.result_artifact is None else artifact_reference(value.result_artifact),
         decision_reason=value.decision_reason,
+        audit=None if value.audit is None else CandidateAudit.model_validate(value.audit.model_dump(mode="json")),
     )
 
 
@@ -842,8 +969,8 @@ def generated_candidate_response(value: RuntimeGeneratedCandidateResult) -> Gene
     )
 
 
-def candidate_page_response(value: RuntimeArtifactCandidatePage[Any]) -> ArtifactCandidatePage:
-    return ArtifactCandidatePage(
+def candidate_page_response(value: RuntimeCandidatePage[Any]) -> CandidatePage:
+    return CandidatePage(
         candidates=[candidate_response(candidate) for candidate in value.candidates],
         next_cursor=value.next_cursor,
     )
@@ -1009,8 +1136,30 @@ def skill_proposal(value: SkillContent) -> SkillProposal:
 
 
 def reviewed_content(
-    value: ExperienceProposal | SkillProposal | ProfileWriteContent,
-) -> ExperienceContent | SkillContent | RuntimeProfileWriteContent:
+    value: ExperienceProposal
+    | SkillProposal
+    | ProfileWriteContent
+    | AtomicMemoryContent
+    | TopicMemoryDreamProposal
+    | TransportHandoffContent
+    | PromptContent,
+) -> (
+    ExperienceContent
+    | SkillContent
+    | RuntimeProfileWriteContent
+    | RuntimeAtomicMemoryContent
+    | RuntimeTopicMemoryContent
+    | HandoffContent
+    | RuntimePromptContent
+):
+    if isinstance(value, PromptContent):
+        return RuntimePromptContent.model_validate_json(value.model_dump_json())
+    if isinstance(value, TransportHandoffContent):
+        return runtime_handoff_content(value)
+    if isinstance(value, TopicMemoryDreamProposal):
+        return RuntimeTopicMemoryContent.model_validate(value.model_dump(mode="json"))
+    if isinstance(value, AtomicMemoryContent):
+        return RuntimeAtomicMemoryContent.model_validate(value.model_dump(mode="json"))
     if isinstance(value, ProfileWriteContent):
         return RuntimeProfileWriteContent.model_validate(value.model_dump(mode="json"))
     if isinstance(value, ExperienceProposal):
@@ -1018,7 +1167,25 @@ def reviewed_content(
     return skill_content(value)
 
 
-def reviewed_proposal(value: object) -> ExperienceProposal | SkillProposal | ProfileCandidateProposal:
+def reviewed_proposal(
+    value: object,
+) -> (
+    ExperienceProposal
+    | SkillProposal
+    | ProfileCandidateProposal
+    | AtomicMemoryContent
+    | TopicMemoryDreamProposal
+    | TransportHandoffContent
+    | PromptContent
+):
+    if isinstance(value, RuntimePromptContent):
+        return PromptContent.model_validate_json(value.model_dump_json())
+    if isinstance(value, HandoffContent):
+        return handoff_content(value)
+    if isinstance(value, RuntimeTopicMemoryContent):
+        return TopicMemoryDreamProposal.model_validate(value.model_dump(mode="json"))
+    if isinstance(value, RuntimeAtomicMemoryContent):
+        return AtomicMemoryContent.model_validate(value.model_dump(mode="json", by_alias=True, exclude={"creation"}))
     if isinstance(value, RuntimeProfileCandidateProposal):
         return ProfileCandidateProposal.model_validate(value.model_dump(mode="json", by_alias=True))
     if isinstance(value, ExperienceContent):

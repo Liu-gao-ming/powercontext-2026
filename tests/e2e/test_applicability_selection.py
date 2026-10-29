@@ -56,13 +56,13 @@ from powercontext.builtin.sources.content import ContentCapture
 from powercontext.builtin.sources.skill_usage import SkillUsageCapture
 from powercontext.client import ForbiddenResponseError, PowerContextClient
 from powercontext.http import (
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     ArtifactReference,
     CaptureContentSourceRequest,
     ExperienceProposal,
     ProposeExperienceRequest,
     ProposeSkillPackageRequest,
-    RejectArtifactCandidateRequest,
+    RejectCandidateRequest,
     SkillLifecycleState,
     UpdateSkillLifecycleRequest,
 )
@@ -71,6 +71,7 @@ from powercontext.server.authz import PrincipalRef
 from powercontext.server.authz.composition import open_builtin_access_control
 from powercontext.server.factory import create_server_app
 from powercontext.server.settings import AccessControlConfig, McpConfig, MetricsConfig, ServerSettings
+from tests.e2e.server_storage import prepare_server_database
 
 
 class Authentication:
@@ -85,20 +86,22 @@ class Authentication:
 @asynccontextmanager
 async def server(directory: Path) -> AsyncIterator[tuple[PowerContextClient, httpx.AsyncClient]]:
     database = SQLiteConfig(url=f"sqlite+aiosqlite:///{directory / 'selection.db'}")
+    settings = ServerSettings(
+        database=database,
+        runtime=RuntimeConfig(artifact_processing_families=()),
+        external_skills=ExternalSkillsConfig(),
+        access=AccessControlConfig(mode="enforced", deployment_id="selection"),
+        mcp=McpConfig(enabled=False),
+        metrics=MetricsConfig(enabled=False),
+    )
+    await asyncio.to_thread(prepare_server_database, settings)
     async with open_builtin_access_control(
         database,
         bootstrap_administrators=(PrincipalRef(type="service", id="admin"),),
         deployment_id="selection",
     ) as access:
         app = create_server_app(
-            settings=ServerSettings(
-                database=database,
-                runtime=RuntimeConfig(artifact_processing_families=()),
-                external_skills=ExternalSkillsConfig(),
-                access=AccessControlConfig(mode="enforced", deployment_id="selection"),
-                mcp=McpConfig(enabled=False),
-                metrics=MetricsConfig(enabled=False),
-            ),
+            settings=settings,
             authentication_provider=Authentication(),
             access_control=access,
             scheduler_path=directory / "scheduler.db",
@@ -141,8 +144,8 @@ async def propose(client: PowerContextClient, scope_id: str, name: str, *, incom
 
 
 async def approve(client: PowerContextClient, scope_id: str, pending) -> ArtifactReference:
-    approved = await client.approve_artifact_candidate(
-        ApproveArtifactCandidateRequest(
+    approved = await client.approve_candidate(
+        ApproveCandidateRequest(
             scope_id=scope_id,
             candidate_id=pending.candidate_id,
             expected_version=pending.version,
@@ -158,8 +161,8 @@ def test_authorized_catalog_excludes_unreviewed_retired_and_incompatible_package
             scope_id, references = await seed_fixture(client)
             await propose(client, scope_id, "http-contract-pending")
             rejected = await propose(client, scope_id, "http-contract-rejected")
-            await client.reject_artifact_candidate(
-                RejectArtifactCandidateRequest(
+            await client.reject_candidate(
+                RejectCandidateRequest(
                     scope_id=scope_id,
                     candidate_id=rejected.candidate_id,
                     expected_version=rejected.version,

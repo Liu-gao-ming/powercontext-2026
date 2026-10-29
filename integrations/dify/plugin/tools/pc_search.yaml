@@ -162,6 +162,8 @@ output_schema:
               score:
                 $ref: '#/definitions/Result/properties/hits/items/properties/score'
                 type: number
+                description: Raw RRF score. Hybrid mode applies the deployment's normalized
+                  relative FTS/vector weights.
               matched_by:
                 $ref: '#/definitions/Result/properties/hits/items/properties/matched_by'
                 type: array
@@ -249,6 +251,8 @@ output_schema:
                     - type: 'null'
               score:
                 type: number
+                description: Raw RRF score. Hybrid mode applies the deployment's normalized
+                  relative FTS/vector weights.
               matched_by:
                 type: array
                 items:

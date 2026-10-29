@@ -39,9 +39,9 @@ from powercontext.builtin.persistence.processing_intents import ArtifactProcessi
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.persistence.supervision import ArtifactProcessingLeaseRepository
 from powercontext.builtin.persistence.tables import (
-    ARTIFACT_CANDIDATE_HEADS_TABLE,
     ARTIFACT_HEADS_TABLE,
     BUILTIN_TABLES,
+    CANDIDATE_HEADS_TABLE,
     MODEL_USAGE_DAILY_TABLE,
 )
 from powercontext.builtin.records import ArtifactWrite
@@ -143,8 +143,18 @@ class _InferenceHandler(BaseHTTPRequestHandler):
         pass
 
 
-@pytest.mark.parametrize("family", ["memory", "experience", "profile"])
-def test_spawned_worker_restores_custom_prompt_and_counts_actual_requests_once(tmp_path, monkeypatch, family):
+@pytest.mark.parametrize(
+    ("family", "prompt_key"),
+    [
+        ("memory", "atomic_memory.extract"),
+        ("memory", "atomic_memory.reconcile"),
+        ("experience", "experience.incubate"),
+        ("profile", "profile.generate"),
+    ],
+)
+def test_spawned_worker_restores_custom_prompt_and_counts_actual_requests_once(
+    tmp_path, monkeypatch, family, prompt_key
+):
     # A configured loopback provider crosses the real spawn/serialization boundary:
     # no injected pipeline, model monkeypatch, or preconstructed PromptRegistry reaches the child.
     monkeypatch.setenv("OPENAI_API_KEY", "hermetic-worker-key")
@@ -171,11 +181,6 @@ def test_spawned_worker_restores_custom_prompt_and_counts_actual_requests_once(t
                 memory_extraction_profile=MemoryExtractionProfile.CONVERSATION,
             ),
         )
-        prompt_key = {
-            "memory": "atomic_memory.extract",
-            "experience": "experience.incubate",
-            "profile": "profile.generate",
-        }[family]
         marker = f"PERSISTED_CUSTOM_{family.upper()}_GUIDANCE"
         async with open_builtin_runtime(config) as runtime:
             assert runtime.scopes is not None
@@ -243,7 +248,7 @@ def test_spawned_worker_restores_custom_prompt_and_counts_actual_requests_once(t
                         completed is not None and completed.handled_generation == assignment.claimed_request_generation
                     )
                     assert completed.clean_generation == completed.dirty_generation
-                    generated = ARTIFACT_CANDIDATE_HEADS_TABLE if family == "experience" else ARTIFACT_HEADS_TABLE
+                    generated = CANDIDATE_HEADS_TABLE if family == "experience" else ARTIFACT_HEADS_TABLE
                     assert (
                         await connection.scalar(
                             select(func.count())
@@ -255,18 +260,22 @@ def test_spawned_worker_restores_custom_prompt_and_counts_actual_requests_once(t
                     assert await connection.scalar(select(func.count()).select_from(ACCESS_OWNERS_TABLE)) == 1
                     usage = (await connection.execute(select(MODEL_USAGE_DAILY_TABLE))).mappings().all()
                 generation = [row for row in usage if row["operation"] == "generation"]
-                if family == "profile":
-                    assert generation == []
-                else:
-                    assert len(generation) == 1
-                    assert generation[0]["scope_id"] == scope
-                    assert generation[0]["purpose"] == (
-                        "memory_extraction" if family == "memory" else "experience_generation"
-                    )
-                    requests = 2 if family == "memory" else 1
-                    assert generation[0]["requests"] == requests
-                    assert generation[0]["input_tokens"] == 11 * requests
-                    assert generation[0]["output_tokens"] == 13 * requests
+                assert len(generation) == 1
+                assert generation[0]["scope_id"] == scope
+                assert (
+                    generation[0]["purpose"]
+                    == {
+                        "memory": "memory_extraction",
+                        "experience": "experience_generation",
+                        "profile": "profile_generation",
+                    }[family]
+                )
+                # A custom extraction or reconciliation Prompt keeps the comparison of a candidate with nothing to
+                # compare, so each memory case makes two requests.
+                requests = 2 if family == "memory" else 1
+                assert generation[0]["requests"] == requests
+                assert generation[0]["input_tokens"] == 11 * requests
+                assert generation[0]["output_tokens"] == 13 * requests
                 embedding = [row for row in usage if row["operation"] == "embedding"]
                 if family == "memory":
                     assert len(embedding) == 1
@@ -279,8 +288,8 @@ def test_spawned_worker_restores_custom_prompt_and_counts_actual_requests_once(t
                 else:
                     assert embedding == []
                 calls = [payload for path, payload in server.requests if path == "/v1/chat/completions"]
-                assert len(calls) == (2 if family == "memory" else 1)
-                assert marker in json.dumps(calls[0])
+                assert len(calls) == requests
+                assert marker in json.dumps(calls[1 if prompt_key == "atomic_memory.reconcile" else 0])
                 assert len([path for path, _ in server.requests if path == "/v1/embeddings"]) == (
                     2 if family == "memory" else 0
                 )

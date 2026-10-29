@@ -1,6 +1,6 @@
 ---
 title: 常见问题
-description: 关于 Memory、Handoff、Experience、Skill 与知识生命周期的常见问题。
+description: 关于制品类型、证据、审核与 Agent 集成的常见问题。
 ---
 
 # 常见问题
@@ -8,30 +8,33 @@ description: 关于 Memory、Handoff、Experience、Skill 与知识生命周期�
 本页回答学习 PowerContext 时经常遇到的问题。更系统的概念介绍见[核心概念](./core-concepts.md)；具体操作步骤请
 参阅相应的工作流指南。
 
-## 四类 Artifact 速览
+## Artifact 速览
 
-**问：我经常看到 Memory、Handoff、Experience 和 Skill，应该分别在什么时候用？**
+**问：各种 Artifact 有什么区别，应该分别在什么时候用？**
 
-这四个 family 在同一个工作循环里扮演不同角色。想象一个 Agent 在修复 `amount.py` 中的 CSV 解析 bug：
+以 Agent 修复 `amount.py` 中的 CSV 金额解析 bug 为例，各类 Artifact 可以保存或配置以下内容：
 
 | Family | 在修复 bug 过程中扮演的角色 | 适用场景 |
 | --- | --- | --- |
-| **Memory** | 保存长期项目约定："金额以整数分存储；超过两位小数的输入必须拒绝。" | 跨越多个会话与 Agent 都应成立的事实、决策或规则。 |
-| **Handoff** | 记录"我已确认 bug 在 `cents()` 函数里；明天由下一个 Agent 跑失败的测试并打补丁。" | 把未完成工作的当前状态交接给另一个 Agent 或会话。 |
-| **Experience** | 记录已经验证的教训："直接调用 `int(Decimal(text) * 100)` 把 `1.999` 静默截断成了 `199`；现在我们在转换前先校验精度。" | 保留基于证据的情境教训。 |
-| **Skill** | 沉淀可复用流程："如何验证金额转换修复——运行测试夹具、检查边界、记录结果。" | 供其他 Agent 加载并遵循的、已验证的可复用配方。 |
+| **Atomic Memory** | 保存一条项目约定：“金额以整数分存储；超过两位小数的输入必须拒绝。” | 独立保存和更新事实、偏好、决策或规则，供后续会话检索。 |
+| **Topic Memory** | 围绕“CSV 金额处理”整理精度规则、边界输入和讨论依据，提供摘要与详细内容。 | 将同一主题的相关信息组织在一起，先查摘要，再按需展开。 |
+| **Profile** | 概括当前 Scope 的背景和协作习惯：“这是财务数据导入项目，团队偏好中文说明和可复现的验证步骤。” | 为后续交互提供用户、团队或项目的整体背景。 |
+| **Handoff** | 记录“我已确认 bug 在 `cents()` 函数里；明天由下一个 Agent 跑失败的测试并打补丁。” | 把未完成工作的当前状态交接给另一个 Agent 或会话。 |
+| **Experience** | 记录已经验证的教训：“直接调用 `int(Decimal(text) * 100)` 把 `1.999` 静默截断成了 `199`；现在我们在转换前先校验精度。” | 保留基于证据的情境教训。 |
+| **Skill** | 保存可复用流程：“如何验证金额转换修复——运行测试夹具、检查边界、记录结果。” | 供其他 Agent 加载并遵循的操作流程。 |
+| **Prompt** | 配置本 Scope 的记忆抽取指令，例如“提取金额约束时保留币种、精度和适用条件”。 | 调整支持自定义的操作提示词，并保留配置版本。 |
 
-一次 bug 修复通常会同时产生这四类内容：要遵守的约定（Memory）、移交的进展（Handoff）、学到的教训
-（Experience）、可复用的做法（Skill）。
+按后续用途选择需要保存的内容。各类制品有自己的写入或生成流程，采集一次 Source 不会自动产出表中的全部制品。
 
-详见 [Memory 与 Handoff](../workflows/memory-and-handoff.md) 以及
-[Experience 与 Skill 的生命周期](../workflows/experience-and-skill-lifecycle.md)。
+具体操作见[原子记忆](../workflows/atomic-memory.md)、[Topic Memory](../workflows/topic-memory.md)、
+[Scope 画像](../workflows/use-profiles.md)、[Memory 与 Handoff](../workflows/memory-and-handoff.md)、
+[Experience 与 Skill 的生命周期](../workflows/experience-and-skill-lifecycle.md)和[操作提示词](../workflows/manage-prompts.md)。
 
 ## Source、Candidate 与知识流水线
 
-**问：Source、Candidate 和已批准的 Artifact 是一条强制流水线吗？**
+**问：Source、Candidate 和 Artifact 是一条强制流水线吗？**
 
-不是。它们是可以组合的独立概念，但捕获证据本身不会产生已批准的知识：
+Source 保存输入证据，Artifact 保存有版本的结果。需要审核的流程通过 Candidate 提出变更：
 
 ```text
 Source（证据）──┐
@@ -41,51 +44,58 @@ Source（证据）──┐
 
 - **Source** 是原始证据——一轮对话、一次工具结果、一份文档。
 - **Candidate** 是从证据或已有 Artifact 派生的提案。在审核前处于 `pending` 状态。
-- **Artifact** 是审核批准后得到的产物——带有稳定引用的不可变 Revision。
+- **Artifact** 是已提交的制品，其每个 Revision 都不可变，并有精确引用。
 
-也可以通过 `remember_memory` 直接写入 Memory，跳过 Source 提取和 Candidate 审核。
+配置好生成模型和处理流程后，Atomic Memory、Topic Memory 可以直接从 Source 生成并提交；Profile 按策略自动提交或
+先进入审核。Experience、Skill 的生成提案通过 Candidate 审核后提交。
+
+人工写入使用各类制品支持的写入接口，例如通过 `remember_memory` 或通用 Artifact API 创建 Atomic Memory，无需
+模型提取或 Candidate 审核。
 
 **问：pending 状态的 Candidate 会被 `PreparedContext` 召回吗？**
 
-不会。pending Candidate 不参与召回。只有已批准的当前 Revision 才能进入 `PreparedContext`。这样可以防止
-未经审核的模型输出悄悄进入 Agent 的工作上下文。
+不会。pending Candidate 尚未提交为正式 Artifact，不参与召回。`PreparedContext` 从已提交的制品中选择内容，
+还会应用权限、生命周期和上下文配置等条件。例如，普通记忆召回只使用 active Atomic Memory 的当前版本；
+Profile 需要在 assembly 中显式选择。
 
 **问：我批准了一个 Skill Candidate，为什么 Agent 还用不了？**
 
 批准、安装和执行是三个独立步骤：
 
 1. **批准**在 PowerContext 中创建一个不可变的 Skill Revision。
-2. **导出 / 安装**把指定 Revision 复制到 Agent 宿主（例如通过 Remote Skill 分发，或手动调用
-   `download_skill_package`）。
-3. **执行**发生在 Agent 宿主发现并加载已安装的 `SKILL.md` 之后。
+2. **导出 / 安装**把精确 Revision 放到 Agent 宿主能发现的目录。Codex 用户按[创建与导出 Skill](../workflows/create-and-export-skill.md)
+   使用 `powercontext skill export --target codex`。仅通过 `download_skill_package` 下载包，不能证明已安装到宿主或已被发现。
+3. **发现与使用**发生在 Agent 宿主。确认它能发现导出的 `SKILL.md`；加载内容本身不会授予执行其中指令的权限。
 
 批准 Skill 不等于安装它；安装它也不等于执行它。每一步都是显式的，以便你掌控"什么内容在什么地方运行"。
 
-## Memory
+## Atomic Memory
 
-**问：Source 和 Memory 有什么区别？**
+**问：Source 和 Atomic Memory 有什么区别？**
 
 - **Source** 是原始证据：一条聊天消息、一份文件、一段 HTTP 调用记录。按原样保存。
-- **Memory** 是经过提炼的知识：一个决策、一条约束、一项事实。它是被刻意写入的（由应用显式写入，或由经过
-  批准的提取流程产生）。
+- **Atomic Memory** 保存一条可复用的事实、偏好、决策或约束。它可以由应用显式写入，也可以由模型从 Source 中
+  抽取，再与相关旧记忆比较，决定新建、更新或合并。
 
-Source 是输入；Memory 是策展后的结果。
+Source 保留依据；Atomic Memory 保存整理后的内容，并通过引用关联其依据。
 
-**问：我通过通用 Artifact API 创建了 Memory，但 `search_memory` 找不到，为什么？**
+**问：通过通用 Artifact API 创建的记忆，能被 `search_memory` 检索吗？**
 
-两条写入路径的效果不同：
+可以。创建时使用 `family=atomic-memory`。以下两条路径都会在指定 Scope 中创建独立的 Atomic Memory：
 
 | 路径 | 结果 |
 | --- | --- |
-| `POST /v1/scopes/{id}/artifacts`，`family=memory` | 创建独立的 Memory Artifact；**不参与**日常召回。 |
-| `POST /v1/memory/remember` | 写入 Scope 的默认 Memory；**可以被** `search_memory` 检索，并被 `prepare_context` 使用。 |
+| `POST /v1/scopes/{scope_id}/artifacts`，`family=atomic-memory` | 创建 active 记忆，并更新当前检索投影。 |
+| `POST /v1/memory/remember` | 通过兼容入口创建 active Atomic Memory，同样更新当前检索投影。 |
 
-如果你希望 Agent 真正能召回这条事实，请使用 `/v1/memory/remember`。
+成功写入的在役记忆可以被 `search_memory` 检索，也可以参与 `prepare_context`；实际结果仍取决于 Scope、权限和查询条件。
+`family=memory` 的通用创建已经停止支持。旧集合数据库需先完成[停服迁移](../operate/atomic-memory-migration.md)。
 
-**问：修订 Memory 时旧版本会被删除吗？**
+**问：修订 Atomic Memory 时旧版本会被删除吗？**
 
-不会。Revision 是不可变的。修订 Memory 会创建一个新 Revision，并把旧 Revision 从活跃召回中退役；但旧
-Revision 仍可通过 `GET .../revisions/{n}` 读取。这样既能保留审计轨迹，也能在需要时恢复早期措辞。
+不会。修订会创建新的正文 Revision 并推进当前 head，保留记忆的生命周期状态。普通检索使用在役记忆的当前正文；旧版本仍可
+通过 `GET /v1/scopes/{scope_id}/artifacts/atomic-memory/{id}/revisions/{n}` 精确读取。恢复历史内容时会生成新的
+Revision，原有历史保持不变，详见[原子记忆](../workflows/atomic-memory.md)。
 
 ## Handoff
 

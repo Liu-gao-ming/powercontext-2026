@@ -175,8 +175,9 @@ Approval creates only the proposed managed Revision; the original snapshot remai
 
 A person may upload a complete package, or a configured generation model may propose one from exact SourceRef and
 ArtifactRef evidence. Generation produces package content outside the approval transaction. PowerContext validates and
-stores it before creating a pending Candidate. A model cannot approve the Candidate, allocate final Artifact identity,
-publish the package, or gain script authority.
+stores it before creating a pending Candidate. Generation does not approve the Candidate or allocate final Artifact
+identity. Approval is a separate operation available to authorized callers, including Agents; it does not prohibit
+self-approval. Publication is another explicit operation, and none of these steps grants script execution authority.
 
 ## Review the package that will be published
 
@@ -958,6 +959,10 @@ until then the Dashboard shows `pending` or `offline`. An older-generation recei
 state. A failed receipt writes the current `observed_generation`, preserves the last successful observed Revision and
 digest, and sets `delivery_failed`. Reconciliation retries the same generation while desired state remains unsatisfied;
 only new operator intent advances `generation`. A later success clears `last_error_code`.
+
+Publishing the same desired Revision and tree digest with the current expected generation is a no-op, preserving
+delivery state, observations, errors, and timestamps. A stale expected generation still conflicts. Publishing after
+unpublication or selecting a different Revision creates a new generation.
 
 ### Receiver installation and receipt
 

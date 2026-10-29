@@ -35,17 +35,22 @@ def select_evidence(
     *,
     skill: bool,
     target: ArtifactRef | None,
+    catalog: bool = False,
 ) -> SelectedEvidence:
     nodes = {node.evidence_id: node for node in manifest.nodes}
     for node_id in used:
         node = nodes.get(node_id)
         if node is None or node.role in {"unresolved", "lineage_only"} or (skill and node.kind == "memory"):
             raise EvidenceResolutionError("invalid_generation_output")
-    chosen = set(used)
-    # A model that cites a root must retain the exact selected Artifact path.
-    for origin in manifest.artifacts:
+    # Targets may be named as comparison context, but cannot support their own revision.
+    chosen = {node_id for node_id in used if nodes[node_id].role != "target"}
+    if not chosen:
+        raise EvidenceResolutionError("needs_evidence")
+    origins = manifest.artifacts
+    # A model that cites a root must retain the exact selected entry/Artifact path.
+    for origin in origins:
         origin_id = evidence_id(origin)
-        if _reachable(origin_id, manifest) & chosen:
+        if nodes[origin_id].role != "target" and _reachable(origin_id, manifest) & chosen:
             chosen.add(origin_id)
     dependencies = set().union(*(_reachable(node_id, manifest) for node_id in chosen))
     sources = tuple(
@@ -53,12 +58,15 @@ def select_evidence(
         for key, node in nodes.items()
         if key in dependencies and node.role == "root" and node.source is not None
     )
+    artifact_kinds = (
+        {"experience", "memory", "skill", "profile", "topic_memory", "handoff"} if catalog else {"experience", "memory"}
+    )
     artifacts = tuple(
         node.artifact
         for key, node in nodes.items()
-        if key in chosen and node.kind in {"experience", "memory"} and node.artifact is not None
+        if key in chosen and node.kind in artifact_kinds and node.artifact is not None
     )
-    if target is not None:
+    if isinstance(target, ArtifactRef):
         artifacts = unique_references((*artifacts, target))
     memory_derived = any(nodes[key].kind == "memory" for key in dependencies)
     if memory_derived and not sources:

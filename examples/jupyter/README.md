@@ -116,7 +116,8 @@ make notebooks-test ARGS="--with-browser --only 20"
 
 | 要做的事情 | 优先使用 |
 | --- | --- |
-| 保存、搜索和修订日常记忆 | `remember_memory`、`search_memory`、按 citation 的修订和停用操作 |
+| 保存和搜索记忆 | `remember_memory` 返回 `records`；`search_memory` 的命中记录位于 `hit.memory` |
+| 修订和遗忘记忆 | `replace_artifact` 携带正文 ETag；`change_atomic_memory_lifecycle` 携带精确引用与状态版本 |
 | 让本次请求用上已有知识 | `prepare_context`；Agent 可直接接入 `PowerContextMiddleware` |
 | 保存原始材料或直接提交明确内容 | `create_source`、统一的 `create_artifact` |
 | 按制品身份查看内容和版本 | `get_artifact`、`list_artifacts`、`get_artifact_revision` |
@@ -124,18 +125,19 @@ make notebooks-test ARGS="--with-browser --only 20"
 | 独立应用接入与并发更新 | HTTP 专题中的 JSON 请求、Server ETag 与 `If-Match` |
 | 把外部身份对应到项目 | `set_scope_binding` / `resolve_scope_binding`；再把解析出的 Scope 交给 Middleware |
 
-当前日常 Memory 召回读取 Scope 的默认 Memory。统一 `create_artifact(family="memory")` 可以创建
-独立 Memory 制品，但不会自动让它加入这条召回路径。01–04 保留日常 Memory 操作；
-01–02 同时用统一 API 查看其制品和版本。第 11 篇通过实际搜索对照展示这个边界。
+01–04 中的每条记忆都是独立的 `atomic-memory` Artifact，搜索与上下文准备在指定 Scope 内召回 active 记忆。
+`remember_memory` 创建后的记录使用 `record.artifact` 精确引用正文版本；统一 `create_artifact(family="atomic-memory")`
+也可以创建同类记忆。正文 revision 与生命周期 state_version 分别变化，历史正文通过精确 Artifact 引用读取。
 
 Experience、Skill 和 Handoff 使用统一 API 直接创建；Candidate 是待确认内容的审核流程。
 Handoff 的主路径是预览再 `commit_handoff`；统一 `create_artifact` 只在内容已经写好时使用。
-当前 Python Client 未在制品读取结果中暴露 ETag，所以完整的条件替换流程在第 11 篇用 HTTP 演示。
+当前 Python Client 未在普通制品读取结果中暴露 ETag；02 用真实 HTTP GET 读取正文 ETag，再交给 Client 执行条件替换。
+第 11 篇使用普通 HTTP 请求演示条件读取与更新。
 进阶篇的具体入口和成功证据见上方学习路径。
 
 ## 本课覆盖与刻意不覆盖
 
-主线覆盖 Source、默认 Memory、PreparedContext、Experience / Skill 审核、工作交接闭环、提取与生成、
+主线覆盖 Source、Atomic Memory、PreparedContext、Experience / Skill 审核、工作交接闭环、提取与生成、
 三种检索和重排、LangChain Middleware、LangGraph Memory 工具以及独立 HTTP 制品契约。
 进阶篇继续覆盖团队共享和权限、OpenDAL、后台孵化、Skill 使用反馈、外部完整包、托管发布与 Receiver、
 MCP、真实浏览器管理、Metrics/OTel 和故障恢复。附录 A1 补充自定义组件与真实存储。
@@ -170,7 +172,7 @@ make notebooks-test ARGS="--with-http --only 11"
 ```
 
 成功时会观察到四类制品的创建与读取，真实的 `304` 条件读取、`412` 过期版本条件、
-`428` 缺少更新条件，以及独立 Memory 和默认 Memory 的搜索差别。
+`428` 缺少更新条件，以及制品搜索结果。
 最后一个单元格关闭应用连接；在终端 A 按 **Ctrl+C** 停止 Server。
 
 ## 配置模型篇
@@ -212,8 +214,8 @@ OceanBase 仅由上面的专用 Notebook 配置项显式启用。
 
 ## 读懂结果
 
-Source 是原始材料，保存成功不代表已成为 Memory。Memory 的停用会使 entry 退出 active recall，
-历史版本仍可读取。准备上下文、加入模型请求、模型实际采用它，是需要分别观察的三个结果。
+Source 是原始材料，保存成功不代表已成为 Memory。Atomic Memory 的 `forgotten` 状态使该记忆退出 active recall，
+正文与历史版本仍可读取，状态版本的变化不会增加正文 revision。准备上下文、加入模型请求、模型实际采用它，是需要分别观察的三个结果。
 
 Handoff 的准备预览、提交、接收确认和任务完成也是不同状态。05 先预览再 commit，两个 Client 模拟交接角色；
 10、16、19、21、22 调用真实 Agent。Skill 的创建或批准不会自动在 Host 中安装、发现或执行它；07 实际导出文件，17 验证完整包，18 与 22 用 Receiver 实际安装和撤回。

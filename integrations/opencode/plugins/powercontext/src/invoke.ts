@@ -33,6 +33,7 @@ export interface ToolResult {
 const WRITE_OPERATIONS = new Set<OperationId>([
   'remember_memory',
   'capture_content_source',
+  'capture_working_note',
   'revise_memory_entry',
   'retire_memory_entry',
   'replace_artifact',

@@ -14,7 +14,7 @@
 
 """Recognize the frozen MySQL layouts without importing application metadata.
 
-Only the reviewed linear p0001--p0003 history is supported. DDL recovery accepts
+Registered resources describe the complete linear history. DDL recovery accepts
 an exact prefix of the next revision, never an arbitrary collection of objects.
 The caller owns maintenance evidence, backup, the pinned database lock and the
 version row; this module never writes or stamps a revision.
@@ -34,10 +34,9 @@ from sqlalchemy.exc import DBAPIError
 from .bundle import MigrationBundle
 from .models import MigrationError, digest
 
-_LEXEME = re.compile(r"\s+|`(?:``|[^`])*`|'(?:''|\\.|[^'\\])*'|[A-Za-z_][A-Za-z_0-9$]*|[0-9]+|>=|<=|<>|!=|[(),.=<>+-]")
-_REVISIONS = ("p0001", "p0002", "p0003")
-_CITATION_TABLES = ("pc_artifacts", "pc_artifact_candidate_versions")
-_FAMILY_CHECK = "ck_pc_artifact_tags_family"
+_LEXEME = re.compile(
+    r"\s+|`(?:``|[^`])*`|'(?:''|\\.|[^'\\])*'|[A-Za-z_][A-Za-z_0-9$]*|[0-9]+|>=|<=|<>|!=|[(),.=<>+*/%\^&|~!?:@-]"
+)
 _CONTROL_TABLE = "pc_schema_revision"
 _PHYSICAL_VALUES = frozenset({
     "row_format",
@@ -115,19 +114,25 @@ def _reflect_tables(connection: Connection, database: str, exclude: frozenset[st
             row = connection.exec_driver_sql(f"SHOW CREATE TABLE {_quote(name)}").first()
             if row is None or not isinstance(row[1], str):
                 raise MigrationError("incompatible_schema", "A table definition could not be reflected.")
-            reflected_name, table = _parse_table(row[1], database=database)
+            try:
+                reflected_name, table = _parse_table(row[1], database=database)
+            except MigrationError as error:
+                detail = str(error).removeprefix(f"{error.code}: ")
+                raise MigrationError(error.code, f"Table {name!r}: {detail}") from error
             if reflected_name != name:
                 raise MigrationError("incompatible_schema", "A reflected table identity is inconsistent.")
             inventory["tables"][name] = table
 
 
-def read_revision(connection: Connection, inventory: dict[str, Any]) -> tuple[bool, str | None]:
+def read_revision(
+    connection: Connection, inventory: dict[str, Any], *, revisions: tuple[str, ...]
+) -> tuple[bool, str | None]:
     """Validate Alembic's only control table before reading its zero/one head."""
     _business_inventory(inventory)
     if _CONTROL_TABLE not in inventory["tables"]:
         return False, None
     rows = connection.exec_driver_sql("SELECT version_num FROM pc_schema_revision LIMIT 2").all()
-    if len(rows) > 1 or (rows and rows[0][0] not in _REVISIONS):
+    if len(rows) > 1 or (rows and rows[0][0] not in revisions):
         raise MigrationError("incompatible_schema", "The database has multiple or unknown migration heads.")
     return True, rows[0][0] if rows else None
 
@@ -135,36 +140,209 @@ def read_revision(connection: Connection, inventory: dict[str, Any]) -> tuple[bo
 class MySQLSchema:
     """Validate source, intermediate and post-DDL shapes from frozen resources."""
 
-    def __init__(self, bundle: MigrationBundle) -> None:
-        if bundle.revisions != _REVISIONS:
-            raise MigrationError("invalid_bundle", "MySQL schema recognition does not cover this revision chain.")
+    def __init__(self, bundle: MigrationBundle, *, embedded_code: bool = False) -> None:  # noqa: C901 -- Keep ordered admission checks with their operation.
         self.bundle = bundle
-        baseline = json.loads((bundle.snapshot_directory / "schemas/pre_dream.json").read_text())["mysql"]
-        current = json.loads((bundle.snapshot_directory / "schemas/v1_1_0.json").read_text())["mysql"]
-        self._statements = {
-            "p0001": tuple(baseline),
-            "p0002": tuple(f"ALTER TABLE {table} ADD COLUMN memory_citations MEDIUMBLOB" for table in _CITATION_TABLES),
-            "p0003": (f"ALTER TABLE pc_artifact_tags DROP CHECK {_FAMILY_CHECK}",),
-        }
+        self.revisions = bundle.revisions
+        manifest = json.loads((bundle.snapshot_directory / "manifest.json").read_text())
+        self.optional_table_options = {}
+        self.affected_objects = bundle.affected_objects
+        if "mysql_state_layouts" in manifest:
+            self._load_state_layouts(manifest["mysql_state_layouts"])
+            if embedded_code:
+                self._extend_embedded_code(manifest)
+            if bundle.vector_profile is not None:
+                self._extend_vectors()
+            return
+        if embedded_code:
+            raise MigrationError("invalid_bundle", "Embedded Code needs a registered complete Server layout.")
+        self.bundle = bundle
+        if not bundle.mysql_layouts:
+            raise MigrationError("invalid_bundle", "MySQL layout steps are not registered in this bundle.")
+        self._statements: dict[str, tuple[str, ...]] = {}
+        checkpoints: dict[str, str] = {}
+        for resource in bundle.mysql_layouts:
+            layouts = json.loads((bundle.snapshot_directory / resource).read_text(encoding="utf-8"))
+            if (
+                not isinstance(layouts, dict)
+                or layouts.get("format") != "powercontext.mysql-layouts.v1"
+                or not isinstance(layouts.get("revisions"), dict)
+                or not isinstance(layouts.get("checkpoints"), dict)
+                or set(layouts["revisions"]) & self._statements.keys()
+                or set(layouts["checkpoints"]) & checkpoints.keys()
+                or any(
+                    not isinstance(steps, list) or any(not isinstance(step, str) or not step.strip() for step in steps)
+                    for steps in layouts["revisions"].values()
+                )
+                or any(
+                    not isinstance(name, str) or name not in bundle.resources
+                    for name in layouts["checkpoints"].values()
+                )
+            ):
+                raise MigrationError("invalid_bundle", "MySQL layout registration is invalid or duplicated.")
+            self._statements.update({revision: tuple(steps) for revision, steps in layouts["revisions"].items()})
+            checkpoints.update(layouts["checkpoints"])
+        if set(self._statements) != set(bundle.revisions) or not set(checkpoints) <= set(bundle.revisions):
+            raise MigrationError("invalid_bundle", "MySQL layout registration does not cover the revision chain.")
         inventory = _empty_inventory()
         self._prefixes: dict[str, list[dict[str, Any]]] = {}
         self._schemas: dict[str, dict[str, Any]] = {}
-        for revision in _REVISIONS:
+        for revision in bundle.revisions:
             prefixes = [copy.deepcopy(inventory)]
             for statement in self._statements[revision]:
                 _apply_statement(inventory, statement)
                 prefixes.append(copy.deepcopy(inventory))
             self._prefixes[revision] = prefixes
             self._schemas[revision] = copy.deepcopy(inventory)
-        frozen_current = _empty_inventory()
-        for statement in current:
-            _apply_statement(frozen_current, statement)
-        if frozen_current != self._schemas["p0003"]:
-            raise MigrationError("invalid_bundle", "Frozen MySQL layouts disagree with the registered revision steps.")
+        for revision, resource in checkpoints.items():
+            frozen = _empty_inventory()
+            for statement in json.loads((bundle.snapshot_directory / resource).read_text(encoding="utf-8"))["mysql"]:
+                _apply_statement(frozen, statement)
+            if frozen != self._schemas[revision]:
+                raise MigrationError(
+                    "invalid_bundle", "Frozen MySQL layouts disagree with the registered revision steps."
+                )
+
+    def _load_state_layouts(self, resources: list[str]) -> None:  # noqa: C901 -- Keep ordered admission checks with their operation.
+        registered = {"revisions": {}}
+        for resource in resources:
+            if resource not in self.bundle.resources:
+                raise MigrationError("invalid_bundle", "A MySQL state layout is outside the frozen bundle.")
+            fragment = json.loads((self.bundle.snapshot_directory / resource).read_text())
+            if (
+                fragment.get("format") != "powercontext.mysql-state-layouts.v1"
+                or set(fragment["revisions"]) & registered["revisions"].keys()
+            ):
+                raise MigrationError("invalid_bundle", "A MySQL state layout is invalid or duplicated.")
+            options = fragment.get("optional_table_options", {})
+            if self.optional_table_options.keys() & options.keys():
+                raise MigrationError("invalid_bundle", "A MySQL layout overrides an earlier option registration.")
+            self.optional_table_options.update(options)
+            registered["revisions"].update(fragment["revisions"])
+        if set(registered["revisions"]) != set(self.bundle.revisions):
+            raise MigrationError("invalid_bundle", "MySQL state layouts must cover exactly the shared revision chain.")
+        inventory = _empty_inventory()
+        self._statements = {}
+        self._prefixes = {}
+        self._schemas = {}
+        for revision in self.bundle.revisions:
+            entry = registered["revisions"][revision]
+            statements, changes = entry["statements"], entry["changes"]
+            if (
+                not statements
+                or len(statements) != len(changes)
+                or any(not isinstance(sql, str) or not sql.strip() for sql in statements)
+            ):
+                raise MigrationError("invalid_bundle", "Each MySQL operation requires its exact schema transition.")
+            prefixes = [copy.deepcopy(inventory)]
+            for change in changes:
+                for name, table in change.items():
+                    if table is None:
+                        if name not in inventory["tables"]:
+                            raise MigrationError("invalid_bundle", "A transition removes an unknown table.")
+                        del inventory["tables"][name]
+                    else:
+                        inventory["tables"][name] = table
+                prefixes.append(copy.deepcopy(inventory))
+            self._statements[revision] = tuple(statements)
+            self._prefixes[revision] = prefixes
+            self._schemas[revision] = copy.deepcopy(inventory)
+
+    def execute(self, connection: Connection, statement: str, configuration: dict[str, Any]) -> None:
+        if statement.startswith("@"):
+            import runpy
+
+            resource, name = statement.removeprefix("@").split(":", 1)
+            if resource not in self.bundle.resources:
+                raise MigrationError("invalid_bundle", "A conditional MySQL operation needs a frozen implementation.")
+            operation = runpy.run_path(str(self.bundle.snapshot_directory / resource))["execute"]
+            operation(connection, "@" + name, configuration)
+        else:
+            connection.exec_driver_sql(statement, execution_options={"no_parameters": True})
+
+    def _extend_embedded_code(self, manifest: dict[str, Any]) -> None:
+        resource = manifest.get("mysql_schema_extensions", {}).get("seekdb_code")
+        if resource not in self.bundle.resources:
+            raise MigrationError("invalid_bundle", "Embedded Code has no frozen schema registration.")
+        profile = json.loads((self.bundle.snapshot_directory / resource).read_text(encoding="utf-8"))
+        revision = profile["source_revision"]
+        statements = profile["statements"]
+        tables = profile["tables"]
+        if (
+            profile.get("format") != "powercontext.mysql-schema-extension.v1"
+            or profile.get("backend") != "seekdb"
+            or revision != self.revisions[0]
+            or not statements
+            or dict(_parse_table(sql) for sql in statements) != tables
+            or any(set(tables) & set(state["tables"]) for state in self._schemas.values())
+        ):
+            raise MigrationError("invalid_bundle", "The embedded Code schema registration is inconsistent.")
+        # Preserve the released Code tables through every core transition. A new
+        # database creates the same registered extension in the baseline revision.
+        state = copy.deepcopy(self._schemas[revision])
+        for statement in statements:
+            name, table = _parse_table(statement)
+            state["tables"][name] = table
+            self._prefixes[revision].append(copy.deepcopy(state))
+        self._statements[revision] += tuple(statements)
+        self._schemas[revision] = state
+        for later in self.revisions[1:]:
+            for prefix in self._prefixes[later]:
+                prefix["tables"].update(copy.deepcopy(tables))
+            self._schemas[later]["tables"].update(copy.deepcopy(tables))
+        self.affected_objects = (*self.affected_objects, *tables)
 
     @staticmethod
     def fingerprint(inventory: dict[str, Any]) -> str:
         return digest(inventory)
+
+    def _extend_vectors(self) -> None:
+        profile = self.bundle.vector_profile
+        if profile is None:
+            raise MigrationError("invalid_bundle", "Vector schema selection needs an exact profile.")
+        definitions = profile.mysql_tables()
+        self.optional_table_options.update(profile.layout["mysql_optional_table_options"])
+        tables = dict(_parse_table(sql) for sql in definitions.values())
+        atomic_name = "pc_atomic_memory_current"
+        atomic = tables.pop(atomic_name)
+        source, target, *later = self.revisions
+        for revision in self.revisions:
+            for state in [*self._prefixes[revision], self._schemas[revision]]:
+                if atomic_name in state["tables"]:
+                    state["tables"][atomic_name] = copy.deepcopy(atomic)
+                if revision != source:
+                    state["tables"].update(copy.deepcopy(tables))
+        self._statements[source] = tuple(
+            definitions[atomic_name] if sql.startswith(f"CREATE TABLE `{atomic_name}` (") else sql
+            for sql in self._statements[source]
+        )
+        source_state = self._schemas[source]
+        for name, table in tables.items():
+            source_state["tables"][name] = copy.deepcopy(table)
+            self._prefixes[source].append(copy.deepcopy(source_state))
+            self._statements[source] += (definitions[name],)
+        declaration_sql = profile.layout["mysql_profile_table"]
+        declaration_name, declaration = _parse_table(declaration_sql)
+        self._schemas[target]["tables"][declaration_name] = copy.deepcopy(declaration)
+        self._prefixes[target].append(copy.deepcopy(self._schemas[target]))
+        self._statements[target] += (declaration_sql,)
+        for revision in later:
+            for state in [*self._prefixes[revision], self._schemas[revision]]:
+                state["tables"][declaration_name] = copy.deepcopy(declaration)
+        self.affected_objects = tuple(dict.fromkeys([*self.affected_objects, *tables, declaration_name]))
+
+    def _matches(self, inventory: dict[str, Any], expected: dict[str, Any]) -> bool:
+        # Captured backends may expose an explicit default that another backend
+        # omits. Only registered values may be absent; retain it in fingerprints.
+        actual = copy.deepcopy(inventory)
+        for name, options in self.optional_table_options.items():
+            table = actual["tables"].get(name)
+            target = expected["tables"].get(name)
+            if table is None or target is None:
+                continue
+            for option, allowed in options.items():
+                if option not in target and table.get(option) in allowed:
+                    del table[option]
+        return _matches(actual, expected)
 
     def identify(self, inventory: dict[str, Any]) -> str | None:
         """Only complete known shapes may be adopted as an unversioned source."""
@@ -172,14 +350,14 @@ class MySQLSchema:
         if inventory == _empty_inventory():
             return None
         for revision, expected in self._schemas.items():
-            if _matches(inventory, expected):
+            if self._matches(inventory, expected):
                 return revision
         raise MigrationError("incompatible_schema", "Actual MySQL schema is not a registered complete layout.")
 
     def verify(self, inventory: dict[str, Any], revision: str | None) -> None:
         inventory = _business_inventory(inventory)
         expected = _empty_inventory() if revision is None else self._schemas.get(revision)
-        if expected is None or not _matches(inventory, expected):
+        if expected is None or not self._matches(inventory, expected):
             raise MigrationError("incompatible_schema", "Actual MySQL schema does not match its recorded revision.")
 
     def recovery(self, inventory: dict[str, Any], revision: str | None) -> MySQLRecovery:
@@ -190,14 +368,12 @@ class MySQLSchema:
         for advancing the version row, and is not itself recovery authorization.
         """
         inventory = _business_inventory(inventory)
-        if revision is None:
-            target = _REVISIONS[0]
-        elif revision not in _REVISIONS or revision == _REVISIONS[-1]:
+        pending = self.bundle.pending(revision)
+        if not pending:
             raise MigrationError("incompatible_schema", "There is no registered next MySQL revision to recover.")
-        else:
-            target = _REVISIONS[_REVISIONS.index(revision) + 1]
+        target = pending[0]
         for position, expected in enumerate(self._prefixes[target]):
-            if _matches(inventory, expected):
+            if self._matches(inventory, expected):
                 return MySQLRecovery(target, self._statements[target][position:])
         raise MigrationError("incompatible_schema", "Actual MySQL schema is not a controlled next-revision DDL state.")
 
@@ -211,11 +387,15 @@ class MySQLSchema:
         expected = self._schemas.get(revision)
         if expected is None:
             raise MigrationError("incompatible_schema", "Cannot validate data for an unknown MySQL revision.")
+        if self.bundle.readiness_scope == "server":
+            expected = _business_inventory(mysql_inventory(connection))
         for name, table in expected["tables"].items():
             for check in table["checks"].values():
                 expression = _expression_sql(check["expression"])
+                # No bind parameters: keep literal percent signs out of DBAPI interpolation.
                 violation = connection.exec_driver_sql(
-                    f"SELECT 1 FROM {_quote(name)} WHERE NOT ({expression}) LIMIT 1"  # noqa: S608 -- frozen expressions
+                    f"SELECT 1 FROM {_quote(name)} WHERE NOT ({expression}) LIMIT 1",  # noqa: S608 -- frozen expressions
+                    execution_options={"no_parameters": True},
                 ).first()
                 if violation is not None:
                     raise MigrationError("data_integrity_error", "Existing rows violate a registered CHECK constraint.")
@@ -345,6 +525,25 @@ def _validate_physical_value(option: str, value: str) -> None:
     supported = {"engine": {"innodb"}, "using": {"btree"}, "organization": {"index", "heap"}}
     if option in supported and value not in supported[option]:
         raise MigrationError("incompatible_schema", "An unsupported table engine or index organization was discovered.")
+
+
+def _table_options(tokens: list[str]) -> tuple[dict[str, str | None], str | None]:
+    positions = [position for position, option in enumerate(tokens) if option == "auto_increment_mode"]
+    if not positions:
+        return _physical(tokens), None
+    if len(positions) != 1:
+        raise MigrationError("incompatible_schema", "Duplicate AUTO_INCREMENT_MODE declarations were discovered.")
+    start = positions[0]
+    position = start + 1
+    if tokens[position : position + 1] == ["="]:
+        position += 1
+    if position >= len(tokens):
+        raise MigrationError("incompatible_schema", "AUTO_INCREMENT_MODE has no value.")
+    value = tokens[position]
+    mode = (_literal(value) if value.startswith("'") else value).lower()
+    if mode not in {"order", "noorder"}:
+        raise MigrationError("incompatible_schema", "An unsupported AUTO_INCREMENT_MODE was discovered.")
+    return _physical(tokens[:start] + tokens[position + 1 :]), mode
 
 
 def _column(tokens: list[str], defaults: dict[str, str | None]) -> dict[str, Any]:
@@ -500,8 +699,10 @@ def _parse_table(statement: str, *, database: str | None = None) -> tuple[str, d
     if schema is not None:
         raise MigrationError("incompatible_schema", "A table belongs to an unexpected database.")
     body, position = _group(tokens, position)
-    defaults = _physical(tokens[position:])
+    defaults, auto_increment_mode = _table_options(tokens[position:])
     table: dict[str, Any] = {"columns": {}, "primary_key": [], "foreign_keys": [], "checks": {}, "indexes": {}}
+    if auto_increment_mode is not None:
+        table["auto_increment_mode"] = auto_increment_mode
     for part in _parts(body):
         _table_clause(table, part, defaults, database)
     table["foreign_keys"].sort(key=digest)
@@ -515,19 +716,93 @@ def _put_named(objects: dict[str, Any], name: str, definition: dict[str, Any]) -
 
 
 def _check_definition(part: list[str], constraint: str | None) -> tuple[str, dict[str, Any]]:
-    expression, end = _group(part, 1)
-    if constraint is None or part[end:] not in ([], ["enforced"], ["not", "enforced"]):
-        raise MigrationError("incompatible_schema", "An unsupported CHECK definition was discovered.")
-    return constraint, {"expression": _Expression(expression).parse(), "enforced": part[end:] != ["not", "enforced"]}
+    try:
+        expression, end = _group(part, 1)
+        if constraint is None or part[end:] not in ([], ["enforced"], ["not", "enforced"]):
+            raise MigrationError("incompatible_schema", "An unsupported CHECK definition was discovered.")  # noqa: TRY301
+        return constraint, {
+            "expression": _Expression(expression).parse(),
+            "enforced": part[end:] != ["not", "enforced"],
+        }
+    except MigrationError as error:
+        detail = str(error).removeprefix(f"{error.code}: ")
+        raise MigrationError(error.code, f"CHECK constraint {constraint!r}: {detail}") from error
 
 
-def _index_definition(part: list[str]) -> tuple[str, dict[str, Any]]:
+def _index_definition(part: list[str], constraint: str | None = None) -> tuple[str, dict[str, Any]]:
     unique = part[0] == "unique"
     offset = 2 if unique and part[1] in {"key", "index"} else 1
-    index_name = part[offset]
-    columns, end = _group(part, offset + 1)
+    if unique and part[offset] == "(" and constraint is not None:
+        index_name = constraint
+        columns, end = _group(part, offset)
+    else:
+        index_name = part[offset]
+        columns, end = _group(part, offset + 1)
     _physical(part[end:])
     return index_name, {"columns": _key_columns(columns), "unique": unique}
+
+
+def _fulltext_definition(part: list[str]) -> tuple[str, dict[str, Any]]:
+    if part[1:2] not in (["key"], ["index"]):
+        raise MigrationError("incompatible_schema", "An unsupported FULLTEXT index definition was discovered.")
+    columns, end = _group(part, 3)
+    parser = None
+    properties: dict[str, int] = {}
+    if part[end : end + 2] == ["with", "parser"]:
+        end += 2
+        if end >= len(part) or not re.fullmatch(r"[a-z_][a-z_0-9$]*", part[end]):
+            raise MigrationError("incompatible_schema", "A FULLTEXT parser has no valid identity.")
+        parser = part[end]
+        end += 1
+        if part[end : end + 2] == ["parser_properties", "="]:
+            arguments, end = _group(part, end + 2)
+            for option in _parts(arguments):
+                if (
+                    len(option) != 3
+                    or option[0] not in {"min_token_size", "max_token_size"}
+                    or option[0] in properties
+                    or option[1] != "="
+                    or not option[2].isdigit()
+                ):
+                    raise MigrationError(
+                        "incompatible_schema", "An unsupported FULLTEXT parser property was discovered."
+                    )
+                properties[option[0]] = int(option[2])
+    _physical(part[end:])
+    return part[2], {
+        "columns": _key_columns(columns),
+        "unique": False,
+        "kind": "fulltext",
+        "parser": parser,
+        "parser_properties": properties,
+    }
+
+
+def _vector_definition(part: list[str]) -> tuple[str, dict[str, Any]]:
+    columns, end = _group(part, 3)
+    if part[end : end + 1] != ["with"]:
+        raise MigrationError("incompatible_schema", "A VECTOR index is missing its parameter declaration.")
+    arguments, end = _group(part, end + 1)
+    parameters: dict[str, str | int] = {}
+    for option in _parts(arguments):
+        if len(option) != 3 or option[1] != "=" or option[0] in parameters:
+            raise MigrationError("incompatible_schema", "A VECTOR index parameter is invalid or duplicated.")
+        name, _, value = option
+        if name in {"distance", "type", "lib"} and re.fullmatch(r"[a-z][a-z_0-9]*", value):
+            parameters[name] = value
+        elif name in {"m", "ef_construction", "ef_search"} and value.isdigit() and int(value) > 0:
+            parameters[name] = int(value)
+        else:
+            raise MigrationError("incompatible_schema", "An unsupported VECTOR index parameter was discovered.")
+    if not {"distance", "type"} <= parameters.keys():
+        raise MigrationError("incompatible_schema", "A VECTOR index has no complete algorithm declaration.")
+    _physical(part[end:])
+    return part[2], {
+        "columns": _key_columns(columns),
+        "unique": False,
+        "kind": "vector",
+        "parameters": parameters,
+    }
 
 
 def _table_clause(
@@ -549,7 +824,13 @@ def _table_clause(
         constraint, definition = _check_definition(part, constraint)
         _put_named(table["checks"], constraint, definition)
     elif part[0] in {"key", "index", "unique"}:
-        index_name, definition = _index_definition(part)
+        index_name, definition = _index_definition(part, constraint)
+        _put_named(table["indexes"], index_name, definition)
+    elif part[0] == "fulltext":
+        index_name, definition = _fulltext_definition(part)
+        _put_named(table["indexes"], index_name, definition)
+    elif part[0] == "vector" and part[1:2] in (["key"], ["index"]):
+        index_name, definition = _vector_definition(part)
         _put_named(table["indexes"], index_name, definition)
     elif constraint is None:
         _put_named(table["columns"], part[0], _column(part, defaults))
@@ -597,7 +878,7 @@ def _matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
                     specification[option] = None
         automatic_keys: set[tuple[str, ...]] = set()
         for index_name, index in tuple(table["indexes"].items()):
-            if index_name in expected_table["indexes"] or index["unique"]:
+            if index_name in expected_table["indexes"] or index["unique"] or index.get("kind") is not None:
                 continue
             columns = tuple(key[0] for key in index["columns"])
             foreign_columns = {tuple(key["columns"]) for key in table["foreign_keys"]}
@@ -627,12 +908,37 @@ class _Expression:
     def parse(self) -> list[Any]:
         value = self._expression(0)
         if self.position != len(self.tokens):
-            raise MigrationError("incompatible_schema", "An unsupported CHECK expression was discovered.")
+            lexeme = self.tokens[self.position]
+            construct = "string literal" if lexeme.startswith("'") else repr(lexeme)
+            if (
+                lexeme == "("
+                and self.position > 0
+                and re.fullmatch(r"[a-z_][a-z_0-9$]*", self.tokens[self.position - 1])
+            ):
+                construct = f"function {self.tokens[self.position - 1]!r}"
+            raise MigrationError("incompatible_schema", f"Unsupported CHECK expression token {construct}.")
         return value
 
     def _expression(self, precedence: int) -> list[Any]:
         left = self._value()
-        priorities = {"or": 1, "and": 2, "=": 3, ">": 3, "<": 3, ">=": 3, "<=": 3, "!=": 3, "<>": 3, "is": 3, "in": 3}
+        priorities = {
+            "or": 1,
+            "and": 2,
+            "=": 3,
+            ">": 3,
+            "<": 3,
+            ">=": 3,
+            "<=": 3,
+            "!=": 3,
+            "<>": 3,
+            "is": 3,
+            "in": 3,
+            "+": 4,
+            "-": 4,
+            "*": 5,
+            "/": 5,
+            "%": 5,
+        }
         while self.position < len(self.tokens):
             operator = self.tokens[self.position]
             priority = priorities.get(operator, 0)
@@ -659,11 +965,12 @@ class _Expression:
         lexeme = self.tokens[self.position]
         self.position += 1
         if lexeme == "(":
-            value = self._expression(0)
-            if self.tokens[self.position : self.position + 1] != [")"]:
-                raise MigrationError("incompatible_schema", "A CHECK expression has unbalanced parentheses.")
-            self.position += 1
-            return value
+            # Parse a balanced group independently so unsupported operators are
+            # not mistaken for a missing closing parenthesis.
+            group, self.position = _group(self.tokens, self.position - 1)
+            return _Expression(group).parse()
+        if lexeme in {"+", "-"}:
+            return ["unary", lexeme, self._value()]
         if lexeme == "_utf8mb4":
             if self.position >= len(self.tokens) or not self.tokens[self.position].startswith("'"):
                 raise MigrationError("incompatible_schema", "A CHECK expression has an unsupported literal introducer.")
@@ -676,7 +983,7 @@ class _Expression:
         if lexeme == "null":
             return ["null"]
         if not re.fullmatch(r"[a-z_][a-z_0-9$]*", lexeme):
-            raise MigrationError("incompatible_schema", "An unsupported CHECK value was discovered.")
+            raise MigrationError("incompatible_schema", f"Unsupported CHECK value token {lexeme!r}.")
         return ["column", lexeme]
 
 
@@ -694,6 +1001,8 @@ def _expression_sql(expression: list[Any]) -> str:
         return f"({_expression_sql(expression[1])} IS {'NOT ' if kind == 'is_not_null' else ''}NULL)"
     if kind == "in":
         return f"({_expression_sql(expression[1])} IN ({', '.join(_expression_sql(value) for value in expression[2])}))"
+    if kind == "unary":
+        return f"({expression[1]}{_expression_sql(expression[2])})"
     if kind == "binary":
         return f"({_expression_sql(expression[2])} {expression[1].upper()} {_expression_sql(expression[3])})"
     raise MigrationError("invalid_bundle", "An unsupported frozen CHECK expression was discovered.")

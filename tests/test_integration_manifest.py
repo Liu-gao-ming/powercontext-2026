@@ -36,14 +36,14 @@ from integration_manifest import (
 )
 from pydantic import ValidationError
 
-from powercontext.cli.system import setup_app
-
 
 def test_manifest_matches_setup_catalog_evidence_and_actual_tool_surfaces() -> None:
     manifest = load_integration_manifest()
 
     agent_hosts = {integration.id for integration in manifest.integrations if integration.kind == "agent_host"}
-    setup_targets = {command.name for command in setup_app.registered_commands if command.name != "select"}
+    from powercontext.cli.installation import installers
+
+    setup_targets = set(installers())
 
     assert agent_hosts == setup_targets
     assert integration_directory_errors(manifest) == ()
@@ -78,42 +78,46 @@ def test_codex_full_profile_includes_managed_and_external_skill_operations() -> 
     )
 
 
-@pytest.mark.parametrize("missing_operation", [False, True])
-def test_tool_surface_probe_handles_long_descriptions_without_borrowing_operations(
-    tmp_path: Path,
-    missing_operation: bool,
-) -> None:
-    source_root = MANIFEST_PATH.parent.parent
-    source = source_root / "integrations/dsh/plugins/powercontext/src/tools.ts"
-    target = tmp_path / source.relative_to(source_root)
-    target.parent.mkdir(parents=True)
-    content = source.read_text(encoding="utf-8").replace(
-        "name: 'pc_skill_generate',",
-        "name: 'pc_skill_generate',\n      /* " + "long guidance " * 200 + " */",
-    )
-    if missing_operation:
-        content = content.replace("run(runtime, exec, 'generate_skill',", "unbound(runtime, exec, 'generate_skill',")
-    target.write_text(content, encoding="utf-8")
+def test_dsh_mcp_surface_matches_the_server_operation_catalog() -> None:
     manifest = load_integration_manifest()
-    toolset = next(item for item in manifest.toolsets if item.id == "dsh-tools")
+    toolset = next(item for item in manifest.toolsets if item.id == "dsh-mcp")
+    assert toolset.probe == "dsh_mcp"
+    assert all(tool.id.startswith("mcp__powercontext__") for tool in toolset.tools)
     isolated = manifest.model_copy(update={"toolsets": (toolset,), "integrations": ()})
-    errors = tool_surface_errors(isolated, tmp_path)
-    if missing_operation:
-        assert errors == (
-            "dsh-tools: tool surface drift (missing ['pc_skill_generate:generate_skill']; unexpected [])",
-        )
-    else:
-        assert errors == ()
+    assert tool_surface_errors(isolated) == ()
 
 
-def test_dify_declares_the_dsh_tool_surface_without_host_lifecycle_claims() -> None:
+def test_dify_declares_http_tools_without_host_lifecycle_claims() -> None:
     manifest = load_integration_manifest()
     toolsets = {item.id: item for item in manifest.toolsets}
-    assert {tool.id for tool in toolsets["dify-tools"].tools} == {tool.id for tool in toolsets["dsh-tools"].tools}
+    assert toolsets["dify-tools"].probe == "dify_tools"
+    assert {"pc_search:search_memory", "pc_skill_generate:generate_skill"} <= {
+        tool.id for tool in toolsets["dify-tools"].tools
+    }
     dify = next(item for item in manifest.integrations if item.id == "dify")
     assert dify.availability is IntegrationAvailability.EXPERIMENTAL
     assert dify.profiles == ()
     assert not {"acknowledge", "work_contract", "external_skill"} & set(dify.capabilities)
+
+
+@pytest.mark.parametrize("change", ["missing", "typo"])
+def test_dsh_probe_detects_plugin_catalog_drift(tmp_path: Path, change: str) -> None:
+    source_root = MANIFEST_PATH.parent.parent
+    plugin = tmp_path / "integrations/dsh/plugins/powercontext/src"
+    plugin.mkdir(parents=True)
+    shutil.copy(source_root / "integrations/dsh/plugins/powercontext/src/mcp.ts", plugin)
+    path = source_root / "integrations/dsh/plugins/powercontext/src/mcp-operations.generated.ts"
+    catalog = path.read_text(encoding="utf-8")
+    entry = '  "search_memory": {\n    "readOnly": true\n  },\n'
+    assert entry in catalog
+    replacement = "" if change == "missing" else entry.replace('"search_memory"', '"search_memories"')
+    (plugin / path.name).write_text(catalog.replace(entry, replacement), encoding="utf-8")
+    manifest = load_integration_manifest()
+    toolset = next(item for item in manifest.toolsets if item.id == "dsh-mcp")
+    isolated = manifest.model_copy(update={"toolsets": (toolset,), "integrations": ()})
+    errors = tool_surface_errors(isolated, tmp_path)
+    assert len(errors) == 1
+    assert "mcp__powercontext__search_memory" in errors[0]
 
 
 @pytest.mark.parametrize("change", ["missing", "operation"])
@@ -129,7 +133,7 @@ def test_dify_probe_checks_provider_entries_and_their_operation_bindings(tmp_pat
     else:
         entry = plugin / "tools/pc_skill_generate.py"
         entry.write_text(
-            entry.read_text(encoding="utf-8").replace('"generate_skill"', '"approve_artifact_candidate"'),
+            entry.read_text(encoding="utf-8").replace('"generate_skill"', '"approve_candidate"'),
             encoding="utf-8",
         )
     manifest = load_integration_manifest()
@@ -139,13 +143,113 @@ def test_dify_probe_checks_provider_entries_and_their_operation_bindings(tmp_pat
     assert len(errors) == 1
     assert "pc_skill_generate:generate_skill" in errors[0]
     if change == "operation":
-        assert "pc_skill_generate:approve_artifact_candidate" in errors[0]
+        assert "pc_skill_generate:approve_candidate" in errors[0]
 
 
 def test_manifest_defines_each_availability_state() -> None:
     manifest = load_integration_manifest()
 
     assert set(manifest.availability_definitions) == set(IntegrationAvailability)
+
+
+def test_manifest_v2_declares_pre_compaction_mode_for_every_maintained_agent_host() -> None:
+    manifest = load_integration_manifest()
+
+    assert manifest.schema_version == 2
+    modes = {
+        integration.id: integration.lifecycle.pre_compaction.mode.value
+        for integration in manifest.integrations
+        if integration.kind is IntegrationKind.AGENT_HOST and integration.lifecycle is not None
+    }
+    assert modes == {
+        "codex": "unsupported",
+        "claude-code": "unsupported",
+        "dsh": "unsupported",
+        "hermes": "unsupported",
+        "openclaw": "best_effort",
+        "opencode": "unsupported",
+        "pi": "best_effort",
+        "workbuddy": "unsupported",
+        "zcode": "unsupported",
+        "kimi-code": "unsupported",
+    }
+
+
+@pytest.mark.parametrize(
+    ("integration_id", "mutation"),
+    [
+        ("codex", lambda integration: integration.pop("lifecycle")),
+        (
+            "codex",
+            lambda integration: integration.__setitem__(
+                "lifecycle", {"pre_compaction": {"mode": "unsupported", "surface": "SessionStart"}}
+            ),
+        ),
+        (
+            "openclaw",
+            lambda integration: integration["lifecycle"]["pre_compaction"].__setitem__(
+                "surface", "private_compaction_callback"
+            ),
+        ),
+        (
+            "openclaw",
+            lambda integration: integration["lifecycle"].__setitem__(
+                "pre_compaction",
+                {"mode": "required_capable", "surface": "before_compaction"},
+            ),
+        ),
+        (
+            "openclaw",
+            lambda integration: integration["lifecycle"].__setitem__(
+                "pre_compaction",
+                {"mode": "unsupported"},
+            ),
+        ),
+    ],
+)
+def test_manifest_rejects_invalid_pre_compaction_declarations(integration_id: str, mutation) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == integration_id)
+    mutation(integration)
+
+    with pytest.raises(ValidationError):
+        IntegrationManifest.model_validate(payload)
+
+
+def test_manifest_rejects_lifecycle_declarations_from_non_agent_integrations() -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == "langchain")
+    integration["lifecycle"] = {"pre_compaction": {"mode": "unsupported"}}
+
+    with pytest.raises(ValidationError):
+        IntegrationManifest.model_validate(payload)
+
+
+def test_manifest_rejects_required_mode_opt_in_for_best_effort() -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == "openclaw")
+    integration["lifecycle"]["pre_compaction"]["required_mode_opt_in"] = "POWERCONTEXT_REQUIRED_CHECKPOINT"
+
+    with pytest.raises(ValidationError, match="only required_capable"):
+        IntegrationManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize("pointer", ["", "missing/required-capable-evidence.ts", "docs"])
+def test_lifecycle_evidence_must_reference_existing_files(pointer: str, tmp_path: Path) -> None:
+    payload = load_integration_manifest().model_dump(mode="json")
+    integration = next(item for item in payload["integrations"] if item["id"] == "openclaw")
+    integration["lifecycle"]["pre_compaction"]["evidence"]["implementation"] = [pointer]
+
+    if not pointer:
+        with pytest.raises(ValidationError):
+            IntegrationManifest.model_validate(payload)
+        return
+
+    (tmp_path / "docs").mkdir()
+    manifest = IntegrationManifest.model_validate(payload)
+    errors = evidence_path_errors(manifest, tmp_path)
+
+    assert f"openclaw: missing lifecycle implementation evidence: {pointer}" in errors
 
 
 @pytest.mark.parametrize("locale", ["en", "zh"])
@@ -232,6 +336,7 @@ def test_prompt_hook_probe_follows_registered_command(
                 "persistent_scope_binding",
             ],
             "toolsets": ["prompt-hooks"],
+            "lifecycle": {"pre_compaction": {"mode": "unsupported"}},
             "evidence": {
                 "implementation": ["integrations/codex/plugins/powercontext/hooks/recall.py"],
                 "documentation": ["integrations/codex/README.md"],
@@ -369,6 +474,12 @@ def integration_tree(tmp_path: Path) -> Path:
                 path = tmp_path / pointer
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("evidence\n", encoding="utf-8")
+        if integration.lifecycle is not None:
+            for paths in integration.lifecycle.pre_compaction.evidence.model_dump().values():
+                for pointer in paths:
+                    path = tmp_path / pointer
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("lifecycle evidence\n", encoding="utf-8")
     for name in manifest.directory_exclusions:
         (tmp_path / "integrations" / name).mkdir(parents=True)
     return tmp_path

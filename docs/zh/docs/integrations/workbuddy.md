@@ -21,7 +21,7 @@ description: 安装 PowerContext WorkBuddy hooks 并控制其本地行为。
 
 ## 使用 PowerContext CLI 安装
 
-WorkBuddy 不在 `setup select` 或 `doctor integrations` 的宿主目录中，使用本页的独立安装和诊断命令。
+WorkBuddy 支持 `setup workbuddy`、`config agent workbuddy` 和 `doctor workbuddy`，也可与其他 Agent 一起操作。
 
 CLI 可以从本地 checkout 或 GitHub 源一键安装 hooks、MCP Server 和 Skill：
 
@@ -66,7 +66,9 @@ WORKBUDDY_HOOKS_DIR="${WORKBUDDY_HOOKS_DIR:-$HOME/.workbuddy/hooks}"
 mkdir -p "$WORKBUDDY_HOOKS_DIR"
 cp "$PLUGIN"/hooks/workbuddy_powercontext_hook.py \
    "$PLUGIN"/hooks/workbuddy_settings.py \
+   "$PLUGIN"/hooks/powercontext_client_config.py \
    "$PLUGIN"/hooks/prepared_context.py \
+   "$PLUGIN"/hooks/prompt_privacy.py \
    "$WORKBUDDY_HOOKS_DIR"/
 cp "$PLUGIN/scripts/workspace_scope.py" \
    "$WORKBUDDY_HOOKS_DIR/powercontext_scope_binding.py"
@@ -153,9 +155,12 @@ powercontext doctor
   独立地把提示词采集为 Source 证据；
 - MCP 为 WorkBuddy 提供读取和维护 Memory 的显式工具，以及明确的 Handoff 工作流。
 
-`powercontext-project-context` Skill 把两条路径连接起来。诸如 `交接`、`交接当前工作` 或 `handoff this work`
-这样的指令会被视为创建持久交接里程碑的明确授权。Skill 会检查当前对话和仓库，调用
-`handoff_current_work`，然后通过 `commit_handoff` 立即提交返回的 `handoff`。预览或设计类请求保持只读。
+`powercontext-project-context` Skill 指导显式工作交接。对于 `交接`、`交接当前工作` 或 `handoff this work`
+等普通请求，Skill 检查当前对话和仓库，调用 `handoff_current_work`，并返回完整 `handoff` 成员作为临时载体。
+该操作记录 boundary Source，不会创建持久 Handoff Revision；接收方可通过 `selection: "prepared"` 和该精确载体继续。
+
+只有 `保存持久交接里程碑` 或 `commit a durable handoff` 等明确请求，才授权将返回载体原样传给 `commit_handoff`。
+必须成功返回精确 Revision，才能报告里程碑已提交。预览或设计请求保持只读；普通交接不授权提交。
 
 WorkBuddy 开始分析提示词前，Hook 只调用一次 `POST /v1/context/prepare`，请求 8000-byte 总预算。它
 严格校验 `powercontext.prepared-context.v1`，并原样注入返回内容。Runtime 负责把 Memory 内容标记为
@@ -270,3 +275,7 @@ query、scope、prepared content、citation、response body 或 authorization va
 3. 从 `<WORKBUDDY_HOOKS_DIR>` 删除 hook 文件和 scope resolver。
 4. 删除 `~/.workbuddy/skills/powercontext-project-context`。
 5. 可选：停止 Server 并删除其本地数据目录。
+
+## 自动输入隐私
+
+本宿主的捕获默认值、关闭方式、凭据识别局限及独立只读查询行为见[自动 prompt 隐私策略](index.md#自动-prompt-隐私策略)。识别到凭据的输入会跳过捕获，已接受的 Source 正文和事件身份不被改写。

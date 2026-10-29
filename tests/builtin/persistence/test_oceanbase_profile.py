@@ -19,6 +19,7 @@ import os
 from contextlib import AbstractAsyncContextManager
 from types import TracebackType
 from typing import cast
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -44,6 +45,10 @@ from powercontext.builtin.persistence.tables import (
 )
 
 VALID_URL = "mysql+aoceanbase://root%40tenant:secret@127.0.0.1:2881/powercontext?charset=utf8mb4"
+
+
+async def _skip_dream_preflight(_engine: AsyncEngine, *, _archive_recovery: bool = False) -> None:
+    """These profile unit tests use engine doubles; read-only preflight has integration coverage."""
 
 
 class _Result:
@@ -176,6 +181,7 @@ def test_oceanbase_profile_hides_sql_parameters(monkeypatch: pytest.MonkeyPatch)
 
         monkeypatch.setattr(oceanbase_profile_module, "create_async_engine", create_engine)
         monkeypatch.setattr(oceanbase_profile_module, "create_tables", create_no_tables)
+        monkeypatch.setattr(oceanbase_profile_module, "assert_dream_schema_ready", _skip_dream_preflight)
 
         async with OceanBaseProfile.open(OceanBaseConfig(url=SecretStr(VALID_URL)), tables=()):
             pass
@@ -201,6 +207,32 @@ def test_profile_requires_an_oceanbase_mysql_tenant(
         with pytest.raises(UnsupportedOceanBaseTenantError):
             async with OceanBaseProfile.attach(cast(AsyncEngine, engine), tables=()):
                 pass
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("version", ["5.7.25-OceanBase seekdb-v1.4.0.0", "8.0.40", "unknown"])
+def test_profile_recognizes_mysql_only_seekdb_without_tenant_variable(version, monkeypatch) -> None:
+    class Connection(_Connection):
+        async def exec_driver_sql(self, statement, parameters=None):
+            if statement == "SELECT VERSION()":
+                return _Result(((version,),))
+            return await super().exec_driver_sql(statement, parameters)
+
+    async def create_no_tables(_connection, _tables):
+        pass
+
+    async def scenario():
+        engine = _Engine(connection=Connection(row=None))
+        monkeypatch.setattr(oceanbase_profile_module, "create_tables", create_no_tables)
+        monkeypatch.setattr(oceanbase_profile_module, "assert_dream_schema_ready", _skip_dream_preflight)
+        if "seekdb" in version:
+            async with OceanBaseProfile.attach(cast(AsyncEngine, engine), tables=()):
+                pass
+        else:
+            with pytest.raises(UnsupportedOceanBaseTenantError):
+                async with OceanBaseProfile.attach(cast(AsyncEngine, engine), tables=()):
+                    pass
 
     asyncio.run(scenario())
 
@@ -232,6 +264,9 @@ def test_profile_rejects_legacy_identity_column_collation(monkeypatch: pytest.Mo
             created = True
 
         monkeypatch.setattr(oceanbase_profile_module, "create_tables", create_no_tables)
+        monkeypatch.setattr(oceanbase_profile_module, "assert_dream_schema_ready", _skip_dream_preflight)
+        # Migration acceptance tests exercise schema readiness with real database connections.
+        monkeypatch.setattr(oceanbase_profile_module, "prepare_topic_memory_recovery_schema", AsyncMock())
         with pytest.raises(IncompatibleOceanBaseSchemaError, match="utf8mb4_general_ci") as caught:
             async with OceanBaseProfile.attach(
                 cast(AsyncEngine, engine),
@@ -285,6 +320,8 @@ def test_profile_creates_tables_for_empty_or_compatible_schema(
             created.append(tables)
 
         monkeypatch.setattr(oceanbase_profile_module, "create_tables", create_selected_tables)
+        monkeypatch.setattr(oceanbase_profile_module, "assert_dream_schema_ready", _skip_dream_preflight)
+        monkeypatch.setattr(oceanbase_profile_module, "prepare_topic_memory_recovery_schema", AsyncMock())
         selected = (SOURCES_TABLE, *STATISTICS_TABLES)
         async with OceanBaseProfile.attach(cast(AsyncEngine, engine), tables=selected):
             pass

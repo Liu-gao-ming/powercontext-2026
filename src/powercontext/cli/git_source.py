@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import uuid4
 
-from powercontext.cli.system import SetupError
+from powercontext.cli.installation import SetupError
+from powercontext.paths import powercontext_data_dir
 
 _GITHUB_HOST = "github.com"
 
@@ -67,9 +70,9 @@ def clone_github_source(source: str, ref: str, target: Path) -> None:
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise SetupError.git_clone_failed() from error
+        raise SetupError("failed to clone the GitHub source") from error  # noqa: TRY003
     if completed.returncode != 0:
-        raise SetupError.git_clone_failed()
+        raise SetupError("failed to clone the GitHub source")  # noqa: TRY003
 
 
 def _repository_path(value: str) -> str:
@@ -80,3 +83,34 @@ def _repository_path(value: str) -> str:
     if len(parts) != 2 or any(not part or any(character.isspace() for character in part) for part in parts):
         raise InvalidGitHubSourceError
     return f"{parts[0]}/{parts[1]}.git"
+
+
+def source_checkout(source: str, ref: str) -> Path:
+    """Keep a separate checkout for each installation, including linked packages."""
+    if is_local_source(source):
+        return Path(source).expanduser().resolve()
+    try:
+        github_clone_url(source)
+    except InvalidGitHubSourceError:
+        raise SetupError("invalid GitHub source; use a local path or an HTTPS/SSH GitHub repository") from None  # noqa: TRY003
+    parent = powercontext_data_dir() / "checkouts"
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / uuid4().hex
+    try:
+        clone_github_source(source, ref, target)
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    return target
+
+
+def resolve_plugin_source(source: str, ref: str, host: str) -> Path:
+    """Locate a native package in a checkout, leaving installation to its host."""
+    from powercontext.cli.guidance import HOST_GUIDANCE
+
+    root = source_checkout(source, ref)
+    descriptor = HOST_GUIDANCE[host]
+    for candidate in (root, root / descriptor.plugin):
+        if descriptor.recognizes(candidate):
+            return candidate
+    raise SetupError(f"PowerContext {host} plugin was not found in source")  # noqa: TRY003

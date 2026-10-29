@@ -130,45 +130,18 @@ class RelationalScopedStatistics:
         self._write_timeout_seconds = write_timeout_seconds
 
     async def overview(self, period: StatisticsPeriod, as_of: datetime, /) -> Statistics:
-        captured_at = _as_utc(as_of)
-        resolved_period = _resolve_period(period, captured_at.date())
-        # Usage accepted before this read must be visible to it. Wait only for
-        # the prefix received so far, never for the whole queue, so a
-        # continuously producing runtime cannot stall the read.
-        await self._model_usage.flush()
-        async with self._database.transaction() as connection:
-            reads = await self._read(connection, resolved_period)
-        return self._assemble(reads, resolved_period, captured_at)
-
-    async def _read(self, connection: AsyncConnection, period: ResolvedUsagePeriod, /) -> _ScopeReads:
-        """Read one Scope's raw statistics rows on an already-open connection."""
-
-        cursor = await self._cursors.load(connection, self._scope_id, SOURCE_WINDOW_TRIGGER_NAME)
-        return _ScopeReads(
-            inventory=await self._repository.inventory(connection, self._scope_id),
-            processed_sources=_processed_sources(cursor),
-            usage=await self._repository.usage(connection, self._scope_id, period.start_date, period.end_date),
-            recall=(
-                ()
-                if self._token_estimator is None
-                else await self._repository.recall_usage(
-                    connection,
-                    self._scope_id,
-                    period.start_date,
-                    period.end_date,
-                    estimator_id=self._token_estimator.estimator_id,
-                    estimator_version=self._token_estimator.version,
-                )
-            ),
-            observations=await self._recurrence.observations(connection, self._scope_id),
-            unlinked_handoff_citations=await self._recurrence.unlinked_handoff_citations(
-                connection,
-                self._scope_id,
-                await self._cited_keys(connection),
-            ),
+        snapshot = (await overview_selection((self,), period, as_of))[0]
+        return Statistics(
+            selection=ScopeSelection(mode="exact", scope_ids=(self._scope_id,)),
+            scope_ids=(self._scope_id,),
+            as_of=_as_utc(as_of),
+            inventory=snapshot.inventory,
+            usage=snapshot.usage,
+            recall=snapshot.recall,
+            by_scope=(snapshot,),
         )
 
-    def _assemble(self, reads: _ScopeReads, period: ResolvedUsagePeriod, captured_at: datetime, /) -> Statistics:
+    def _assemble(self, reads: _ScopeReads, period: ResolvedUsagePeriod, /) -> ScopeStatistics:
         """Project one Scope's raw rows into the statistics contract."""
 
         artifacts = tuple(FamilyCount(family=family, total=total) for family, total in reads.inventory.artifacts)
@@ -192,22 +165,12 @@ class RelationalScopedStatistics:
             reads.observations,
             unlinked_handoff_citations=reads.unlinked_handoff_citations,
         )
-        return Statistics(
-            selection=ScopeSelection(mode="exact", scope_ids=(self._scope_id,)),
-            scope_ids=(self._scope_id,),
-            as_of=captured_at,
+        return ScopeStatistics(
+            scope_id=self._scope_id,
             inventory=inventory,
             usage=usage,
             recall=recall,
-            by_scope=(
-                ScopeStatistics(
-                    scope_id=self._scope_id,
-                    inventory=inventory,
-                    usage=usage,
-                    recall=recall,
-                    recurrence=recurrence,
-                ),
-            ),
+            recurrence=recurrence,
         )
 
     def offer_model_usage(
@@ -317,12 +280,21 @@ class RelationalScopedStatistics:
                 cited.extend(handoff_experience_citations(handoff.content))
         if not cited:
             return ()
-        experiences = []
-        for ref in cited:
-            try:
-                experiences.append(await self._artifacts.get(connection, self._scope_id, ref))
-            except RepositoryNotFoundError:
-                continue
+        unique = tuple(dict.fromkeys((ref.family, ref.artifact_id, ref.revision) for ref in cited))
+        refs = tuple(
+            ArtifactRef(family=family, artifact_id=artifact_id, revision=revision)
+            for family, artifact_id, revision in unique
+        )
+        try:
+            experiences = list(await self._artifacts.get_many(connection, self._scope_id, refs))
+        except RepositoryNotFoundError:
+            # get_many is all-or-nothing; skip dangling citations one by one as before.
+            experiences = []
+            for ref in refs:
+                try:
+                    experiences.append(await self._artifacts.get(connection, self._scope_id, ref))
+                except RepositoryNotFoundError:
+                    continue
         keys: set[tuple[str, str, int, str]] = set()
         for experience in experiences:
             content = experience.content
@@ -438,7 +410,7 @@ async def overview_selection(
     period: StatisticsPeriod,
     as_of: datetime,
     /,
-) -> tuple[Statistics, ...]:
+) -> tuple[ScopeStatistics, ...]:
     """Read a whole Scope selection in one transaction, one query per table instead of per Scope.
 
     The per-Scope reads answer the same question for every Scope, so issuing them once per
@@ -460,13 +432,7 @@ async def overview_selection(
     async with shared._database.transaction() as connection:
         inventories = await shared._repository.inventory_many(connection, scope_ids)
         cursors = await shared._cursors.load_many(connection, scope_ids, SOURCE_WINDOW_TRIGGER_NAME)
-        usage = await shared._repository.usage_many(
-            connection,
-            scope_ids,
-            resolved_period.start_date,
-            resolved_period.end_date,
-        )
-        recall = await _recall_by_scope(connection, shared._repository, services, resolved_period)
+        usage, recall = await _daily_usage_by_scope(connection, shared._repository, services, resolved_period)
         reads = [
             _ScopeReads(
                 inventory=inventories[service._scope_id],
@@ -483,38 +449,31 @@ async def overview_selection(
             for service in services
         ]
     return tuple(
-        service._assemble(scope_reads, resolved_period, captured_at)
-        for service, scope_reads in zip(services, reads, strict=True)
+        service._assemble(scope_reads, resolved_period) for service, scope_reads in zip(services, reads, strict=True)
     )
 
 
-async def _recall_by_scope(
+async def _daily_usage_by_scope(
     connection: AsyncConnection,
     repository: StatisticsRepository,
     services: Sequence[RelationalScopedStatistics],
     period: ResolvedUsagePeriod,
     /,
-) -> dict[str, tuple[StoredRecallTokenUsage, ...]]:
-    """Read recall aggregates once per estimator profile present in the selection."""
+) -> tuple[dict[str, tuple[StoredModelUsage, ...]], dict[str, tuple[StoredRecallTokenUsage, ...]]]:
+    """Read daily aggregates once per estimator profile present in the selection."""
 
-    grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
+    grouped: dict[tuple[str, str] | None, list[str]] = defaultdict(list)
     for service in services:
         estimator = service._token_estimator
-        if estimator is not None:
-            grouped[estimator.estimator_id, estimator.version].append(service._scope_id)
-    recall: dict[str, tuple[StoredRecallTokenUsage, ...]] = {}
-    for (estimator_id, estimator_version), scope_ids in grouped.items():
-        recall.update(
-            await repository.recall_usage_many(
-                connection,
-                tuple(scope_ids),
-                period.start_date,
-                period.end_date,
-                estimator_id=estimator_id,
-                estimator_version=estimator_version,
-            )
+        grouped[None if estimator is None else (estimator.estimator_id, estimator.version)].append(service._scope_id)
+    usage, recall = {}, {}
+    for estimator, scope_ids in grouped.items():
+        model_rows, recall_rows = await repository.daily_usage_many(
+            connection, tuple(scope_ids), period.start_date, period.end_date, estimator=estimator
         )
-    return recall
+        usage.update(model_rows)
+        recall.update(recall_rows)
+    return usage, recall
 
 
 def _processed_sources(cursor: StoredSourceCursor | None, /) -> int:

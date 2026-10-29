@@ -75,8 +75,14 @@ class DshTarget:
         return dsh_home() / "profiles" / self.profile
 
 
-def resolve_dsh_target(profile: DshProfile, command: Path | None = None) -> DshTarget:
-    """Resolve an explicit command or find the selected carrier on PATH."""
+def resolve_dsh_target(profile: DshProfile | None = None, command: Path | None = None) -> DshTarget:
+    """Resolve the requested or saved profile and its native carrier."""
+    from powercontext.client.transport_policy import load_client_settings
+
+    saved = load_client_settings("dsh")
+    profile = profile or DshProfile(saved.get("profile", "web"))
+    if command is None and saved.get("profile") == profile and saved.get("dsh_command"):
+        command = Path(saved["dsh_command"])
     from powercontext.cli.system import SetupError
 
     if command is not None:

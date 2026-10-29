@@ -80,6 +80,16 @@ output_schema:
         content_bytes:
           $ref: '#/definitions/Result/properties/content_bytes'
           type: number
+        reason:
+          $ref: '#/definitions/Result/properties/reason'
+          description: 'Why this preparation lost a retrieval channel it would otherwise
+            have used. Absent unless the request asked with `explain` and a channel
+            was lost, so a response a Host injects keeps its four fields. The values
+            are the two inference failures among RFC 1435''s four `SearchGroup.fallback_reason`
+            spellings, so a later Receipt reuses them instead of restating the cause.
+            `none` travels as absence, and `reused_fts_fallback` is not a cause here:
+            a later round reusing a failed round''s keyword-only outcome is still
+            explained by that round''s `inference_*` value, which outranks it.'
       description: Complete successful HTTP response; empty object on error or unknown
         outcome.
   required:
@@ -108,6 +118,23 @@ output_schema:
         content_bytes:
           type: integer
           minimum: 0
+        reason:
+          anyOf:
+          - allOf:
+            - type: string
+              enum:
+              - inference_timeout
+              - inference_unavailable
+            description: 'Why this preparation lost a retrieval channel it would otherwise
+              have used. Absent unless the request asked with `explain` and a channel
+              was lost, so a response a Host injects keeps its four fields. The values
+              are the two inference failures among RFC 1435''s four `SearchGroup.fallback_reason`
+              spellings, so a later Receipt reuses them instead of restating the cause.
+              `none` travels as absence, and `reused_fts_fallback` is not a cause
+              here: a later round reusing a failed round''s keyword-only outcome is
+              still explained by that round''s `inference_*` value, which outranks
+              it.'
+          - type: 'null'
       description: Complete successful HTTP response; empty object on error or unknown
         outcome.
 extra:

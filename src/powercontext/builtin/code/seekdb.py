@@ -203,6 +203,7 @@ class SeekDBGraphStore:
         with self.connection(deadline) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
             existing = {row[0] for row in cursor.fetchall()}
+            managed = "pc_schema_revision" in existing
             # Even IF NOT EXISTS acquires seekdb's DDL lock. Reopening a complete
             # index must not wait for unrelated internal schema initialization.
             for table, statement in zip(
@@ -210,12 +211,16 @@ class SeekDBGraphStore:
             ):
                 check_deadline(deadline)
                 if table not in existing:
+                    if managed:
+                        raise CodeError("code_storage_unavailable")
                     cursor.execute(statement)
             cursor.execute(
                 "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() "
                 "AND table_name = 'pc_code_nodes' AND index_name = 'ix_code_search'"
             )
             if cursor.fetchone()[0] == 0:
+                if managed:
+                    raise CodeError("code_storage_unavailable")
                 try:
                     cursor.execute(
                         "CREATE FULLTEXT INDEX ix_code_search ON pc_code_nodes (searchable_text) WITH PARSER SPACE"

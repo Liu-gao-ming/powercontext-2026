@@ -1,0 +1,6 @@
+# Generated inputs and run evidence stay outside Git.
+/data/xnli/calibration.json
+/data/xnli/held_out.json
+/results/jev-1.13/*
+!/results/jev-1.13/RESULTS.md
+/data/xnli/validation.json

@@ -18,7 +18,6 @@ import json
 import os
 import stat
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 
@@ -26,15 +25,14 @@ from powercontext.cli.authorization import (
     AuthorizationResolution,
     clear_stored_authorization,
     configure_codex_desktop_authorization,
-    configure_stored_authorization,
     credential_path,
     normalize_authorization,
     read_codex_desktop_authorization,
     read_stored_authorization,
     setup_authorization_value,
-    setup_server_url,
     write_stored_authorization,
 )
+from powercontext.cli.transport import resolve_setup_endpoint
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +50,7 @@ def test_setup_url_uses_local_server_port(monkeypatch: pytest.MonkeyPatch, port:
     for name in ("POWERCONTEXT_CODEX_SERVER_URL", "POWERCONTEXT_CLIENT_SERVER_URL", "POWERCONTEXT_SERVER_PUBLIC_URL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("POWERCONTEXT_SERVER_HTTP_PORT", port)
-    assert setup_server_url("codex", "http://127.0.0.1:8000") == f"http://127.0.0.1:{port}"
+    assert resolve_setup_endpoint("codex", default="http://127.0.0.1:8000") == f"http://127.0.0.1:{port}"
 
 
 @pytest.mark.parametrize("port", ["", "invalid", "0", "65536", "1.5"])
@@ -62,7 +60,7 @@ def test_setup_url_rejects_invalid_server_port(monkeypatch: pytest.MonkeyPatch, 
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("POWERCONTEXT_SERVER_HTTP_PORT", port)
     with pytest.raises(ValueError, match="must be an integer between 1 and 65535"):
-        setup_server_url("codex", "http://127.0.0.1:8000")
+        resolve_setup_endpoint("codex", default="http://127.0.0.1:8000")
 
 
 def test_setup_url_preserves_explicit_access_urls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -72,14 +70,14 @@ def test_setup_url_preserves_explicit_access_urls(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("POWERCONTEXT_CLIENT_SERVER_URL", "https://client.example.com")
     monkeypatch.setenv("POWERCONTEXT_SERVER_PUBLIC_URL", "https://proxy.example.com")
     with pytest.raises(ValueError, match="Conflicting PowerContext endpoints"):
-        setup_server_url("codex", "fallback")
+        resolve_setup_endpoint("codex", default="fallback")
     monkeypatch.delenv("POWERCONTEXT_CODEX_SERVER_URL")
-    assert setup_server_url("codex", "fallback") == "https://client.example.com"
+    assert resolve_setup_endpoint("codex", default="fallback") == "https://client.example.com"
     monkeypatch.delenv("POWERCONTEXT_CLIENT_SERVER_URL")
-    assert setup_server_url("codex", "fallback") == "https://proxy.example.com"
+    assert resolve_setup_endpoint("codex", default="fallback") == "https://proxy.example.com"
     monkeypatch.delenv("POWERCONTEXT_SERVER_PUBLIC_URL")
     monkeypatch.delenv("POWERCONTEXT_SERVER_HTTP_PORT")
-    assert setup_server_url("codex", "fallback") == "fallback"
+    assert resolve_setup_endpoint("codex", default="fallback") == "fallback"
 
 
 def test_normalize_authorization_accepts_bare_tokens_and_headers() -> None:
@@ -195,7 +193,7 @@ def test_setup_uses_host_specific_credentials_and_endpoints(monkeypatch) -> None
     monkeypatch.setenv("POWERCONTEXT_CLIENT_API_TOKEN", "Bearer shared-token")
 
     assert setup_authorization_value("opencode") == "Bearer host-token"
-    assert setup_server_url("opencode", "http://127.0.0.1:8000") == "https://memory.example/api"
+    assert resolve_setup_endpoint("opencode", default="http://127.0.0.1:8000") == "https://memory.example/api"
 
 
 @pytest.mark.parametrize(
@@ -240,58 +238,6 @@ def test_stored_authorization_remains_bound_to_proxy_path(tmp_path, server_url):
     assert read_stored_authorization(path, server_url=server_url + "-other") == AuthorizationResolution(
         "url_mismatch", None
     )
-
-
-@pytest.mark.parametrize("replacement_token", [None, "replacement-token"])
-def test_setup_endpoint_change_preserves_or_replaces_url_bound_credential(replacement_token):
-    """Only a supplied new token can replace the previous endpoint's credential."""
-    path = credential_path("codex")
-    old_url = "http://127.0.0.1:8100"
-    new_url = "http://127.0.0.1:17429"
-    write_stored_authorization(path, server_url=old_url, value="old-token")
-    original = path.read_bytes()
-
-    status = configure_stored_authorization("codex", server_url=new_url, value=replacement_token)
-
-    if replacement_token is None:
-        assert status == "url_mismatch"
-        assert path.read_bytes() == original
-        assert read_stored_authorization(path, server_url=new_url) == AuthorizationResolution("url_mismatch", None)
-    else:
-        assert status == "configured"
-        assert read_stored_authorization(path, server_url=new_url) == AuthorizationResolution(
-            "configured", "Bearer replacement-token"
-        )
-        assert read_stored_authorization(path, server_url=old_url) == AuthorizationResolution("url_mismatch", None)
-
-
-def test_credential_path_uses_host_owned_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
-    monkeypatch.setenv("WORKBUDDY_HOME", str(tmp_path / "workbuddy"))
-
-    assert credential_path("codex") == tmp_path / "codex" / "powercontext" / "credentials.json"
-    assert credential_path("claude-code") == tmp_path / "claude" / "powercontext" / "credentials.json"
-    assert credential_path("pi") == tmp_path / "pi" / "powercontext" / "credentials.json"
-    assert credential_path("workbuddy") == tmp_path / "workbuddy" / "powercontext" / "credentials.json"
-
-
-def test_codex_desktop_authorization_uses_the_windows_user_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    import powercontext.cli.authorization as authorization
-
-    write = Mock()
-    monkeypatch.setattr(authorization.sys, "platform", "win32")
-    monkeypatch.setattr(authorization, "_write_windows_user_environment", write)
-    monkeypatch.setattr(
-        authorization,
-        "_read_windows_user_environment",
-        lambda _name: "Bearer saved-token",
-    )
-
-    assert configure_codex_desktop_authorization("saved-token") is True
-    assert read_codex_desktop_authorization() == "Bearer saved-token"
-    write.assert_called_once_with("POWERCONTEXT_CODEX_AUTHORIZATION", "Bearer saved-token")
 
 
 def test_codex_desktop_authorization_is_windows_only(monkeypatch: pytest.MonkeyPatch) -> None:

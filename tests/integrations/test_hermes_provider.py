@@ -1064,6 +1064,81 @@ def test_extended_slash_commands_dispatch_json_operations(provider_and_client):
     assert [call[0] for call in client.calls] == ["request_operation", "request_operation"]
 
 
+def test_handoff_tools_accept_and_forward_advisory_rollover_reasons(provider_and_client):
+    provider, _client = provider_and_client
+    boundary_source = {"name": "content", "source_id": "turn-1"}
+    reasons = ["host_context_budget", "context_quality"]
+    schemas = {schema["name"]: schema["parameters"] for schema in provider.get_tool_schemas()}
+    for operation in ("powercontext_activate_handoff", "powercontext_prepare_handoff"):
+        rollover_schema = schemas[operation]["properties"]["rollover_reasons"]
+        assert rollover_schema == {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "user_requested",
+                    "host_context_budget",
+                    "host_compaction",
+                    "context_quality",
+                    "delegation",
+                    "manual_checkpoint",
+                ],
+            },
+            "maxItems": 6,
+        }
+
+    validate(
+        {
+            "boundary_source": boundary_source,
+            "objective": "Continue in a fresh session.",
+            "rollover_reasons": reasons,
+        },
+        schemas["powercontext_activate_handoff"],
+    )
+    validate(
+        {
+            "objective": "Continue in a fresh session.",
+            "evidence": [{"kind": "source", "source_ref": boundary_source}],
+            "rollover_reasons": reasons,
+        },
+        schemas["powercontext_prepare_handoff"],
+    )
+
+    activated = json.loads(
+        provider.handle_tool_call(
+            "powercontext_activate_handoff",
+            {
+                "boundary_source": boundary_source,
+                "objective": "Continue in a fresh session.",
+                "rollover_reasons": reasons,
+            },
+        )
+    )
+    prepared = json.loads(
+        provider.handle_tool_call(
+            "powercontext_prepare_handoff",
+            {
+                "objective": "Continue in a fresh session.",
+                "evidence": [{"kind": "source", "source_ref": boundary_source}],
+                "rollover_reasons": reasons,
+            },
+        )
+    )
+
+    assert activated["payload"] == {
+        "boundary_source": boundary_source,
+        "objective": "Continue in a fresh session.",
+        "rollover_reasons": reasons,
+        "scope_id": provider._scope_id,
+    }
+    assert prepared["payload"] == {
+        "objective": "Continue in a fresh session.",
+        "evidence": [{"kind": "source", "source_ref": boundary_source}],
+        "rollover_reasons": reasons,
+        "scope_id": provider._scope_id,
+    }
+
+
 def test_slash_commands_parse_unwrapped_citation_json_from_readme(provider_and_client):
     provider, client = provider_and_client
     citation = client.remember_memory(

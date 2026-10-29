@@ -116,13 +116,11 @@ def test_mcp_full_profile_preserves_review_and_external_fingerprints(tmp_path: P
                     generated = await call(f"generate_{family}", scope_id=scope_id, **evidence, **extra)
                     assert generated["status"] == "pending"
                     candidate = generated["candidate"]
-                    inspected = await call(
-                        "get_artifact_candidate", scope_id=scope_id, candidate_id=candidate["candidate_id"]
-                    )
+                    inspected = await call("get_candidate", scope_id=scope_id, candidate_id=candidate["candidate_id"])
                     assert inspected["status"] == "pending"
                     assert inspected["result_artifact"] is None
                     approved = await call(
-                        "approve_artifact_candidate",
+                        "approve_candidate",
                         scope_id=scope_id,
                         candidate_id=candidate["candidate_id"],
                         expected_version=candidate["version"],
@@ -184,6 +182,53 @@ class NoOpGenerator:
         return None
 
 
+def test_native_current_work_handoff_transfers_only_its_nested_prepared_carrier() -> None:
+    async def scenario() -> None:
+        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+            app = create_app(application=cast(ServerApplication, runtime))
+            async with Client(create_mcp_server(app)) as client:
+                scope = await client.call_tool(
+                    "create_scope",
+                    {"title": "DSH Handoff", "summary": "Native carrier", "idempotency_key": "dsh-handoff"},
+                )
+                scope_id = scope.structured_content["scope_id"]
+                result = await client.call_tool(
+                    "handoff_current_work",
+                    {
+                        "scope_id": scope_id,
+                        "source_id": "dsh-boundary",
+                        "handoff": {
+                            "schema": "powercontext.current-work-handoff.v1",
+                            "trust": "untrusted_input",
+                            "objective": "Continue the checked work",
+                            "state": [{"text": "README complete", "basis": "declared", "evidence": []}],
+                            "disposition": "continuable",
+                            "next_action": {"text": "Review examples", "basis": "declared", "evidence": []},
+                            "omissions": [],
+                        },
+                    },
+                )
+                assert not result.is_error
+                assert result.structured_content is not None
+                assert set(result.structured_content) == {"boundary", "handoff"}
+                assert result.structured_content["boundary"]["position"] == 1
+                prepared = result.structured_content["handoff"]
+                continuation = await client.call_tool(
+                    "continue_handoff", {"scope_id": scope_id, "selection": "prepared", "prepared": prepared}
+                )
+                assert not continuation.is_error
+                assert continuation.structured_content["status"] == "resolved"
+                assert continuation.structured_content["content"] == prepared["content"]
+                invalid = await client.call_tool(
+                    "continue_handoff",
+                    {"scope_id": scope_id, "selection": "prepared", "prepared": result.structured_content},
+                    raise_on_error=False,
+                )
+                assert invalid.is_error
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("configured", [False, True])
 def test_mcp_generation_distinguishes_missing_model_from_no_op(configured: bool) -> None:
     async def scenario() -> None:
@@ -218,7 +263,7 @@ def test_mcp_generation_distinguishes_missing_model_from_no_op(configured: bool)
                     else:
                         assert result.is_error
                         assert "503" in result.content[0].text
-                inbox = await client.call_tool("list_artifact_candidates", {"scope_id": scope_id})
+                inbox = await client.call_tool("list_candidates", {"scope_id": scope_id})
                 assert inbox.structured_content["candidates"] == []
 
     asyncio.run(scenario())

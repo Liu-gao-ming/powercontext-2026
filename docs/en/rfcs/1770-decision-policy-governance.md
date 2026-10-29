@@ -58,7 +58,7 @@ behaviour. RFC 1652 reserves Memory consolidation, supersession, and lifecycle e
 shared policy and observation contract, each consumer will reinvent its own threshold, fallback, privacy, and audit
 rules.
 
-The expected outcome is a small shared layer that lets implementation PRs proceed in a consistent order:
+For a policy that seeks promotion beyond `shadow` or `advisory`, the shared layer supports this evidence sequence:
 
 1. define a policy in shadow mode;
 2. collect observations without changing domain behaviour;
@@ -66,7 +66,9 @@ The expected outcome is a small shared layer that lets implementation PRs procee
 4. promote only the narrow action a policy has earned;
 5. keep domain authority, review, persistence, and access control in the owning service.
 
-This is an enablement RFC, not an adoption recommendation for a specific backend.
+This is an enablement RFC, not an adoption recommendation for a specific backend or a commitment to implement every
+listed consumer. A consumer may stop at `disabled`, `shadow`, or `advisory`; it does not need a replay runner, dashboard,
+or cross-consumer evaluation bundle unless it seeks a stronger mode.
 
 # Guide-level explanation
 
@@ -153,7 +155,7 @@ Promotion is based on replay and labeled evidence, not on provider claims.
 
 ## Boundaries that users should not expect
 
-This RFC does not add a general decision workflow engine. It does not let a model approve Review candidates, accept a
+This RFC does not add a general decision workflow engine. Gate evaluation does not approve Review candidates, accept a
 Handoff, verify task completion, deactivate Memory, install a Skill, or select tools for an agent. Those remain domain
 actions owned by existing PowerContext services and their review or authorization contracts.
 
@@ -350,8 +352,8 @@ Shadow mode requirements:
 2. Every gate attempt emits a `DecisionObservation`.
 3. Observations distinguish no-call, local-rule, successful backend, backend fallback, privacy fallback, and parse
    failure.
-4. The policy can be replayed or rescored without re-running the whole workload when enough exact references remain
-   resolvable.
+4. A policy considered for `enforcing` can be replayed or rescored without re-running the whole workload when enough
+   exact references remain resolvable.
 
 Replay has two forms:
 
@@ -360,6 +362,10 @@ Replay has two forms:
 
 Both forms must report their input coverage. A replay result that cannot resolve enough original material is not a
 negative result for the policy; it is an incomplete replay.
+
+Replay/rescore is required promotion evidence, not a required runtime feature for every `shadow` or `advisory` consumer.
+A consumer without that evidence must not be promoted to `enforcing`.
+Memory write-gate promotion evidence is tracked separately in [#1930](https://github.com/oceanbase/powercontext/issues/1930).
 
 ## Promotion criteria
 
@@ -417,8 +423,9 @@ rewrite Memory.
 ### RFC 0050
 
 Review Inbox remains the place for review-owned families and explicit review proposals. A gate may create a pending
-Candidate only where the owning family already supports that flow, and the model cannot approve the Candidate it
-creates.
+Candidate only where the owning family already supports that flow. Gate evaluation creates no approval; approval is
+a separate Review operation. An Agent authorized to call that operation can approve its own Candidate, so independent
+review requires distinct authenticated identities and suitable permission assignments.
 
 ## Compatibility, persistence, and API impact
 
@@ -474,7 +481,7 @@ PowerContext already has the building blocks:
 - RFC 1745 defines a decision-model rerank seam and the fail-closed distinction for reranking.
 - RFC 1560 defines a model-free recall sufficiency gate with bounded expansion.
 - RFC 1652 defines evidence-preserving Memory quality and lifecycle boundaries.
-- RFC 0050 defines the Review Inbox and the rule that generated candidates cannot approve themselves.
+- RFC 0050 defines the Review Inbox and the separate approval operation required before a Candidate becomes an Artifact.
 - RFC 0046 defines observability foundations that the observation stream should reuse rather than bypass.
 
 Adjacent systems provide cautionary examples. Hermes-style Jev plugins show the value of cheap code-invoked gates,
@@ -484,9 +491,6 @@ are candidate backends or reference points, not policy owners.
 
 # Unresolved questions
 
-- What is the first concrete storage target for `DecisionObservation`: structured logs, evaluation artifacts, or a
-  private internal ledger?
-- Which subset of observations should be retained by default, and for how long?
 - Should policy definitions live as Python constants, JSON/YAML resources, or both?
 - Which numeric promotion criteria should #1742 use if it is revised to conform to this RFC?
 - Do hosted-provider privacy boundaries need a user-facing configuration document before the first hosted backend is
@@ -499,6 +503,5 @@ are candidate backends or reference points, not policy owners.
 - A policy registry page in the dashboard showing active policies, modes, fallback rates, and last replay results.
 - A CLI command that replays one policy against recent observations and prints candidate thresholds.
 - A standard evaluation bundle for decision policies, shared by Jev, Laya, local rules, and future backends.
-- A private decision-observation ledger with retention controls and export for offline evaluation.
 - Policy-aware Review Inbox grouping, where a review item links back to the policy observation that suggested it.
 - Local-only decision backends for air-gapped deployments, using the same policy and observation contract.

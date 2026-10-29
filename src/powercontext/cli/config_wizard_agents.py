@@ -20,8 +20,6 @@ import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from powercontext.cli.hosts import FIRST_CLASS_HOSTS
-
 
 @dataclass(frozen=True, slots=True)
 class AgentSpec:
@@ -146,7 +144,7 @@ _HOST_METADATA = {
     ),
 }
 
-AGENT_SPECS: tuple[AgentSpec, ...] = tuple(_HOST_METADATA[host.name] for host in FIRST_CLASS_HOSTS)
+AGENT_SPECS: tuple[AgentSpec, ...] = tuple(_HOST_METADATA.values())
 AGENT_SPEC_BY_ID = {spec.identifier: spec for spec in AGENT_SPECS}
 
 

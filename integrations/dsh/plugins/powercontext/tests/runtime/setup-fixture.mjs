@@ -50,18 +50,19 @@ export function setupFixture(home, { dshHome = join(home, 'installed-dsh') } = {
     homePatch: join(env.DSH_HOME, 'cordis.patch.yml'), clients: env.POWERCONTEXT_CLIENT_CONFIG_FILE }
 }
 
-export async function installIntoHome(home, { customized = false } = {}) {
+export async function installIntoHome(home, { customized = false, serverUrl } = {}) {
   const { root, cli, native, profile, patch } = setupFixture(home)
   const customizations = '- id: agent-default-model\n  name: "@deepseek-ai/dsh-agent-default-model"\n'
   if (customized) {
     await native(['--profile', 'web', '--dump-default-config'])
     writeFileSync(patch, customizations)
   }
-  const setup = await cli(['setup', 'dsh', '--source', root])
+  const args = ['setup', 'dsh', '--source', root, '--server-url', serverUrl, '--json']
+  const setup = JSON.parse(await cli(args)).hosts.dsh
   if (customized) {
-    await cli(['setup', 'dsh', '--source', root])
+    await cli(args)
     assert.equal(readFileSync(patch, 'utf8'), customizations)
   }
   const doctor = await cli(['doctor', 'dsh', '--json'])
-  return { setup, doctor: JSON.parse(doctor), plugin: join(profile, 'node_modules/powercontext-dsh') }
+  return { setup, doctor: JSON.parse(doctor).hosts.dsh, plugin: join(profile, 'node_modules/powercontext-dsh') }
 }

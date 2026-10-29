@@ -118,35 +118,6 @@ def test_openclaw_config_path_and_common_url_precedence(tmp_path, monkeypatch):
     assert _resolve("openclaw") == ("http://common.example", False)
 
 
-def test_codex_installed_mcp_endpoint_is_authoritative(tmp_path, monkeypatch):
-    _write(
-        tmp_path / "CODEX_HOME/plugins/cache/local/powercontext/0.1.0/.mcp.json",
-        {
-            "mcpServers": {"powercontext": {"url": "http://memory.example:8000/mcp"}},
-        },
-    )
-    _save_shared(tmp_path, "codex", "http://memory.example:8000/", True)
-    monkeypatch.setenv("POWERCONTEXT_CODEX_SERVER_URL", "https://irrelevant.example")
-    monkeypatch.setenv("POWERCONTEXT_CLIENT_SERVER_URL", "https://irrelevant-common.example")
-    assert _resolve("codex") == ("http://memory.example:8000", True)
-
-
-@pytest.mark.parametrize("second_url", ["http://memory.example/mcp/", "http://another.example/mcp"])
-def test_codex_multiple_cache_versions_require_an_unambiguous_endpoint(tmp_path, second_url):
-    for version, url in (("1", "http://memory.example/mcp"), ("2", second_url)):
-        _write(
-            tmp_path / f"CODEX_HOME/plugins/cache/local/powercontext/{version}/.mcp.json",
-            {
-                "mcpServers": {"powercontext": {"url": url}},
-            },
-        )
-    if "another" in second_url:
-        with pytest.raises(ValueError, match="determine"):
-            _resolve("codex")
-    else:
-        assert _resolve("codex") == ("http://memory.example", False)
-
-
 def test_workbuddy_native_mcp_template_matches_hook_endpoint(tmp_path, monkeypatch):
     _write(
         tmp_path / "WORKBUDDY_HOME/mcp.json",

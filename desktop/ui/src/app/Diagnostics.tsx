@@ -17,7 +17,8 @@
 import { useState } from "react";
 import { desktopApi } from "../shared/ipc";
 import type { DiagnosticKind, DiagnosticReport } from "../generated/ipc";
-import type { Language } from "./messages";
+import { messages, type Language } from "./messages";
+import { PageFeedback } from "./PageFeedback";
 import { connectionError } from "./connection-messages";
 const labels: Record<string, [string, string]> = {
   support: ["平台支持", "Platform support"],
@@ -47,8 +48,6 @@ const labels: Record<string, [string, string]> = {
   ok: ["通过", "Passed"],
   degraded: ["部分可用", "Degraded"],
   skipped: ["未检查", "Skipped"],
-  present: ["已发现", "Present"],
-  missing: ["未发现", "Missing"],
   plugin: ["插件", "Plugin"],
   package: ["扩展包", "Package"],
   skill: ["技能", "Skill"],
@@ -59,6 +58,7 @@ const labels: Record<string, [string, string]> = {
 };
 export function Diagnostics({ language }: { language: Language }) {
   const zh = language === "zh";
+  const t = messages[language];
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<DiagnosticReport | null>(null);
   const [error, setError] = useState<unknown>(null);
@@ -100,22 +100,38 @@ export function Diagnostics({ language }: { language: Language }) {
         </button>
       </div>
       {busy && (
-        <p role="status">
-          {zh ? "正在检查本机，请稍候…" : "Checking this computer…"}
-        </p>
+        <PageFeedback
+          compact
+          kind="loading"
+          title={zh ? "正在检查本机，请稍候…" : "Checking this computer…"}
+        />
+      )}
+      {!busy && !report && error == null && (
+        <PageFeedback compact kind="empty" title={t.diagnosticIdle} />
       )}
       {error != null && (
-        <p role="alert">
-          {code === "not_found"
-            ? zh
-              ? "未找到已登记的本机 CLI；远程连接不受影响。"
-              : "No registered local CLI was found; remote connections are unaffected."
-            : code === "compatibility_unverified"
+        <PageFeedback
+          compact
+          kind="error"
+          title={
+            code === "not_found"
               ? zh
-                ? "本机 CLI 的摘要或版本未通过核验，请重新核对登记信息。"
-                : "The local CLI digest or version did not pass verification. Check its registration."
-              : connectionError(error, language)}
-        </p>
+                ? "未找到已登记的本机 CLI；远程连接不受影响。"
+                : "No registered local CLI was found; remote connections are unaffected."
+              : code === "compatibility_unverified"
+                ? zh
+                  ? "本机 CLI 注册未通过校验，请核对程序路径和摘要。"
+                  : "The local CLI registration did not pass verification. Check its executable path and digest."
+                : connectionError(error, language)
+          }
+          action={
+            kind && (
+              <button disabled={busy} onClick={() => void run(kind)}>
+                {t.retryDiagnostics}
+              </button>
+            )
+          }
+        />
       )}
       {report && (
         <div>
@@ -134,6 +150,13 @@ export function Diagnostics({ language }: { language: Language }) {
             )}{" "}
             · {zh ? "退出码" : "Exit code"}: {report.exitCode}
           </p>
+          <p>
+            CLI {zh ? "版本" : "version"}:{" "}
+            {report.cliVersion ?? (zh ? "未知" : "Unknown")}
+          </p>
+          {!report.items.length && !report.hosts.length && (
+            <PageFeedback compact kind="empty" title={t.diagnosticEmpty} />
+          )}
           <dl>
             {report.items.map((item) => (
               <div key={item.field}>
@@ -145,7 +168,7 @@ export function Diagnostics({ language }: { language: Language }) {
           {report.hosts.map((host) => (
             <section key={host.host}>
               <h4>
-                {host.host} · {label(host.presence)}
+                {host.host} · {label(host.status)}
               </h4>
               <dl>
                 {host.checks.map((item) => (

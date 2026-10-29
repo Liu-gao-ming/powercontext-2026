@@ -97,6 +97,28 @@ class InstalledPage:
     def wait_text(self, text: str) -> None:
         self.wait("return document.body.innerText.includes(arguments[0]);", [text])
 
+    def confirm(self, message: str, *, accept: bool) -> None:
+        """Check and answer the application's dialog with a real WebDriver click."""
+        dialog_xpath = "//div[@role='alertdialog' and @aria-modal='true']"
+        dialog = self.element(dialog_xpath)
+        if (
+            self.observe(
+                "return document.getElementById(arguments[0].getAttribute('aria-describedby'))?.textContent;",
+                [{ELEMENT: dialog}],
+            )
+            != message
+        ):
+            raise HarnessFailure("installed_confirmation_message_mismatch", message)
+        action = "确认" if accept else "取消"
+        self.click(f"{dialog_xpath}//button[normalize-space(.)='{action}']")
+        # A confirmed dirty editor can immediately open a second confirmation
+        # (for example, removing its profile). Wait only for this prompt to leave.
+        self.wait(
+            """return ![...document.querySelectorAll('[role=alertdialog]')].some(dialog =>
+              document.getElementById(dialog.getAttribute('aria-describedby'))?.textContent === arguments[0]);""",
+            [message],
+        )
+
     def profile(self, name: str) -> None:
         self.click(
             f"//ul[@class='profile-list']//span[@class='profile-name'][normalize-space(.)='{name}']/ancestor::button"
@@ -267,18 +289,14 @@ def exercise_connection_isolation(
         page.type("记忆内容", draft, "textarea")
         page.open_connection_menu()
         page.button("断开桌面连接")
-        alert = page.client.get(page.prefix + "/alert/text")
-        alert.raise_for_status()
-        if alert.json()["value"] != "丢弃尚未保存的输入？":  # noqa: RUF001 - exact localized UI
-            raise HarnessFailure("installed_disconnect_discard_confirmation_missing")
-        page.post("/alert/dismiss", {})
+        page.confirm("丢弃尚未保存的输入？", accept=False)  # noqa: RUF001 - exact localized UI
         if page.observe("return document.querySelector('.memory-workspace textarea')?.value;") != draft:
             raise HarnessFailure("installed_cancel_disconnect_lost_draft")
         if page.observe("return document.querySelector('.reader > .plain-text')?.textContent;") != text_b:
             raise HarnessFailure("installed_cancel_disconnect_changed_reader")
         page.open_connection_menu()
         page.button("断开桌面连接")
-        page.post("/alert/accept", {})
+        page.confirm("丢弃尚未保存的输入？", accept=True)  # noqa: RUF001 - exact localized UI
         page.wait_text("尚未连接")
         page.expect_empty_context()
         page.button("连接")
@@ -291,7 +309,7 @@ def exercise_connection_isolation(
         page.button("连接")
         page.profile("Desktop CI B")
         page.button("移除连接")
-        page.post("/alert/accept", {})
+        page.confirm("只移除此桌面配置和自有凭据，不停止服务或删除业务数据。继续？", accept=True)  # noqa: RUF001 - exact localized UI
         page.wait("""return ![...document.querySelectorAll('.profile-name')].some(
           name => name.textContent.trim() === 'Desktop CI B');""")
         for server, scope, reference, expected in (
@@ -363,7 +381,7 @@ def exercise_late_save(page: InstalledPage) -> None:
             page.click("//div[@class='topbar-group']/button")
             page.button("查找范围")
             page.click(f"//ul[@class='scope-list']/li[code[normalize-space(.)='{scope_b}']]/button")
-            page.post("/alert/accept", {})
+            page.confirm("丢弃尚未保存的输入？", accept=True)  # noqa: RUF001 - exact localized UI
             page.wait("return !document.querySelector('[role=dialog]');")
             draft = "new scope unsaved draft"
             page.type("记忆内容", draft, "textarea")
@@ -371,7 +389,7 @@ def exercise_late_save(page: InstalledPage) -> None:
             # This is shown only after the old form refreshes the native write record.
             page.wait_text("连接或范围已改变，旧正文已隐藏。")  # noqa: RUF001 - exact localized UI
             page.button("总览")
-            page.post("/alert/dismiss", {})
+            page.confirm("丢弃尚未保存的输入？", accept=False)  # noqa: RUF001 - exact localized UI
             if page.observe("return document.querySelector('.memory-workspace textarea')?.value;") != draft:
                 raise HarnessFailure("installed_late_save_lost_new_draft")
             original = server.post(

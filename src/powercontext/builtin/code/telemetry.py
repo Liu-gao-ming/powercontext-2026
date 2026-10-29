@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import time
@@ -25,7 +26,7 @@ from contextvars import ContextVar
 from functools import wraps
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
-from powercontext._logging import log_safely
+from powercontext._logging import error_category, log_safely
 from powercontext.builtin.code.errors import CodeError
 
 if TYPE_CHECKING:
@@ -59,11 +60,18 @@ def stage(name: str) -> Iterator[dict[str, TraceAttribute]]:
             span = candidate.__enter__()
             manager = candidate
     outcome = "success"
+    diagnostic_code: str | None = None
+    status_code: int | None = None
     try:
         yield attributes
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
     except BaseException as error:
         outcome = "failure"
-        attributes["reason"] = error.code if isinstance(error, CodeError) else type(error).__name__
+        diagnostic_code = error.code if isinstance(error, CodeError) else type(error).__name__
+        status_code = error.status if isinstance(error, CodeError) else None
+        attributes["reason"] = diagnostic_code
         raise
     finally:
         attributes["seconds"] = time.monotonic() - started
@@ -81,14 +89,32 @@ def stage(name: str) -> Iterator[dict[str, TraceAttribute]]:
                 attributes["children_lifetime_max_rss_bytes"] = (
                     resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * scale
                 )
+        category = error_category(diagnostic_code, status_code=status_code, outcome=outcome)
         if span is not None:
             with suppress(Exception):
                 span.set_attributes({"powercontext.code." + key: value for key, value in attributes.items()})
+                if category is not None:
+                    span.set_attributes({"powercontext.error.category": category})
                 span.set_outcome(outcome)
         if manager is not None:
             with suppress(Exception):
                 manager.__exit__(None, None, None)
-        log_safely(_logger, logging.DEBUG, "Code stage completed", extra={"event": "code." + name, **attributes})
+        log_safely(
+            _logger,
+            logging.DEBUG,
+            "Code stage completed",
+            extra={
+                **attributes,
+                "code_operation": attributes.get("operation"),
+                "event": "code." + name,
+                "unit": "stage",
+                "operation": "code." + name,
+                "duration_ms": float(attributes["seconds"]) * 1000,
+                "error_code": diagnostic_code,
+                "status_code": status_code,
+                "error_category": category,
+            },
+        )
 
 
 def observed(name: str) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:

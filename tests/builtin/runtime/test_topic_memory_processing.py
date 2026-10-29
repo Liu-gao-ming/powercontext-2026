@@ -62,6 +62,7 @@ from powercontext.builtin.artifacts.topic_memory.generation import (
     TopicMemoryProbeInput,
     TopicMemoryProbeOutput,
     TopicMemoryProposal,
+    TopicMemoryReconcileOutput,
     TopicMemoryTemporaryInput,
     TopicMemoryTemporaryOutput,
     topic_memory_stage_fixed_prompt,
@@ -80,7 +81,10 @@ from powercontext.builtin.persistence.processing import ArtifactProcessingPendin
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
 from powercontext.builtin.persistence.sources import SourceRepository
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
-from powercontext.builtin.persistence.sqlite.topic_memory_index import SQLiteTopicMemoryFTSIndex
+from powercontext.builtin.persistence.sqlite.topic_memory_index import (
+    SQLiteTopicMemoryFTSIndex,
+    SQLiteTopicMemoryVectorIndex,
+)
 from powercontext.builtin.persistence.supervision import ArtifactProcessingLeaseRepository
 from powercontext.builtin.persistence.tables import (
     BUILTIN_TABLES,
@@ -198,8 +202,8 @@ class _FenceRevokingTopicRepository(TopicMemoryRepository):
         super().__init__(artifacts=delegate.artifacts, index=delegate.index)
         self._leases = leases
 
-    async def publish_create(self, connection, scope_id, artifact_id, draft, projection, /):
-        published = await super().publish_create(connection, scope_id, artifact_id, draft, projection)
+    async def publish_creates(self, connection, scope_id, items, /, *, known_sources=()):
+        published = await super().publish_creates(connection, scope_id, items, known_sources=known_sources)
         await self._leases.start_single_process_term(connection, "replacement-holder")
         return published
 
@@ -263,9 +267,16 @@ def _stages(
     )
 
 
-async def _repositories(config: SQLiteConfig | None = None):
-    index = CompositeTopicMemoryIndex(SQLiteTopicMemoryFTSIndex())
-    profile = SQLiteProfile.open(SQLiteConfig() if config is None else config, tables=BUILTIN_TABLES + index.tables)
+async def _repositories(config: SQLiteConfig | None = None, *, embedding_profile: EmbeddingProfile | None = None):
+    index = CompositeTopicMemoryIndex(
+        SQLiteTopicMemoryFTSIndex(),
+        *((SQLiteTopicMemoryVectorIndex(embedding_profile),) if embedding_profile is not None else ()),
+    )
+    profile = SQLiteProfile.open(
+        SQLiteConfig() if config is None else config,
+        tables=BUILTIN_TABLES + index.tables,
+        load_vector_extension=embedding_profile is not None,
+    )
     opened = await profile.__aenter__()
     topics = TopicMemoryRepository(index=index)
     async with opened.database.transaction() as connection:
@@ -321,6 +332,167 @@ def test_processor_create_and_noop_advance_cursor_atomically() -> None:
             assert cursor is not None and cursor.cursor.sequence == stored.journal_position
             probe_input = stages.probe.inputs[0]
             assert "note-1" not in probe_input.model_dump_json()
+        finally:
+            await manager.__aexit__(None, None, None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("with_vectors", [False, True])
+@pytest.mark.parametrize("bound_candidate", [False, True])
+def test_processor_publishes_stopword_only_content(with_vectors, bound_candidate) -> None:
+    class Embedding:
+        profile = EmbeddingProfile(profile_id="empty-lexical", model="fixture", dimension=2)
+
+        async def embed(self, texts, /):
+            return EmbeddingResult(vectors=tuple((1.0, 0.0) for _ in texts))
+
+    async def scenario() -> None:
+        embedding = Embedding() if with_vectors else None
+        manager, profile, sources, topics = await _repositories(
+            embedding_profile=None if embedding is None else embedding.profile
+        )
+        try:
+            content = TopicMemoryContent(title="New", summary="First", detail="One")
+            leases = ArtifactProcessingLeaseRepository()
+            historical = None
+            async with profile.database.transaction() as connection:
+                source = await sources.add(
+                    connection,
+                    "scope-a",
+                    NoteSource(name="note", materialization=SourceMaterialization.CAPTURED, body="New First One"),
+                )
+                if bound_candidate or with_vectors:
+                    old_content = TopicMemoryContent(
+                        title="historymarker", summary="Prior evidence", detail="Prior state"
+                    )
+                    projection = prepare_topic_memory_projection(old_content)
+                    if embedding is not None:
+                        projection = prepare_topic_memory_projection(
+                            old_content,
+                            topic_embedding=(1.0, 0.0),
+                            chunk_embeddings=((1.0, 0.0),) * len(projection.chunks),
+                            embedding_profile=embedding.profile,
+                        )
+                    historical = await topics.publish_create(
+                        connection,
+                        "scope-a",
+                        "history",
+                        TopicMemoryDraft(content=old_content, sources=(source.ref,)),
+                        projection,
+                    )
+                term = await leases.start_single_process_term(connection, "holder")
+            proposal = TopicMemoryProposal(
+                content=content,
+                evidence_ids=("evidence-0001",),
+                candidate_id="candidate-0001" if bound_candidate else None,
+            )
+            stages = _stages(
+                probe=TopicMemoryProbeOutput(
+                    probes=(
+                        TopicMemoryProbe(
+                            query="historymarker" if bound_candidate else "unmatched", evidence_ids=("evidence-0001",)
+                        ),
+                    )
+                ),
+                global_output=TopicMemoryGlobalOutput(proposals=(proposal,)),
+                reconcile=(
+                    TopicMemoryReconcileOutput(
+                        proposals=(
+                            proposal.model_copy(
+                                update={
+                                    "candidate_id": "candidate-0001",
+                                    "proposal_id": "proposal-0001",
+                                }
+                            ),
+                        )
+                    ),
+                ),
+            )
+            processor = TopicMemoryProcessor(
+                database=profile.database,
+                sources=sources,
+                topics=topics,
+                stages=stages,
+                publisher=TopicMemoryAtomicPublisher(profile.database, sources, topics, leases=leases),
+                embedding_model=embedding,
+                id_factory=lambda: "created",
+            )
+
+            assert (await processor.process(_assignment(term.fence("single-process")))).outcome.value == "succeeded"
+            async with profile.database.transaction() as connection:
+                current = await topics.browse_current(connection, "scope-a", limit=10)
+                ref = current[0].artifact_ref
+                published = await topics.get_exact(connection, "scope-a", ref)
+            assert len(current) == 1
+            assert published.topic.content == content
+            assert ref.artifact_id == ("history" if historical is not None else "created")
+            assert ref.revision == (2 if historical is not None else 1)
+        finally:
+            await manager.__aexit__(None, None, None)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("query", ['"the"', "not"])
+def test_processor_updates_history_from_quoted_stopwords_and_negations(query) -> None:
+    async def scenario() -> None:
+        manager, profile, sources, topics = await _repositories()
+        try:
+            leases = ArtifactProcessingLeaseRepository()
+            content = TopicMemoryContent(title="the not", summary="historical evidence", detail="Historical state")
+            updated = TopicMemoryContent(title="Updated topic", summary="Remembered state", detail="Updated state")
+            async with profile.database.transaction() as connection:
+                await sources.add(
+                    connection,
+                    "scope-a",
+                    NoteSource(
+                        name="note", materialization=SourceMaterialization.CAPTURED, body="Update remembered state"
+                    ),
+                )
+                historical = await topics.publish_create(
+                    connection,
+                    "scope-a",
+                    "history",
+                    TopicMemoryDraft(content=content),
+                    prepare_topic_memory_projection(content),
+                )
+                term = await leases.start_single_process_term(connection, "holder")
+            processor = TopicMemoryProcessor(
+                database=profile.database,
+                sources=sources,
+                topics=topics,
+                stages=_stages(
+                    probe=TopicMemoryProbeOutput(
+                        probes=(TopicMemoryProbe(query=query, evidence_ids=("evidence-0001",)),)
+                    ),
+                    global_output=TopicMemoryGlobalOutput(
+                        proposals=(
+                            TopicMemoryProposal(
+                                content=updated, candidate_id="candidate-0001", evidence_ids=("evidence-0001",)
+                            ),
+                        )
+                    ),
+                    planner=TopicMemoryPlannerOutput(items=(TopicMemoryPlanItem(probe_ids=("probe-0001",)),)),
+                    evolve=(
+                        TopicMemoryEvolveOutput(
+                            proposal=TopicMemoryProposal(content=updated, evidence_ids=("evidence-0001",))
+                        ),
+                    ),
+                ),
+                publisher=TopicMemoryAtomicPublisher(profile.database, sources, topics, leases=leases),
+            )
+
+            assert (await processor.process(_assignment(term.fence("single-process")))).outcome.value == "succeeded"
+            async with profile.database.transaction() as connection:
+                current = await topics.browse_current(connection, "scope-a", limit=10)
+                assert len(current) == 1
+                ref = current[0].artifact_ref
+                published = await topics.get_exact(connection, "scope-a", ref)
+            assert ref.artifact_id == historical.topic.artifact_id
+            assert ref.revision == 2
+            assert published.topic.content == updated
+            assert published.topic.lineage.artifacts == (historical.topic.as_ref(),)
         finally:
             await manager.__aexit__(None, None, None)
 
@@ -915,6 +1087,9 @@ def test_history_selection_applies_threshold_floor_cap_and_stable_exact_binding(
                 async def get_exact(self, _connection, _scope_id, ref):
                     return stored[ref.artifact_id]
 
+                async def get_exact_many(self, connection, scope_id, refs):
+                    return tuple([await self.get_exact(connection, scope_id, ref) for ref in refs])
+
             processor = TopicMemoryProcessor(
                 database=profile.database,
                 sources=sources,
@@ -1003,6 +1178,9 @@ def test_global_structural_ambiguity_falls_back_to_lightweight_planner(
 
                 async def get_exact(self, _connection, _scope_id, _ref):
                     return published
+
+                async def get_exact_many(self, connection, scope_id, refs):
+                    return tuple([await self.get_exact(connection, scope_id, ref) for ref in refs])
 
             global_proposals = tuple(
                 TopicMemoryProposal(
@@ -1416,6 +1594,9 @@ def test_related_coordination_fails_closed_for_candidate_union_above_stage_contr
             async def get_exact(self, _connection, _scope_id, ref):
                 return published[ref.artifact_id]
 
+            async def get_exact_many(self, connection, scope_id, refs):
+                return tuple([await self.get_exact(connection, scope_id, ref) for ref in refs])
+
         try:
             stages = _stages(probe=TopicMemoryProbeOutput(), global_output=TopicMemoryGlobalOutput())
             processor = TopicMemoryProcessor(
@@ -1500,6 +1681,9 @@ def test_related_coordination_fails_closed_and_keeps_cursor_when_history_exceeds
 
                 async def get_exact(self, _connection, _scope_id, _ref):
                     return published
+
+                async def get_exact_many(self, connection, scope_id, refs):
+                    return tuple([await self.get_exact(connection, scope_id, ref) for ref in refs])
 
             class UnexpectedPublisher:
                 async def publish(self, *_args, **_kwargs):
@@ -1591,6 +1775,9 @@ async def _union_over_stage_contract_setup(*, retrying: bool = False):
 
         async def get_exact(self, _connection, _scope_id, ref):
             return published[ref.artifact_id]
+
+        async def get_exact_many(self, connection, scope_id, refs):
+            return tuple([await self.get_exact(connection, scope_id, ref) for ref in refs])
 
     leases = ArtifactProcessingLeaseRepository()
     async with profile.database.transaction() as connection:
@@ -2154,7 +2341,8 @@ def test_oversized_source_preserves_all_evidence_and_reaches_tail_at_the_same_bu
     asyncio.run(scenario())
 
 
-def test_oversized_source_temporary_fragments_publish_atomically_with_original_lineage() -> None:
+@pytest.mark.parametrize("invalid_final", [False, True])
+def test_oversized_source_temporary_fragments_publish_atomically_with_original_lineage(invalid_final) -> None:
     class Planner:
         async def generate(self, value: TopicMemoryPlannerInput, /):
             return GenerationResult(
@@ -2192,11 +2380,12 @@ def test_oversized_source_temporary_fragments_publish_atomically_with_original_l
                 TopicMemoryProbeOutput(probes=(TopicMemoryProbe(query="segmented", evidence_ids=("evidence-0001",)),))
             )
             temporary = TemporaryGenerator(proposal)
+            evolver = _RepeatingGenerator(TopicMemoryEvolveOutput(proposal=proposal))
             stages = TopicMemoryStageSet(
                 probe=probe,
                 planner=Planner(),
                 temporary=temporary,
-                evolver=_RepeatingGenerator(TopicMemoryEvolveOutput(proposal=proposal)),
+                evolver=evolver,
                 global_evolver=_QueueGenerator(),
                 reconciler=_QueueGenerator(),
                 estimator=character_token_estimator(),
@@ -2221,6 +2410,28 @@ def test_oversized_source_temporary_fragments_publish_atomically_with_original_l
             temporary.fail_tail = False
             temporary.inputs.clear()
             probe.inputs.clear()
+            if invalid_final:
+                evolver.output = TopicMemoryEvolveOutput(
+                    proposal=TopicMemoryProposal(
+                        content=TopicMemoryContent(
+                            title="T-19",
+                            summary="S-19 coordinated without merging historical identities.",
+                            detail="D-19 coordinated detail preserving distinct historical identity.",
+                        ),
+                        evidence_ids=("evidence-0001",),
+                    )
+                )
+                with pytest.raises(TopicMemoryGenerationError, match="invalid_topic_placeholder"):
+                    await processor.process(assignment)
+                async with profile.database.transaction() as connection:
+                    assert await topics.browse_current(connection, "scope-a", limit=10) == ()
+                    assert (
+                        await SourceCursorRepository().load(connection, "scope-a", TOPIC_MEMORY_SOURCE_WINDOW_BINDING)
+                        is None
+                    )
+                evolver.output = TopicMemoryEvolveOutput(proposal=proposal)
+                temporary.inputs.clear()
+                probe.inputs.clear()
             assert (await processor.process(assignment)).outcome is ArtifactProcessingWorkerOutcome.SUCCEEDED
             for inputs, stage in ((probe.inputs, "probe"), (temporary.inputs, "temporary")):
                 assert len(inputs) > 1

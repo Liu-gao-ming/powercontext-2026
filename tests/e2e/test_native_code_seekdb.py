@@ -511,11 +511,16 @@ def test_process_exit_before_publication_recovers_without_partial_results(reposi
         assert cursor.fetchone()[0] == 2
 
 
-def test_http_prepare_online_cli_sync_and_restart(tmp_path, backend):
-    database, _ = backend
+def test_http_prepare_online_cli_sync_and_restart(tmp_path):
+    database = SeekDBConfig(path=tmp_path / "server-database")
     root = make_repository(tmp_path)
 
     async def exercise():
+        bootstrap = create_server_app(
+            settings=ServerSettings(database=database, code=CodeConfig(enabled=True, cache_dir=tmp_path / "cache"))
+        )
+        async with bootstrap.router.lifespan_context(bootstrap):
+            pass
         async with open_builtin_runtime(
             BuiltinConfig(database=database), scheduler_path=tmp_path / "scheduler.db"
         ) as runtime:

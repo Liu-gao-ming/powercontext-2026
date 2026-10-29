@@ -29,7 +29,15 @@ try {
   for (const [name, path] of [['server', '/health/ready'], ['protected_api', '/v1/capabilities']]) {
     try {
       const response = await request(settings, 'GET', path, undefined, signal)
-      checks[name] = { status: response.status === 200 ? 'ok' : 'failed', code: response.status === 200 ? name === 'server' ? 'ready' : 'protected_api_reachable' : 'invalid_response' }
+      if (name === 'server') {
+        const state = response.body?.status
+        const details = response.body?.checks
+        const valid = response.status === 200 && details && typeof details === 'object' && !Array.isArray(details) &&
+          Object.values(details).every(item => typeof item === 'string') && Object.keys(response.body).every(key => ['status', 'checks'].includes(key))
+        checks[name] = valid && (state === 'ready' || state === 'degraded')
+          ? { status: state === 'ready' ? 'ok' : 'degraded', code: state, checks: details }
+          : { status: 'failed', code: 'server_unavailable' }
+      } else checks[name] = { status: response.status === 200 ? 'ok' : 'failed', code: response.status === 200 ? 'protected_api_reachable' : 'invalid_response' }
     } catch (error) { checks[name] = { status: 'failed', code: failureCode(error) } }
   }
   let scope
@@ -67,5 +75,5 @@ try {
   } else checks.runtime = { status: 'skipped', code: 'not_observed' }
   checks.mcp_session = { status: 'skipped', code: 'not_observed' }
 } catch { checks.probe = { status: 'failed', code: 'invalid_arguments' } }
-console.log(JSON.stringify({ schema: 'powercontext.zcode.diagnostics.v1', checks }))
+console.log(JSON.stringify({ schema: 'powercontext.zcode.diagnostics.v2', checks }))
 if (Object.values(checks).some(check => check.status === 'failed')) process.exitCode = 1

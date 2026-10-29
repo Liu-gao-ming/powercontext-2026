@@ -21,10 +21,43 @@ from pydantic import AnyHttpUrl, SecretStr, ValidationError
 
 from powercontext.builtin.runtime import RuntimeConfig
 from powercontext.builtin.runtime.config import InferenceConfig
+from powercontext.builtin.runtime.decision_policy import DecisionPolicyMode, DecisionPrivacyBoundary
 
 
 def test_decision_assistance_is_disabled_by_default() -> None:
     assert RuntimeConfig().decision_assistance_enabled is False
+
+
+def test_memory_write_gate_defaults_to_no_external_call() -> None:
+    assert RuntimeConfig().memory_write_gate_privacy_boundary is DecisionPrivacyBoundary.NO_EXTERNAL_CALL
+
+
+def test_memory_write_gate_defaults_to_shadow_mode() -> None:
+    assert RuntimeConfig().memory_write_gate_mode is DecisionPolicyMode.SHADOW
+
+
+def test_decision_observation_retention_is_disabled_until_explicitly_configured() -> None:
+    assert RuntimeConfig().decision_observation_retention_days is None
+    assert RuntimeConfig(decision_observation_retention_days=30).decision_observation_retention_days == 30
+
+
+@pytest.mark.parametrize("retention_days", [0, -1])
+def test_decision_observation_retention_rejects_nonpositive_values(retention_days: int) -> None:
+    with pytest.raises(ValidationError):
+        RuntimeConfig(decision_observation_retention_days=retention_days)
+
+
+def test_memory_write_gate_accepts_hosted_redaction_for_runtime_validation() -> None:
+    config = RuntimeConfig(memory_write_gate_privacy_boundary=DecisionPrivacyBoundary.HOSTED_REDACTED)
+
+    assert config.memory_write_gate_privacy_boundary is DecisionPrivacyBoundary.HOSTED_REDACTED
+    assert config.memory_write_gate_sanitizer == "none"
+
+
+def test_memory_write_gate_accepts_an_explicit_known_secret_sanitizer() -> None:
+    config = RuntimeConfig(memory_write_gate_sanitizer="known_secrets")
+
+    assert config.memory_write_gate_sanitizer == "known_secrets"
 
 
 def test_decision_inference_defaults_are_unset() -> None:

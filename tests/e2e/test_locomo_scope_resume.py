@@ -80,16 +80,20 @@ def test_locomo_ingestion_registers_and_resumes_its_scope_after_restart(
             output = {"label": "CORRECT"} if "gold_answer" in value else {"answer": "7 May 2023"}
         return ModelResponse(parts=[TextPart(json.dumps(output))])
 
+    opened_clients: list[str] = []
+
     def infer_model(model, **kwargs):
+        opened_clients.append(str(model))
         return model if isinstance(model, Model) else FunctionModel(respond)
 
     monkeypatch.setattr("pydantic_ai.models.infer_model", infer_model)
     monkeypatch.setattr(runner, "infer_model", infer_model)
 
-    monkeypatch.setattr(
-        "pydantic_ai.embeddings.infer_embedding_model",
-        lambda model, **kwargs: TestEmbeddingModel() if isinstance(model, str) else model,
-    )
+    def infer_embedding_model(model, **kwargs):
+        opened_clients.append(str(model))
+        return TestEmbeddingModel() if isinstance(model, str) else model
+
+    monkeypatch.setattr("pydantic_ai.embeddings.infer_embedding_model", infer_embedding_model)
 
     async def ingest(run_id: str):
         return await runner.ingest_dataset(
@@ -130,6 +134,9 @@ def test_locomo_ingestion_registers_and_resumes_its_scope_after_restart(
     )
     ingestion_path = tmp_path / "scope-resume" / "ingestion.json"
     frozen_ingestion = ingestion_path.read_bytes()
+    # A database that cannot resolve a recorded Scope has to say so before any model client --
+    # the runtime's generation and embedding providers included -- is opened.
+    opened_clients.clear()
     with pytest.raises(ScopeNotFoundError):
         asyncio.run(
             runner.evaluate_dataset(
@@ -140,6 +147,7 @@ def test_locomo_ingestion_registers_and_resumes_its_scope_after_restart(
                 top_k=1,
             )
         )
+    assert opened_clients == []
     with pytest.raises(ScopeNotFoundError):
         asyncio.run(
             runner.ingest_dataset(
@@ -149,6 +157,7 @@ def test_locomo_ingestion_registers_and_resumes_its_scope_after_restart(
                 output_directory=tmp_path / "scope-resume",
             )
         )
+    assert opened_clients == []
     assert ingestion_path.read_bytes() == frozen_ingestion
     assert not (tmp_path / "scope-resume" / "observations.jsonl").exists()
 

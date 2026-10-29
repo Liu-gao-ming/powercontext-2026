@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -32,6 +34,7 @@ from sqlalchemy import Connection, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from powercontext.builtin.persistence import dream_schema
 from powercontext.builtin.persistence.migrations import connections
 from powercontext.builtin.persistence.migrations.connections import BackendIdentity, MaintenanceConnections
 from powercontext.builtin.persistence.migrations.locking import local_migration_lock
@@ -408,3 +411,93 @@ def test_real_oceanbase_single_host_coordinator_excludes_other_maintenance_and_s
         return target
 
     assert adapter.run(reacquire, writable=True) == identity
+
+
+def _statement_snapshot_adapter(target):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{target}")
+
+    class NativeReadConnection:
+        dialect = SimpleNamespace(name="mysql")
+
+        def __init__(self):
+            self.connection = engine.connect()
+
+        async def __aenter__(self):
+            await self.connection.__aenter__()
+            return self
+
+        async def __aexit__(self, *args):
+            return await self.connection.__aexit__(*args)
+
+        async def exec_driver_sql(self, statement):
+            translated = {
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT": "BEGIN",
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ": "SELECT 1",
+                "START TRANSACTION": "SELECT 1",
+            }.get(statement, statement)
+            return await self.connection.exec_driver_sql(translated)
+
+        async def run_sync(self, operation, *args, **kwargs):
+            return await self.connection.run_sync(operation, *args, **kwargs)
+
+        async def invalidate(self):
+            await self.connection.invalidate()
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def database_name(connection, _record):
+        connection.create_function("DATABASE", 0, lambda: "test")
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute", retval=True)
+    def ordinary_transaction(_connection, _cursor, statement, parameters, _context, _many):
+        # An ordinary READ COMMITTED transaction does not pin a snapshot.
+        return ("SELECT 1" if statement == "START TRANSACTION" else statement), parameters
+
+    return SimpleNamespace(connect=NativeReadConnection, dispose=engine.dispose)
+
+
+@pytest.mark.parametrize("entry", ["profile", "oceanbase", "seekdb"])
+def test_native_read_admission_keeps_one_snapshot(tmp_path, monkeypatch, entry):
+    # A real SQLite WAL file models MySQL READ COMMITTED's statement snapshots.
+    # Only the connection/protocol boundary is substituted; the native E2E
+    # suite proves these semantics on OceanBase and embedded seekDB themselves.
+    target = tmp_path / "read-consistency.db"
+    with sqlite3.connect(target) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE snapshot_values (value INTEGER NOT NULL)")
+        writer.execute("INSERT INTO snapshot_values VALUES (1)")
+    adapter = _statement_snapshot_adapter(target)
+
+    def read_twice(connection, *_args, **_kwargs):
+        first = connection.exec_driver_sql("SELECT value FROM snapshot_values").scalar_one()
+        with sqlite3.connect(target) as writer:
+            writer.execute("UPDATE snapshot_values SET value=2")
+        second = connection.exec_driver_sql("SELECT value FROM snapshot_values").scalar_one()
+        assert (first, second) == (1, 1)
+
+    if entry == "profile":
+        monkeypatch.setattr(dream_schema, "check_dream_schema", read_twice)
+        try:
+            asyncio.run(dream_schema.assert_dream_schema_ready(adapter))
+        finally:
+            asyncio.run(adapter.dispose())
+    elif entry == "oceanbase":
+        monkeypatch.setattr(connections, "create_async_engine", lambda *_args, **_kwargs: adapter)
+        monkeypatch.setattr(
+            connections, "_oceanbase_identity", lambda _connection: BackendIdentity("oceanbase", "isolated", "test")
+        )
+        config = OceanBaseConfig.model_validate({"url": "mysql+aoceanbase://test@localhost:2881/test?charset=utf8mb4"})
+        MaintenanceConnections(config).run(read_twice)
+    else:
+        path = tmp_path / "seekdb"
+        path.mkdir()
+        (path / "fixture").touch()
+
+        async def open_instance(_path):
+            return SimpleNamespace(connection_options=lambda: {}, close=lambda: None)
+
+        monkeypatch.setattr(connections, "_seekdb_storage_exists", lambda _path: True)
+        monkeypatch.setattr(connections.seekdb_profile, "_load_binding", lambda: SimpleNamespace(aopen=open_instance))
+        monkeypatch.setattr(connections.seekdb_profile, "_create_engine", lambda *_args: adapter)
+        MaintenanceConnections(SeekDBConfig(path=path)).run(read_twice)
+    with sqlite3.connect(target) as writer:
+        assert writer.execute("SELECT value FROM snapshot_values").fetchone() == (2,)

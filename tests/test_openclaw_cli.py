@@ -25,9 +25,9 @@ import pytest
 from typer.testing import CliRunner
 
 import powercontext.cli.openclaw as openclaw_cli
-import powercontext.cli.system as system_cli
 from powercontext.cli.app import create_cli
-from powercontext.cli.system import DiagnosticStatus, OpenClawSetupResult, SetupError, doctor_app, setup_app
+from powercontext.cli.installation import setup as install_plugin
+from powercontext.cli.system import DiagnosticStatus, SetupError, doctor_app
 
 
 def _write_openclaw_plugin(root: Path) -> Path:
@@ -40,79 +40,64 @@ def _write_openclaw_plugin(root: Path) -> Path:
     return plugin
 
 
-def test_resolve_openclaw_plugin_dir_accepts_checkout_root(tmp_path: Path) -> None:
-    checkout = tmp_path / "powercontext"
-    plugin = _write_openclaw_plugin(checkout)
-
-    assert openclaw_cli.resolve_openclaw_plugin_dir(source=str(checkout), ref="master") == plugin
-
-
-def test_checkout_target_rejects_path_traversal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
-
-    with pytest.raises(system_cli.SetupError, match="invalid OpenClaw ref"):
-        openclaw_cli.checkout_target("../../outside")
-
-
-def test_configure_openclaw_preserves_existing_tools_and_adds_missing_tools(monkeypatch: pytest.MonkeyPatch) -> None:
-    run_process = Mock(
-        return_value=CompletedProcess(
-            ["openclaw", "config", "get"],
-            0,
-            '["custom_tool", "powercontext_memory_get"]',
-            "",
-        )
-    )
-    run_openclaw = Mock()
-    monkeypatch.setattr(openclaw_cli, "run_process", run_process)
-    monkeypatch.setattr(openclaw_cli, "run_openclaw", run_openclaw)
-
+def test_configure_openclaw_changes_only_connection_settings(monkeypatch):
+    commands = []
+    monkeypatch.setattr(openclaw_cli, "run_openclaw", lambda *args: commands.append(args))
     openclaw_cli.configure_openclaw(
-        executable="openclaw",
-        server_url="http://127.0.0.1:8765",
-        allow_insecure_http=False,
+        executable="openclaw", server_url="https://memory.example", allow_insecure_http=False
     )
-
-    allowlist_call = run_openclaw.call_args_list[1]
-    assert allowlist_call.args[:3] == ("openclaw", "config", "set")
-    assert json.loads(allowlist_call.args[4]) == [
-        "custom_tool",
-        "powercontext_memory_get",
-        "powercontext_memory_search",
-        "powercontext_memory_store",
-        "powercontext_memory_revise",
-        "powercontext_memory_retire",
+    settings = [item for command in commands for item in json.loads(command[-1])]
+    assert settings == [
+        {"path": "plugins.entries.memory-powercontext.config.endpoint", "value": "https://memory.example"},
+        {"path": "plugins.entries.memory-powercontext.config.allowInsecureHttp", "value": False},
     ]
-    assert run_openclaw.call_args_list[-1].args == ("openclaw", "gateway", "restart")
 
 
-def test_configure_openclaw_initializes_local_gateway_when_mode_is_missing(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("failure", [None, "local_write", "native_rejection"])
+def test_config_agent_openclaw_keeps_connection_settings_consistent(
+    tmp_path: Path, monkeypatch, failure: str | None
 ) -> None:
-    def read_config(command: list[str], *, timeout: int, check: bool = True) -> CompletedProcess[str]:
-        del timeout, check
-        if command[1:4] == ["config", "get", "gateway.mode"]:
-            return CompletedProcess(command, 1, "", "Config path not found")
-        if command[1:4] == ["config", "get", "tools.alsoAllow"]:
-            return CompletedProcess(command, 0, "[]", "")
-        raise AssertionError(command)
+    from powercontext.cli import installation
+    from powercontext.cli.config import app as config_app
 
-    run_openclaw = Mock()
-    monkeypatch.setattr(openclaw_cli, "run_process", read_config)
-    monkeypatch.setattr(openclaw_cli, "run_openclaw", run_openclaw)
+    clients = tmp_path / "clients.json"
+    previous = {"version": 1, "hosts": {"openclaw": {"server_url": "https://old.example"}}}
+    clients.write_text(json.dumps(previous), encoding="utf-8")
+    native = tmp_path / "openclaw.json"
+    native.write_text(json.dumps({"endpoint": "https://old.example"}), encoding="utf-8")
+    monkeypatch.setenv("POWERCONTEXT_CLIENT_CONFIG_FILE", str(clients))
+    monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "openclaw")
 
-    openclaw_cli.configure_openclaw(
-        executable="openclaw",
-        server_url="http://127.0.0.1:8765",
-        allow_insecure_http=False,
+    def native_command(_executable, *arguments):
+        if arguments[:2] == ("config", "set"):
+            if failure == "native_rejection":
+                message = "Native configuration rejected"
+                raise SetupError(message)
+            settings = json.loads(native.read_text(encoding="utf-8"))
+            for update in json.loads(arguments[-1]):
+                settings[update["path"].rsplit(".", 1)[1]] = update["value"]
+            native.write_text(json.dumps(settings), encoding="utf-8")
+        return CompletedProcess([], 0, "{}", "")
+
+    monkeypatch.setattr(openclaw_cli, "run_openclaw", native_command)
+    write_bytes = installation.write_bytes
+
+    def write(path, value):
+        if failure == "local_write" and path == clients:
+            message = "Connection file is read-only"
+            raise PermissionError(message)
+        write_bytes(path, value)
+
+    monkeypatch.setattr(installation, "write_bytes", write)
+    result = CliRunner().invoke(
+        create_cli([config_app]),
+        ["config", "agent", "openclaw", "--server-url", "https://new.example", "--json"],
     )
 
-    settings = json.loads(run_openclaw.call_args_list[0].args[4])
-    assert settings[0] == {"path": "gateway.mode", "value": "local"}
-    assert {
-        "path": "plugins.entries.memory-powercontext.hooks.allowConversationAccess",
-        "value": True,
-    } in settings
+    assert result.exit_code == (1 if failure else 0), result.output
+    expected = "https://old.example" if failure else "https://new.example"
+    assert json.loads(native.read_text(encoding="utf-8"))["endpoint"] == expected
+    assert json.loads(clients.read_text(encoding="utf-8"))["hosts"]["openclaw"]["server_url"] == expected
 
 
 def test_install_openclaw_plugin_builds_installs_and_configures(
@@ -120,36 +105,50 @@ def test_install_openclaw_plugin_builds_installs_and_configures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = _write_openclaw_plugin(tmp_path / "checkout")
-    run_openclaw = Mock()
+    managed = tmp_path / "native-managed"
+    managed.mkdir()
+
+    def native_command(*args):
+        output = (
+            json.dumps({"install": {"installPath": str(managed)}})
+            if "inspect" in args
+            else _openclaw_plugin_list_output()
+        )
+        return CompletedProcess([], 0, output, "")
+
+    run_openclaw = Mock(side_effect=native_command)
+    monkeypatch.setattr(
+        openclaw_cli,
+        "read_config_value",
+        lambda _executable, path: (
+            {"entries": {"memory-powercontext": {"enabled": False}}} if path == "plugins" else "memory-powercontext"
+        ),
+    )
     build = Mock()
+
+    def pack(command, **kwargs):
+        (Path(command[-1]) / "plugin.tgz").write_bytes(b"archive")
+
+    monkeypatch.setattr(openclaw_cli, "run_process", pack)
+    monkeypatch.setattr(openclaw_cli, "pnpm_executable", lambda: "pnpm")
     configure = Mock()
     monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "/usr/bin/openclaw")
     monkeypatch.setattr(openclaw_cli, "require_supported_openclaw", Mock())
-    monkeypatch.setattr(openclaw_cli, "resolve_openclaw_plugin_dir", lambda **_kwargs: plugin)
+    monkeypatch.setattr("powercontext.cli.git_source.resolve_plugin_source", lambda *_args, **_kwargs: plugin)
     monkeypatch.setattr(openclaw_cli, "build_openclaw_plugin", build)
     monkeypatch.setattr(openclaw_cli, "run_openclaw", run_openclaw)
     monkeypatch.setattr(openclaw_cli, "configure_openclaw", configure)
     monkeypatch.setenv("POWERCONTEXT_HOME", str(tmp_path / "data"))
 
-    result = openclaw_cli.install_openclaw_plugin(
-        source="oceanbase/powercontext",
-        ref="tested-ref",
-        server_url="http://127.0.0.1:8765/",
-    )
+    result = install_plugin("openclaw", source=str(plugin), ref="tested-ref", server_url="http://127.0.0.1:8765/")
 
-    assert result == OpenClawSetupResult(
-        plugin="memory-powercontext",
-        plugin_path=str(plugin),
-        server_url="http://127.0.0.1:8765",
-        data_dir=str(tmp_path / "data"),
-    )
-    build.assert_called_once_with(plugin)
-    run_openclaw.assert_called_once_with("/usr/bin/openclaw", "plugins", "install", "--link", "--force", str(plugin))
-    configure.assert_called_once_with(
-        executable="/usr/bin/openclaw",
-        server_url="http://127.0.0.1:8765",
-        allow_insecure_http=False,
-    )
+    assert result == {
+        "plugin": "memory-powercontext",
+        "plugin_path": result["plugin_path"],
+        "server_url": "http://127.0.0.1:8765",
+        "data_dir": str(tmp_path / "data"),
+    }
+    assert Path(result["plugin_path"]) == managed
 
 
 def test_build_openclaw_plugin_runs_pnpm_install_non_interactively(
@@ -189,63 +188,6 @@ if "build" in sys.argv:
     assert (plugin / "dist" / "index.js").is_file()
 
 
-def test_setup_openclaw_exposes_source_ref_and_runtime_options(monkeypatch: pytest.MonkeyPatch) -> None:
-    import powercontext.cli.openclaw as openclaw_module
-
-    install = Mock(
-        return_value=OpenClawSetupResult(
-            plugin="memory-powercontext",
-            plugin_path="plugin-path",
-            server_url="http://127.0.0.1:8765",
-            data_dir="data-dir",
-        )
-    )
-    monkeypatch.setattr(openclaw_module, "install_openclaw_plugin", install)
-
-    result = CliRunner().invoke(
-        create_cli([setup_app]),
-        [
-            "setup",
-            "openclaw",
-            "--source",
-            "oceanbase/powercontext",
-            "--ref",
-            "tested-ref",
-            "--server-url",
-            "http://127.0.0.1:8765",
-            "--json",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert json.loads(result.output)["plugin"] == "memory-powercontext"
-    install.assert_called_once_with(
-        source="oceanbase/powercontext",
-        ref="tested-ref",
-        server_url="http://127.0.0.1:8765",
-        allow_insecure_http=False,
-    )
-
-
-def test_setup_openclaw_defaults_to_the_server_default_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    import powercontext.cli.openclaw as openclaw_module
-
-    def install(**kwargs: str) -> OpenClawSetupResult:
-        return OpenClawSetupResult(
-            plugin="memory-powercontext",
-            plugin_path="plugin-path",
-            server_url=kwargs["server_url"],
-            data_dir="data-dir",
-        )
-
-    monkeypatch.setattr(openclaw_module, "install_openclaw_plugin", install)
-
-    result = CliRunner().invoke(create_cli([setup_app]), ["setup", "openclaw", "--json"])
-
-    assert result.exit_code == 0
-    assert json.loads(result.output)["server_url"] == "http://127.0.0.1:8000"
-
-
 _OPENCLAW_PLUGIN_LIST_COMMAND = ["openclaw", "plugins", "list", "--enabled", "--json"]
 
 
@@ -278,11 +220,13 @@ def test_run_openclaw_diagnostics_reports_installed_plugin(monkeypatch: pytest.M
     monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "/usr/bin/openclaw")
     monkeypatch.setattr(openclaw_cli, "run_process", run_process)
 
-    diagnostics = openclaw_cli.run_openclaw_diagnostics()
+    diagnostics = openclaw_cli.OpenClawInstaller().verify()
 
     assert diagnostics["openclaw"].status is DiagnosticStatus.OK
     assert diagnostics["plugin"].status is DiagnosticStatus.OK
-    assert diagnostics["plugin"].detail == "memory-powercontext is installed and active"
+    assert "installed, enabled and selected" in diagnostics["plugin"].detail
+    assert diagnostics["plugin"].checks is not None
+    assert diagnostics["plugin"].checks["running_host_configuration"] == "not_observed"
 
 
 def test_run_openclaw_diagnostics_reads_memory_slot_when_plugin_list_omits_selection(
@@ -301,7 +245,7 @@ def test_run_openclaw_diagnostics_reads_memory_slot_when_plugin_list_omits_selec
     monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "/usr/bin/openclaw")
     monkeypatch.setattr(openclaw_cli, "run_process", run_process)
 
-    diagnostics = openclaw_cli.run_openclaw_diagnostics()
+    diagnostics = openclaw_cli.OpenClawInstaller().verify()
 
     assert diagnostics["plugin"].status is DiagnosticStatus.OK
 
@@ -315,13 +259,12 @@ def test_run_openclaw_diagnostics_reports_missing_plugin(monkeypatch: pytest.Mon
     monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "/usr/bin/openclaw")
     monkeypatch.setattr(openclaw_cli, "run_process", run_process)
 
-    diagnostics = openclaw_cli.run_openclaw_diagnostics()
+    diagnostics = openclaw_cli.OpenClawInstaller().verify()
 
     assert diagnostics["openclaw"].status is DiagnosticStatus.OK
     assert diagnostics["plugin"].status is DiagnosticStatus.FAILED
     assert (
-        diagnostics["plugin"].detail
-        == "PowerContext OpenClaw plugin is not enabled, loaded, and selected as the memory plugin"
+        diagnostics["plugin"].detail == "PowerContext OpenClaw plugin is not enabled and selected as the memory plugin"
     )
 
 
@@ -349,7 +292,7 @@ def test_run_openclaw_diagnostics_rejects_inactive_plugin(
     monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "/usr/bin/openclaw")
     monkeypatch.setattr(openclaw_cli, "run_process", run_process)
 
-    diagnostics = openclaw_cli.run_openclaw_diagnostics()
+    diagnostics = openclaw_cli.OpenClawInstaller().verify()
 
     assert diagnostics["openclaw"].status is DiagnosticStatus.OK
     assert diagnostics["plugin"].status is DiagnosticStatus.FAILED
@@ -357,19 +300,19 @@ def test_run_openclaw_diagnostics_rejects_inactive_plugin(
 
 def test_run_openclaw_diagnostics_reports_missing_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     def missing_executable() -> str:
-        raise SetupError.openclaw_unavailable()
+        message = "OpenClaw CLI is not installed or is not on PATH."
+        raise SetupError(message)
 
     monkeypatch.setattr(openclaw_cli, "openclaw_executable", missing_executable)
 
-    diagnostics = openclaw_cli.run_openclaw_diagnostics()
+    diagnostics = openclaw_cli.OpenClawInstaller().verify()
 
     assert diagnostics["openclaw"].status is DiagnosticStatus.FAILED
     assert diagnostics["plugin"].status is DiagnosticStatus.SKIPPED
 
 
 def test_doctor_openclaw_reports_an_installed_plugin_as_json(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server_checks
 ) -> None:
     monkeypatch.setenv("POWERCONTEXT_OPENCLAW_BASE_URL", "http://127.0.0.1:8000")
     run_process = Mock(
@@ -381,12 +324,12 @@ def test_doctor_openclaw_reports_an_installed_plugin_as_json(
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "openclaw", "--json"])
 
     assert result.exit_code == 0
-    report = json.loads(result.output)
+    report = json.loads(result.output)["hosts"]["openclaw"]
     assert report["checks"]["openclaw"]["ok"] is True
     assert report["checks"]["plugin"]["ok"] is True
 
 
-def test_doctor_openclaw_exits_nonzero_when_plugin_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_doctor_openclaw_exits_nonzero_when_plugin_is_missing(monkeypatch: pytest.MonkeyPatch, server_checks) -> None:
     run_process = Mock(
         return_value=CompletedProcess(
             _OPENCLAW_PLUGIN_LIST_COMMAND, 0, _openclaw_plugin_list_output(plugin_id=None), ""
@@ -398,3 +341,94 @@ def test_doctor_openclaw_exits_nonzero_when_plugin_is_missing(monkeypatch: pytes
     result = CliRunner().invoke(create_cli([doctor_app]), ["doctor", "openclaw"])
 
     assert result.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    "plugins",
+    [
+        {"enabled": False},
+        {"entries": {"memory-powercontext": {"enabled": False}}},
+        {"deny": ["memory-powercontext"]},
+        {"slots": {"memory": "other-memory-provider"}},
+    ],
+)
+def test_openclaw_activation_preserves_existing_native_choices(monkeypatch, plugins):
+    from copy import deepcopy
+
+    before = deepcopy(plugins)
+    monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "openclaw")
+    monkeypatch.setattr(
+        openclaw_cli, "read_config_value", lambda _command, path: plugins if path == "plugins" else None
+    )
+
+    def native(executable, *arguments):
+        if arguments[:2] == ("plugins", "enable"):
+            plugins.setdefault("entries", {}).setdefault("memory-powercontext", {})["enabled"] = True
+        return CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(openclaw_cli, "run_openclaw", native)
+    openclaw_cli.OpenClawInstaller().enable()
+    assert plugins == before
+
+
+def test_openclaw_rejects_installers_without_policy_preserving_installation(monkeypatch):
+    def native(command, **options):
+        return CompletedProcess(
+            command, 0, "OpenClaw 2026.8.33" if command[-1] == "--version" else "plugins install", ""
+        )
+
+    monkeypatch.setattr(openclaw_cli, "run_process", native)
+    with pytest.raises(SetupError, match="--no-enable"):
+        openclaw_cli.require_supported_openclaw("openclaw")
+
+
+def test_openclaw_config_read_failure_is_not_an_absent_setting(monkeypatch):
+    monkeypatch.setattr(
+        openclaw_cli, "run_process", lambda *args, **kwargs: CompletedProcess([], 1, "", "configuration is invalid")
+    )
+    with pytest.raises(SetupError, match="Cannot read OpenClaw configuration"):
+        openclaw_cli.read_config_value("openclaw", "plugins")
+
+
+def test_openclaw_repeat_activation_preserves_removed_native_tool_grants(monkeypatch):
+    plugins = {
+        "enabled": True,
+        "slots": {"memory": "memory-powercontext"},
+        "entries": {
+            "memory-powercontext": {
+                "enabled": True,
+                "config": {"autoRecall": False, "autoCapture": False},
+                "hooks": {"allowConversationAccess": False},
+            }
+        },
+    }
+    allowed = ["powercontext_memory_get"]
+    monkeypatch.setattr(openclaw_cli, "openclaw_executable", lambda: "openclaw")
+    monkeypatch.setattr(
+        openclaw_cli,
+        "read_config_value",
+        lambda _executable, path: {"plugins": plugins, "tools.alsoAllow": allowed, "gateway.mode": "local"}[path],
+    )
+
+    def native(*_args):
+        pytest.fail("Repeated setup must not rewrite the existing native activation policy")
+
+    monkeypatch.setattr(openclaw_cli, "run_openclaw", native)
+    openclaw_cli.OpenClawInstaller().enable()
+
+
+def test_openclaw_recognizes_native_json_unset_without_treating_other_errors_as_absence(monkeypatch):
+    output = {
+        "ok": False,
+        "error": {
+            "type": "cli_error",
+            "message": "Config path is valid but unset: gateway.mode. The runtime default applies.",
+        },
+    }
+    monkeypatch.setattr(
+        openclaw_cli, "run_process", lambda *args, **kwargs: CompletedProcess([], 1, json.dumps(output), "")
+    )
+    assert openclaw_cli.read_config_value("openclaw", "gateway.mode") is None
+    output["error"]["message"] = "Unknown config path: gateway.mode."
+    with pytest.raises(SetupError, match="Cannot read OpenClaw configuration"):
+        openclaw_cli.read_config_value("openclaw", "gateway.mode")

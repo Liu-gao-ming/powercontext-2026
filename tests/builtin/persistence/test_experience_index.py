@@ -39,6 +39,7 @@ from powercontext.builtin.persistence.oceanbase.experience_index import OceanBas
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, BUILTIN_TABLES
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
+from powercontext.builtin.scope import ScopeDraft
 from powercontext.builtin.sources import ContentCapture
 
 
@@ -68,9 +69,10 @@ def test_artifact_head_search_projection_schema_is_mysql_compilable() -> None:
     assert "pc_experience_heads" not in {table.name for table in BUILTIN_TABLES}
 
 
-def test_sqlite_startup_upgrades_legacy_artifact_heads_without_searchable_text(tmp_path) -> None:
-    database = tmp_path / "legacy.db"
+def test_sqlite_startup_upgrades_legacy_artifact_heads_without_searchable_text(initialized_sqlite_database) -> None:
+    database = initialized_sqlite_database
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE pc_artifact_heads")
         connection.execute(
             """
             CREATE TABLE pc_artifact_heads (
@@ -167,7 +169,12 @@ def test_explicit_shared_schema_upgrade_preserves_existing_heads_and_lineage(tmp
 def test_sqlite_experience_fts_tracks_only_approved_current_heads_and_rebuilds() -> None:
     async def scenario() -> None:
         async with open_builtin_contexts(BuiltinConfig(database=SQLiteConfig())) as contexts:
-            context = await contexts.get("project")
+            scope_id = (
+                await contexts.scopes.create(
+                    ScopeDraft(title="Project", summary="Experience search test", idempotency_key="experience-search")
+                )
+            ).scope_id
+            context = await contexts.get(scope_id)
             async with contexts.database.transaction() as connection:
                 experience_tables = set(
                     (
@@ -186,7 +193,7 @@ def test_sqlite_experience_fts_tracks_only_approved_current_heads_and_rebuilds()
                 ContentCapture(source_id="task-1", content="The first client repair passed.")
             )
             first_source_ref = context.sources.catalog.as_ref(first_source)
-            review = contexts.review("project")
+            review = contexts.review(scope_id)
             candidate = await review.propose_experience(
                 _experience("hamsterlegacy", "Run client generation before contract validation."),
                 sources=(first_source_ref,),
@@ -195,11 +202,11 @@ def test_sqlite_experience_fts_tracks_only_approved_current_heads_and_rebuilds()
                 reason=None,
             )
 
-            assert await contexts.search_experience("project", "hamsterlegacy", 8) == ()
+            assert await contexts.search_experience(scope_id, "hamsterlegacy", 8) == ()
 
             approved = await review.approve(candidate.candidate_id, candidate.version)
             assert approved.result_artifact is not None
-            first_outcome = await contexts.search_experience_outcome("project", "hamsterlegacy", 8)
+            first_outcome = await contexts.search_experience_outcome(scope_id, "hamsterlegacy", 8)
             assert tuple(hit.artifact_ref for hit in first_outcome.hits) == (approved.result_artifact,)
             assert first_outcome.admission is not None
             assert first_outcome.admission.admitted == 1
@@ -212,15 +219,17 @@ def test_sqlite_experience_fts_tracks_only_approved_current_heads_and_rebuilds()
             assert raw.raw < 0
             assert raw.higher_is_better is False
             assert scored_hit.retrieval_score == -raw.raw / (1 - raw.raw)
-            async with contexts.database.transaction() as connection:
-                excluded = await contexts.experience_index.search(
-                    connection, "project", "hamsterlegacy", 8, min_score=1, require_scores=True
-                )
+            from powercontext.builtin.artifacts.experience import ExperienceSearchRequest
+            from powercontext.builtin.runtime.experience_search import ExperienceArtifactSearcher
+
+            excluded = await ExperienceArtifactSearcher(
+                contexts.database, contexts.repositories.artifacts, contexts.experience_index
+            ).search(scope_id, ExperienceSearchRequest(query="hamsterlegacy", limit=8, min_score=1))
             assert excluded.hits == ()
             assert excluded.admission is not None
             assert excluded.admission.admitted == 1
             assert await contexts.search_experience("other-project", "hamsterlegacy", 8) == ()
-            assert await contexts.search_experience("project", "situation outcome", 8) == ()
+            assert await contexts.search_experience(scope_id, "situation outcome", 8) == ()
 
             second_source, _ = await context.sources.capture(
                 ContentCapture(source_id="task-2", content="The corrected client repair passed.")
@@ -235,8 +244,8 @@ def test_sqlite_experience_fts_tracks_only_approved_current_heads_and_rebuilds()
             replaced = await review.approve(replacement.candidate_id, replacement.version)
             assert replaced.result_artifact is not None
             assert replaced.result_artifact.revision == 2
-            assert await contexts.search_experience("project", "hamsterlegacy", 8) == ()
-            current = await contexts.search_experience("project", "falconcurrent", 8)
+            assert await contexts.search_experience(scope_id, "hamsterlegacy", 8) == ()
+            current = await contexts.search_experience(scope_id, "falconcurrent", 8)
             assert tuple(hit.artifact_ref for hit in current) == (replaced.result_artifact,)
 
             skill_candidate = await review.propose_skill(
@@ -248,44 +257,44 @@ def test_sqlite_experience_fts_tracks_only_approved_current_heads_and_rebuilds()
             )
             skill_approval = await review.approve(skill_candidate.candidate_id, skill_candidate.version)
             assert skill_approval.result_artifact is not None
-            skill_hits = await contexts.search_skills("project", "regenerate client", 8)
+            skill_hits = await contexts.search_skills(scope_id, "regenerate client", 8)
             assert tuple(hit.artifact_ref for hit in skill_hits) == (skill_approval.result_artifact,)
             assert skill_hits[0].retrieval_score is not None
             assert skill_hits[0].channel_scores is not None
             assert skill_hits[0].channel_scores["text"].metric == "sqlite_bm25"
             governance = await contexts.update_skill_lifecycle(
-                "project",
+                scope_id,
                 skill_approval.result_artifact.artifact_id,
                 0,
                 ArtifactLifecycleState.DEPRECATED,
                 None,
             )
             assert governance.governance_generation == 1
-            assert await contexts.search_skills("project", "regenerate client", 8) == ()
-            deprecated = await contexts.list_skills("project", True, 8)
+            assert await contexts.search_skills(scope_id, "regenerate client", 8) == ()
+            deprecated = await contexts.list_skills(scope_id, True, 8)
             assert deprecated[0][1].lifecycle_state is ArtifactLifecycleState.DEPRECATED
             reactivated = await contexts.update_skill_lifecycle(
-                "project",
+                scope_id,
                 skill_approval.result_artifact.artifact_id,
                 1,
                 ArtifactLifecycleState.ACTIVE,
                 None,
             )
             assert reactivated.governance_generation == 2
-            assert tuple(hit.artifact_ref for hit in await contexts.search_skills("project", "regenerate", 8)) == (
+            assert tuple(hit.artifact_ref for hit in await contexts.search_skills(scope_id, "regenerate", 8)) == (
                 skill_approval.result_artifact,
             )
 
             async with contexts.database.transaction() as connection:
                 experience_searchable_text = await connection.scalar(
                     select(ARTIFACT_HEADS_TABLE.c.searchable_text).where(
-                        ARTIFACT_HEADS_TABLE.c.scope_id == "project",
+                        ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
                         ARTIFACT_HEADS_TABLE.c.family == Experience.family,
                     )
                 )
                 skill_searchable_text = await connection.scalar(
                     select(ARTIFACT_HEADS_TABLE.c.searchable_text).where(
-                        ARTIFACT_HEADS_TABLE.c.scope_id == "project",
+                        ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
                         ARTIFACT_HEADS_TABLE.c.family == Skill.family,
                     )
                 )
@@ -301,12 +310,42 @@ def test_sqlite_experience_fts_tracks_only_approved_current_heads_and_rebuilds()
                     .values(searchable_text=None)
                 )
                 await connection.exec_driver_sql("DELETE FROM pc_artifact_fts")
-            assert await contexts.search_experience("project", "falconcurrent", 8) == ()
+                await connection.exec_driver_sql(
+                    "INSERT INTO pc_artifact_fts (scope_id, family, artifact_id, revision, searchable_text) "
+                    "SELECT scope_id, family, artifact_id, revision, searchable_text FROM pc_artifact_heads "
+                    "WHERE family = 'skill'"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO pc_artifact_fts (scope_id, family, artifact_id, revision, searchable_text) "
+                    "SELECT scope_id, family, artifact_id, revision, searchable_text FROM pc_artifact_heads "
+                    "WHERE family = 'skill'"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO pc_artifact_fts (scope_id, family, artifact_id, revision, searchable_text) "
+                    "SELECT scope_id, family, artifact_id, revision - 1, 'staleprojection' FROM pc_artifact_heads "
+                    "WHERE family = 'experience'"
+                )
+                await connection.exec_driver_sql(
+                    "INSERT INTO pc_artifact_fts VALUES (?, 'experience', 'orphan', 1, 'orphanprojection')",
+                    (scope_id,),
+                )
+            assert await contexts.search_experience(scope_id, "falconcurrent", 8) == ()
+
+            async with contexts.database.transaction() as connection:
+                await contexts.experience_index.rebuild(connection)
+            rebuilt = await contexts.search_experience(scope_id, "falconcurrent", 8)
+            assert tuple(hit.artifact_ref for hit in rebuilt) == (replaced.result_artifact,)
+            assert await contexts.search_experience(scope_id, "staleprojection", 8) == ()
+            assert await contexts.search_experience(scope_id, "orphanprojection", 8) == ()
+            assert tuple(hit.artifact_ref for hit in await contexts.search_skills(scope_id, "regenerate", 8)) == (
+                skill_approval.result_artifact,
+            )
 
             async with contexts.database.transaction() as connection:
                 await contexts.experience_index.initialize(connection)
-            rebuilt = await contexts.search_experience("project", "falconcurrent", 8)
-            assert tuple(hit.artifact_ref for hit in rebuilt) == (replaced.result_artifact,)
+            assert tuple(
+                hit.artifact_ref for hit in await contexts.search_experience(scope_id, "falconcurrent", 8)
+            ) == (replaced.result_artifact,)
 
     asyncio.run(scenario())
 
@@ -429,22 +468,16 @@ def test_skill_threshold_uses_same_score_and_admission_contract() -> None:
     assert hits[0].channel_scores["text"].raw == -1
 
 
-def test_oceanbase_search_selects_match_raw_and_preserves_candidate_window() -> None:
+def test_oceanbase_search_preserves_match_raw_score() -> None:
     rows = [_experience_row("one", 2.0, "oceanbase_match")]
-    connection = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: rows)))
-    outcome = asyncio.run(
-        OceanBaseExperienceFTSIndex().search(
-            cast(AsyncConnection, connection), "project", "client", 8, require_scores=True
-        )
+    connection = SimpleNamespace(
+        dialect=SimpleNamespace(name="mysql"),
+        execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: rows)),
     )
-    statement = connection.execute.await_args.args[0]
-    compiled = statement.compile(dialect=mysql.dialect())
-    sql = str(compiled)
-
-    assert "AS raw_score" in sql
-    assert "MATCH (pc_artifact_heads.searchable_text) AGAINST" in sql
-    assert "ORDER BY MATCH" in sql
-    assert " DESC, pc_artifact_heads.artifact_id, pc_artifact_heads.revision" in sql
-    assert 32 in compiled.params.values()
+    selected = asyncio.run(
+        OceanBaseExperienceFTSIndex().search(cast(AsyncConnection, connection), "project", "experience", "client", 8)
+    )
+    outcome = experience_search_hits(selected, "client", 8, "project", require_scores=True)
     assert outcome.hits[0].channel_scores is not None
     assert outcome.hits[0].channel_scores["text"].metric == "oceanbase_match"
+    assert outcome.hits[0].channel_scores["text"].raw == 2.0

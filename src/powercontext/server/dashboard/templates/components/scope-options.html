@@ -15,7 +15,7 @@ limitations under the License.
 -->
 
 {% macro option(item) %}
-<option value="{{ item.scope_id }}" {% if scope == item.scope_id %}selected{% endif %}>{{ item.display_title }}</option>
+<option value="{{ item.scope_id }}" {% if scope == item.scope_id %}selected{% endif %}>{{ item.display_title|default(item.title) }}</option>
 {% endmacro %}
 <div class="scope-picker" data-no-results="{{ t.scope_no_match }}">
 <style>
@@ -32,43 +32,76 @@ limitations under the License.
 </style>
 <select id="scope" name="scope" class="form-select" aria-describedby="scope-switch-hint">
   <option value="" {% if not scope %}selected{% endif %}>{{ t.scope_none }}</option>
-  {% if parent_scope or children %}
-    {% for item in scopes if item.scope_id == scope %}{{ option(item) }}{% endfor %}
-    {% if parent_scope %}
-    <optgroup label="{{ t.parent_scope }}">{{ option(parent_scope) }}</optgroup>
-    {% endif %}
-    {% if children %}
-    <optgroup label="{{ t.child_scope }}">
-      {% for item in children %}{{ option(item) }}{% endfor %}
-    </optgroup>
-    {% endif %}
-    {% set related_ids = children|map(attribute='scope_id')|list + ([parent_scope.scope_id] if parent_scope else []) + [scope] %}
-    {% set others = scopes|rejectattr('scope_id', 'in', related_ids)|list %}
-    {% if others %}
-    <optgroup label="{{ t.other_scopes }}">
-      {% for item in others %}{{ option(item) }}{% endfor %}
-    </optgroup>
-    {% endif %}
-  {% else %}
-    {% for item in scopes %}{{ option(item) }}{% endfor %}
+  {% if scope_descriptor %}{{ option(scope_descriptor) }}{% endif %}
+  {% if parent_scope %}
+  <optgroup label="{{ t.parent_scope }}">{{ option(parent_scope) }}</optgroup>
   {% endif %}
 </select>
 <span id="scope-switch-hint" class="visually-hidden">{{ t.scope_switch_hint }}</span>
 {% set scope_input %}<input type="text" aria-label="{{ t.scope_label }}">{% endset %}
 <script>
   me().run(component => {
+    const controller = new AbortController();
     const picker = new TomSelect(me('select', component), {
-      plugins: ['dropdown_input'],
+      plugins: ['dropdown_input', 'virtual_scroll'],
+      valueField: 'scope_id',
+      labelField: 'display_title',
+      searchField: ['title', 'display_title'],
+      preload: true,
+      loadThrottle: 300,
+      firstUrl(query) {
+        return '/dashboard/scope-options?' + new URLSearchParams({query, current: {{ scope|tojson }} || ''});
+      },
+      load(query, callback) {
+        const url = this.getUrl(query);
+        if (!url) { callback(); return; }
+        fetch(url, {credentials: 'same-origin', signal: controller.signal})
+          .then(response => { if (!response.ok) throw new Error('scope discovery failed'); return response.json(); })
+          .then(result => {
+            const failure = component.closest('form').querySelector('[data-scope-error]');
+            if (failure) failure.hidden = true;
+            const next = result.next_cursor
+              ? '/dashboard/scope-options?' + new URLSearchParams({query, cursor: result.next_cursor, current: {{ scope|tojson }} || ''})
+              : false;
+            this.setNextUrl(query, next);
+            if (result.parent) {
+              this.addOption({...result.parent, $optgroup: 'parent'});
+            }
+            if (result.current) this.updateOption(result.current.scope_id, result.current);
+            const related = result.parent || result.items.some(item => item.parent_scope_id === {{ scope|tojson }});
+            for (const item of result.items) {
+              if (item.scope_id === {{ scope|tojson }}) continue;
+              item.$optgroup = result.parent && item.scope_id === result.parent.scope_id ? 'parent'
+                : !related ? undefined : item.parent_scope_id === {{ scope|tojson }} ? 'children' : 'others';
+            }
+            callback(result.items);
+          })
+          .catch(() => {
+            if (!controller.signal.aborted) {
+              const failure = component.closest('form').querySelector('[data-scope-error]');
+              if (failure) failure.hidden = false;
+            }
+            callback();
+          });
+      },
+      optgroups: [
+        {value: 'parent', label: {{ t.parent_scope|tojson }}},
+        {value: 'children', label: {{ t.child_scope|tojson }}},
+        {value: 'others', label: {{ t.other_scopes|tojson }}},
+      ],
+      optgroupField: '$optgroup',
       controlInput: {{ scope_input|tojson }},
       allowEmptyOption: true,
       maxOptions: null,
       lockOptgroupOrder: true,
       render: {
+        loading_more: () => null,
+        no_more_results: () => null,
         no_results: (data, escape) => `<div class="no-results">${escape(component.dataset.noResults)}</div>`,
       },
     });
     component.on('htmx:beforeCleanupElement', event => {
-      if (event.detail.elt === component) picker.destroy();
+      if (event.detail.elt === component) { controller.abort(); picker.destroy(); }
     });
   });
 </script>

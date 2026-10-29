@@ -1,0 +1,149 @@
+name: Kimi Code acceptance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kimi-code-acceptance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Upgrade only after qualifying the new CLI with the controlled host acceptance.
+  KIMI_VERSION: '2.1.1'
+  CI: 'true'
+
+jobs:
+  changes:
+    uses: ./.github/workflows/ci-changes.yml
+
+  controlled-cli:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || fromJSON(needs.changes.outputs.suites || '{}').kimi) }}
+    name: controlled-cli (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out PowerContext
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: ./.github/actions/setup-python-env
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.21.0'
+
+      - name: Install the pinned Kimi CLI
+        run: |
+          npm install --prefix "${{ runner.temp }}/kimi-host" \
+            --registry https://registry.npmjs.org --ignore-scripts --no-audit --no-fund \
+            "@moonshot-ai/kimi-code@$KIMI_VERSION"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          cli = Path(os.environ["RUNNER_TEMP"]) / "kimi-host/node_modules/@moonshot-ai/kimi-code/dist/main.mjs"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
+              environment.write(f"KIMI_CLI_BIN={cli}\n")
+          PY
+
+      - name: Verify the real CLI and record provenance
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          import subprocess
+          from pathlib import Path
+
+          cli = Path(os.environ["KIMI_CLI_BIN"])
+          if not cli.is_file():
+              raise SystemExit("Pinned Kimi CLI is missing; host acceptance must not skip")
+          version = subprocess.check_output(["node", str(cli), "--version"], text=True).strip()
+          if version != os.environ["KIMI_VERSION"]:
+              raise SystemExit(f"Unexpected Kimi CLI version: {version}")
+          reports = Path(os.environ["RUNNER_TEMP"]) / "kimi-ci-evidence"
+          reports.mkdir()
+          provenance = {
+              "repository_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "host_package": "@moonshot-ai/kimi-code",
+              "host_version": version,
+              "host_bundle_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
+              "node_version": subprocess.check_output(["node", "--version"], text=True).strip(),
+              "python_version": platform.python_version(),
+              "platform": platform.system(),
+              "inference": "controlled",
+              "server": "real-sqlite",
+          }
+          (reports / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(provenance, indent=2))
+          PY
+
+      - name: Run plugin Hook behavior tests
+        run: node --test integrations/kimi-code/plugins/powercontext/tests/plugin.test.mjs
+
+      - name: Check generated MCP profiles
+        run: uv run --locked --no-sync python scripts/generate_kimi_profiles.py --check
+
+      - name: Run real-host acceptance without skips
+        run: |
+          uv run --locked --no-sync pytest tests/e2e/test_kimi_code_host.py tests/e2e/test_kimi_code_workflows.py \
+            -q -p no:cacheprovider \
+            --basetemp="${{ runner.temp }}/kimi-acceptance" \
+            --junitxml="${{ runner.temp }}/kimi-ci-evidence/junit.xml"
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "kimi-ci-evidence/junit.xml"
+          cases = list(ET.parse(report).iter("testcase"))
+          if not cases or any(case.find(tag) is not None for case in cases for tag in ("skipped", "failure", "error")):
+              raise SystemExit("Kimi host acceptance must execute and pass without skips")
+          PY
+
+      - name: Collect acceptance summaries
+        if: always()
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          reports = temporary / "kimi-ci-evidence"
+          reports.mkdir(exist_ok=True)
+          for evidence in (temporary / "kimi-acceptance").glob("*/evidence.json"):
+              shutil.copy2(evidence, reports / (evidence.parent.name + ".json"))
+          for evidence in (temporary / "kimi-acceptance").glob("*/server-startup.json"):
+              shutil.copy2(evidence, reports / (evidence.parent.name + "-server-startup.json"))
+          PY
+
+      - name: Upload controlled acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: kimi-controlled-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kimi-ci-evidence/
+          if-no-files-found: warn
+          retention-days: 14

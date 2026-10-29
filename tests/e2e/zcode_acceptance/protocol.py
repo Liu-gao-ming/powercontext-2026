@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from collections.abc import Callable
+from hashlib import sha256
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -48,7 +50,7 @@ def decode_response(raw: bytes) -> dict[str, Any]:
                     value = json.loads(line[6:])
                 except ValueError:
                     continue
-                if isinstance(value, dict) and "result" in value:
+                if isinstance(value, dict) and ("result" in value or "error" in value):
                     return value
     return {}
 
@@ -62,10 +64,16 @@ class WireEvidence:
         self.arrivals: list[dict[str, Any]] = []
 
     def calls(self, name: str, start: int = 0) -> list[dict[str, Any]]:
+        # Body-reading middleware exposes tools/call payloads on redirects too.
+        # Count only correlated JSON-RPC responses, including failures.
         return [
             item
             for item in self.records[start:]
-            if item["request"].get("method") == "tools/call" and item["request"].get("params", {}).get("name") == name
+            if item["request"].get("method") == "tools/call"
+            and item["request"].get("params", {}).get("name") == name
+            and "id" in item["request"]
+            and item["response"].get("id") == item["request"]["id"]
+            and ("result" in item["response"] or "error" in item["response"])
         ]
 
     def result(self, name: str, start: int = 0) -> dict[str, Any]:
@@ -88,13 +96,57 @@ class WireEvidence:
         raise AssertionError(message)
 
 
+class CaptureResponseGate:
+    """Withhold one accepted capture receipt until its owning host turn has completed."""
+
+    def __init__(self, content: str, *, release_timeout: float = 185) -> None:
+        self.content = content
+        self.release_timeout = release_timeout
+        self.accepted = threading.Event()
+        self._released = threading.Event()
+        self.receipt: dict[str, Any] | None = None
+        self.release_timed_out = False
+
+    def release(self) -> None:
+        self._released.set()
+
+    async def hold(self, response: dict[str, Any]) -> None:
+        source = response.get("source", {})
+        assert response.get("status") == "accepted" and source.get("name") == "content", (
+            "capture_gate_accepted_receipt_missing"
+        )
+        assert isinstance(source.get("source_id"), str) and source["source_id"], "capture_gate_source_identity_missing"
+        assert isinstance(response.get("position"), int) and response["position"] > 0, (
+            "capture_gate_source_position_missing"
+        )
+        self.receipt = {
+            "source": {"name": "content", "source_id": source["source_id"]},
+            "position": response["position"],
+        }
+        self.accepted.set()
+        if not await asyncio.to_thread(self._released.wait, self.release_timeout):
+            self.release_timed_out = True
+            raise AssertionError("capture_response_gate_release_timeout")
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "target_content_digest": "sha256:" + sha256(self.content.encode()).hexdigest(),
+            "accepted": self.accepted.is_set(),
+            "accepted_receipt": self.receipt,
+            "explicitly_released": self._released.is_set(),
+            "release_timed_out": self.release_timed_out,
+        }
+
+
 class ObserveServer:
     def __init__(self, app: ASGIApp, evidence: WireEvidence) -> None:
         self.app = app
         self.evidence = evidence
-        self.capture_response_delay = 0.0
+        self.event_loop: asyncio.AbstractEventLoop | None = None
+        self.capture_response_gate: CaptureResponseGate | None = None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:  # noqa: C901
+        self.event_loop = asyncio.get_running_loop()
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -104,8 +156,9 @@ class ObserveServer:
         request_body = bytearray()
         response_body = bytearray()
         status = 0
-        delayed_messages: list[Message] = []
-        delay = self.capture_response_delay if scope["path"] == "/v1/sources/content" else 0
+        held_messages: list[Message] = []
+        gate = self.capture_response_gate if scope["path"] == "/v1/sources/content" else None
+        hold_response = False
 
         async def receive_observed() -> Message:
             message = await receive()
@@ -117,9 +170,10 @@ class ObserveServer:
             return message
 
         async def send_observed(message: Message) -> None:
-            nonlocal status
+            nonlocal status, hold_response
             if message["type"] == "http.response.start":
                 status = message["status"]
+                hold_response = bool(gate and status == 202 and arrived["request"].get("content") == gate.content)
             elif message["type"] == "http.response.body":
                 response_body.extend(message.get("body", b""))
                 assert len(response_body) <= 1_048_576, "acceptance response exceeded evidence limit"
@@ -130,15 +184,16 @@ class ObserveServer:
                         "request": decode_response(bytes(request_body)) if request_body else {},
                         "response": decode_response(bytes(response_body)),
                     })
-            if delay:
-                delayed_messages.append(message)
+            if hold_response:
+                held_messages.append(message)
             else:
                 await send(message)
 
         await self.app(scope, receive_observed, send_observed)
-        if delay:
-            await asyncio.sleep(delay)
-            for message in delayed_messages:
+        if hold_response:
+            assert gate is not None
+            await gate.hold(decode_response(bytes(response_body)))
+            for message in held_messages:
                 await send(message)
 
 
@@ -173,7 +228,7 @@ class HostModelFixture:
                 (
                     item["function"]["name"]
                     for item in body.get("tools", [])
-                    if item["function"]["name"].endswith("__" + operation)
+                    if item["function"]["name"] == operation or item["function"]["name"].endswith("__" + operation)
                 ),
                 None,
             )
@@ -238,34 +293,42 @@ class HostModelFixture:
     def generate_memory(self, body: dict[str, Any]) -> JSONResponse:
         """Public inference protocol for real scheduler worker processes, not an injected Runtime pipeline."""
         self.generation_requests.append(body)
-        payload = None
+        payload: dict[str, Any] | None = None
         for text in strings(body.get("messages", [])):
             try:
                 value = json.loads(text)
             except ValueError:
                 continue
-            if isinstance(value, dict) and "evidence" in value and "current_entries" in value:
+            if isinstance(value, dict) and "evidence" in value:
                 payload = value
                 break
         assert payload is not None or not body.get("tools"), "generation_input_missing"
-        payload = payload or {"evidence": [], "current_entries": []}
-        candidates = []
-        existing = {entry["text"] for entry in payload["current_entries"]}
-        for item in payload["evidence"]:
-            match = re.search(
-                r"In the synthetic (\w+) project, the verification color is (\w+-\d+)\.",
-                "\n".join(strings(item["content"])),
+        payload = payload or {"evidence": []}
+        if "proposal" in payload:
+            proposal, related = payload["proposal"], payload["related"]
+            duplicate = next(
+                (item for item in related if (item["kind"], item["text"]) == (proposal["kind"], proposal["text"])),
+                None,
             )
-            if match and match[0] not in existing:
-                candidates.append({
-                    "intent": "add",
-                    "kind": "fact",
-                    "text": match[0],
-                    "evidence_ids": [item["evidence_id"]],
-                    "entry_id": None,
-                    "reason": "Synthetic source evidence",
-                })
-        output = json.dumps({"candidates": candidates})
+            value = {
+                "action": "noop" if duplicate else "create",
+                "compared_ids": [item["item_id"] for item in related],
+                "target_ids": [duplicate["item_id"]] if duplicate else [],
+                "content": None if duplicate else {"kind": proposal["kind"], "text": proposal["text"]},
+                "evidence_ids": [] if duplicate else proposal["evidence_ids"],
+                "reason": "Already represented" if duplicate else "Independent synthetic source evidence",
+            }
+        else:
+            candidates = []
+            for item in payload["evidence"]:
+                match = re.search(
+                    r"In the synthetic (\w+) project, the verification color is (\w+-\d+)\.",
+                    "\n".join(strings(item["content"])),
+                )
+                if match:
+                    candidates.append({"kind": "fact", "text": match[0], "evidence_ids": [item["evidence_id"]]})
+            value = {"candidates": candidates}
+        output = json.dumps(value)
         tools = body.get("tools", [])
         message = {"role": "assistant", "content": output}
         if tools:

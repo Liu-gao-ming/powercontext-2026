@@ -22,14 +22,14 @@ The provider declares exactly the following 20 tools. `generate_contract.py --ch
 | `pc_experience_get` | `get_experience` | Read an exact Experience artifact |
 | `pc_skill_generate` | `generate_skill` | Generate a managed Skill candidate |
 | `pc_skill_get` | `get_skill` | Read an exact managed Skill artifact |
-| `pc_review_list` | `list_artifact_candidates` | List candidates; explicit family experience / skill |
-| `pc_review_get` | `get_artifact_candidate` | Read a candidate |
+| `pc_review_list` | `list_candidates` | List candidates; explicit family experience / skill |
+| `pc_review_get` | `get_candidate` | Read a candidate |
 
 ## Parameter and output differences
 
 Memory tools retain their logical operation IDs. The adapter routes `pc_memory_list` to `list_atomic_memories`, Atomic reads to `get_artifact` or `get_artifact_revision`, revisions to `replace_artifact`, and forgetting to `change_atomic_memory_lifecycle`.
 
-The administrator supplies Scope/binding, Server URL/token, context assembly and byte budget. The model supplies only operation-specific fields. Search limit is 8 rather than the HTTP default of 10 and maximum of 50. Memory kind is restricted to the six documented kinds; normalized Memory text is bounded by 8192 UTF-8 bytes. Search query keeps the HTTP character limit. Code indexing and tag filters are outside this provider surface.
+The administrator supplies Scope/binding, Server URL/token, context assembly and byte budget. Host integrations, rather than the model, own bootstrap delivery receipts. The model supplies only operation-specific fields. Search limit is 8 rather than the HTTP default of 10 and maximum of 50. Memory kind is restricted to the six documented kinds; normalized Memory text is bounded by 8192 UTF-8 bytes. Search query keeps the HTTP character limit. Code indexing and tag filters are outside this provider surface.
 
 Objects, arrays and nullable inputs use strings containing one JSON value. The model-facing parameter description retains the decoded schema through the default daemon's discovery path; the plugin decodes once and validates the public HTTP contract. Nullable strings need JSON quotes, explicit null is the text `null`, and optional unused parameters may be omitted. Unknown fields, malformed/non-finite JSON, empty reference objects and malformed references fail before the operation request. Generation permits a combined 1–32 Source/Artifact references; empty array defaults are encoded as `[]`. Review's explicit family uses the text `"experience"`/`"skill"`; an omitted or JSON-null filter is unfiltered. See [Workflow serialization examples](plugin/README.md).
 

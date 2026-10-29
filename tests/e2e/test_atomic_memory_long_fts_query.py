@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Long lexical queries preserve admission on SQLite with a depth limit of 1000."""
+"""Long lexical queries preserve admission across supported databases."""
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
 
+import aiosqlite
 import pytest
 from sqlalchemy import Engine, event
 
 from powercontext.builtin.artifacts.search import AdmissionFloor
 from powercontext.builtin.persistence.atomic_memory_index import AtomicMemoryIndexFilter, AtomicMemoryRelatedRequest
-from powercontext.builtin.persistence.sqlite import SQLiteConfig
 from powercontext.builtin.runtime import BuiltinConfig, open_builtin_contexts
 from tests.e2e.test_access_control_regressions import _scope, _server
 from tests.e2e.test_sqlite_vec import _KeywordEmbeddingModel
@@ -43,7 +43,7 @@ def sqlite_expression_limit():
     def configure(connection, _record):
         if isinstance(connection, sqlite3.Connection):
             connection.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, 1000)
-        else:
+        elif isinstance(getattr(connection, "driver_connection", None), aiosqlite.Connection):
 
             async def set_limit(driver):
                 await driver._execute(driver._conn.setlimit, sqlite3.SQLITE_LIMIT_EXPR_DEPTH, 1000)
@@ -90,10 +90,10 @@ def test_long_fts_query_http_keeps_all_terms_before_result_limit(tmp_path, entry
 
 
 @pytest.mark.parametrize("mode", ["text", "hybrid"])
-def test_long_fts_query_search_preserves_recovery_probe(tmp_path, mode):
+def test_long_fts_query_search_preserves_recovery_probe(migration_backend, mode):
     async def scenario():
         async with open_builtin_contexts(
-            BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'long-query.db'}")),
+            BuiltinConfig(database=migration_backend.config),
             embedding_model=_KeywordEmbeddingModel(),
         ) as contexts:
             await contexts.get("project")
@@ -121,17 +121,15 @@ def test_long_fts_query_search_preserves_recovery_probe(tmp_path, mode):
     asyncio.run(scenario())
 
 
-def test_long_fts_query_related_recall_preserves_threshold(tmp_path):
+def test_long_fts_query_related_recall_preserves_threshold(migration_backend):
     async def scenario():
-        async with open_builtin_contexts(
-            BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'long-related.db'}"))
-        ) as contexts:
+        async with open_builtin_contexts(BuiltinConfig(database=migration_backend.config)) as contexts:
             await contexts.get("project")
             await contexts.records.create_atomic_memories(
                 "project", tuple({"kind": "fact", "text": body} for body in (ADMITTED, BELOW_THRESHOLD))
             )
             async with contexts.database.transaction() as connection:
-                hits = await contexts.atomic_memory.index.enumerate_related(
+                hits, _ = await contexts.atomic_memory.index.enumerate_related_with_heads(
                     connection, "project", AtomicMemoryRelatedRequest(QUERY, AtomicMemoryIndexFilter())
                 )
             assert [hit.text for hit in hits] == [ADMITTED]

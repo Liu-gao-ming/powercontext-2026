@@ -19,13 +19,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import os
 import socket
+import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import which
 from typing import Annotated, Never, TypeAlias
 from uuid import uuid4
 
@@ -68,16 +71,22 @@ from powercontext.client.skill_receiver import (
 )
 from powercontext.http import (
     AllScopeSelection,
-    ApproveArtifactCandidateRequest,
-    ArtifactCandidate,
-    ArtifactCandidatePage,
+    ApproveCandidateRequest,
     ArtifactPage,
     ArtifactReference,
+    Candidate,
     CandidateFamily,
+    CandidateHistory,
+    CandidateKind,
+    CandidatePage,
     CandidateStatus,
     Capabilities,
+    ClearScopeBindingRequest,
+    ClearScopeBindingResponse,
+    ContextReference,
     CreateDreamRunRequest,
     CreateRemoteSkillTargetRequest,
+    CreateScopeRequest,
     DreamOperation,
     DreamRun,
     DreamRunPage,
@@ -88,19 +97,20 @@ from powercontext.http import (
     ExperienceProposal,
     ExternalSkillImportMode,
     ExternalSkillResolution,
+    ExtractionStatus,
     FamilyCount,
     GeneratedCandidateResponse,
     GenerateExperienceRequest,
     GenerateSkillRequest,
-    GetArtifactCandidateRequest,
+    GetCandidateRequest,
     GetExperienceRequest,
     GetSkillPackageRequest,
     GetSkillRequest,
     GetStatsRequest,
     HealthResponse,
     ImportExternalSkillRequest,
-    ListArtifactCandidatesRequest,
     ListArtifactsRequest,
+    ListCandidatesRequest,
     ListDreamRunsRequest,
     ListExternalSkillsRequest,
     ListExternalSkillsResponse,
@@ -109,20 +119,29 @@ from powercontext.http import (
     ModelUsageValue,
     PublishRemoteSkillRequest,
     ReadinessResponse,
-    RejectArtifactCandidateRequest,
+    RejectCandidateRequest,
     RemoteAgentKind,
     RemoteSkillPublication,
     RemoteSkillTarget,
     RemoteSkillTargetStatus,
     RenameRemoteSkillTargetRequest,
     ResolveExternalSkillRequest,
-    ReviseArtifactCandidateRequest,
+    ResolveScopeBindingRequest,
+    ReviseCandidateRequest,
     RevokeRemoteSkillTargetRequest,
     ScanExternalSkillsRequest,
     ScanExternalSkillsResponse,
+    ScopeBinding,
+    ScopeBindingKey,
+    ScopeDescriptor,
     ScopedStats,
+    ScopeExternalReference,
     ScopeId,
+    ScopePage,
+    ScopeQueryField,
     ScopeSelection,
+    SetDefaultScopeRequest,
+    SetScopeBindingRequest,
     SkillArtifact,
     SkillGenerationOrigin,
     SkillProposal,
@@ -131,14 +150,24 @@ from powercontext.http import (
     StatsPeriod,
     SubtreeScopeSelection,
     UnpublishRemoteSkillRequest,
+    UpdateScopeRequest,
+)
+from powercontext.http._generated.models import (
+    GetTopicMemoryProcessingBlockRequest,
+    RetryTopicMemoryProcessingRequest,
+    RetryTopicMemoryProcessingResponse,
+    TopicMemoryProcessingBlock,
+    TopicMemoryProcessingStatus,
+    TopicMemoryProcessingStatusRequest,
 )
 
 HELP_OPTION_NAMES = ("-h", "--help")
 _ClientResponse: TypeAlias = (
-    ArtifactCandidate
+    Candidate
+    | CandidateHistory
     | DreamRun
     | DreamRunPage
-    | ArtifactCandidatePage
+    | CandidatePage
     | ArtifactPage
     | Capabilities
     | ExperienceArtifact
@@ -151,8 +180,15 @@ _ClientResponse: TypeAlias = (
     | RemoteSkillPublication
     | RemoteSkillTarget
     | ScanExternalSkillsResponse
+    | ScopeBinding
+    | ScopeDescriptor
+    | ScopePage
     | SkillArtifact
     | ScopedStats
+    | TopicMemoryProcessingBlock
+    | TopicMemoryProcessingStatus
+    | RetryTopicMemoryProcessingResponse
+    | ClearScopeBindingResponse
 )
 _ClientOperation: TypeAlias = Callable[[PowerContextClient], Awaitable[_ClientResponse]]
 
@@ -162,6 +198,59 @@ dream_app = typer.Typer(
     help="Create and inspect asynchronous Artifact Dreams.",
     no_args_is_help=True,
 )
+
+topic_memory_app = typer.Typer(
+    name="topic-memory",
+    context_settings={"help_option_names": HELP_OPTION_NAMES},
+    help="Inspect and explicitly retry blocked Topic Memory processing.",
+    no_args_is_help=True,
+)
+
+
+@topic_memory_app.command("status")
+def topic_memory_status(
+    context: typer.Context, scope_id: Annotated[str, typer.Option(help="Scope to inspect.")]
+) -> None:
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.get_topic_memory_processing_status(
+                TopicMemoryProcessingStatusRequest(scope_id=scope_id)
+            ),
+        )
+    )
+
+
+@topic_memory_app.command("block")
+def topic_memory_block(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Scope containing the block.")],
+    block_id: Annotated[str, typer.Option(help="Exact block ID returned by status.")],
+) -> None:
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.get_topic_memory_processing_block(
+                GetTopicMemoryProcessingBlockRequest(scope_id=scope_id, block_id=block_id)
+            ),
+        )
+    )
+
+
+@topic_memory_app.command("retry")
+def topic_memory_retry(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Option(help="Scope to retry; requires scope.admin.")],
+    block_id: Annotated[str, typer.Option(help="Exact observed block ID; duplicates reuse its acceptance.")],
+) -> None:
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.retry_topic_memory_processing(
+                RetryTopicMemoryProcessingRequest(scope_id=scope_id, block_id=block_id)
+            ),
+        )
+    )
 
 
 @dream_app.command("run")
@@ -245,7 +334,226 @@ external_skill_app = typer.Typer(
     help="Discover and exactly resolve Agent-native Skills on the Server host.",
     no_args_is_help=True,
 )
+scope_app = typer.Typer(
+    name="scope",
+    context_settings={"help_option_names": HELP_OPTION_NAMES},
+    help="Create, inspect, and bind isolated Scope boundaries.",
+    no_args_is_help=True,
+)
+scope_binding_app = typer.Typer(
+    name="binding",
+    context_settings={"help_option_names": HELP_OPTION_NAMES},
+    help="Bind external integration identities to one Scope.",
+    no_args_is_help=True,
+)
+scope_app.add_typer(scope_binding_app, name="binding")
 candidate_app.add_typer(candidate_revise_app, name="revise")
+
+_BINDING_KIND_SESSION = "session"
+_BINDING_KIND_WORKSPACE = "workspace"
+_DEFAULT_BINDING_INTEGRATION = "opencode"
+
+
+def _workspace_binding_external_id(cwd: Path, integration: str) -> str:
+    if integration in {"codex", "claude-code"}:
+        # These hosts bind the canonical repository root, including when invoked from a subdirectory.
+        root = cwd
+        executable = which("git")
+        if executable is not None:
+            try:
+                result = subprocess.run(  # noqa: S603 - fixed Git arguments, without a shell.
+                    [executable, "rev-parse", "--show-toplevel"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                )
+                if result.stdout.strip():
+                    root = Path(result.stdout.strip())
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return hashlib.sha256(os.fsencode(root.resolve(strict=False))).hexdigest()
+    if integration in {"hermes", "kimi-code"}:
+        return hashlib.sha256(os.fsencode(cwd.resolve(strict=False))).hexdigest()
+    if integration in {"opencode", "pi"}:
+        # Node hosts use path.resolve without resolving symlinks.
+        return hashlib.sha256(os.path.abspath(cwd).encode("utf-8")).hexdigest()
+    raise typer.BadParameter(  # noqa: TRY003 - user-facing CLI validation.
+        "Unsupported workspace integration; use an explicit binding key instead.", param_hint="--integration"
+    )
+
+
+def _binding_key(integration: str, kind: str, external_id: str) -> ScopeBindingKey:
+    return ScopeBindingKey(integration=integration, kind=kind, external_id=external_id)
+
+
+def _external_reference(value: str) -> ScopeExternalReference:
+    kind, separator, reference_value = value.partition("=")
+    if not separator or not kind.strip() or not reference_value.strip():
+        raise typer.BadParameter("--external-reference expects kind=value")  # noqa: TRY003
+    return ScopeExternalReference(kind=kind.strip(), value=reference_value.strip())
+
+
+@scope_app.command("create")
+def create_scope(
+    context: typer.Context,
+    title: Annotated[str, typer.Option(help="Human-readable Scope title.")],
+    summary: Annotated[str, typer.Option(help="One-line description of the Scope boundary.")],
+    idempotency_key: Annotated[
+        str | None, typer.Option(help="Stable creation key; repeating it returns the same Scope.")
+    ] = None,
+    parent_scope_id: Annotated[str | None, typer.Option(help="Optional parent Scope ID.")] = None,
+    context_reference: Annotated[list[str] | None, typer.Option(help="Related Scope ID; repeatable.")] = None,
+    external_reference: Annotated[
+        list[str] | None, typer.Option(help="External reference as kind=value; repeatable.")
+    ] = None,
+) -> None:
+    """Create one independent Scope boundary and print its opaque Scope ID."""
+
+    request = CreateScopeRequest(
+        title=title,
+        summary=summary,
+        idempotency_key=idempotency_key if idempotency_key is not None else uuid4().hex,
+        parent_scope_id=parent_scope_id,
+        context_references=[ContextReference(value) for value in context_reference or []],
+        external_references=[_external_reference(value) for value in external_reference or []],
+    )
+    asyncio.run(_execute(context, lambda client: client.create_scope(request)))
+    if not _options(context).json_output:
+        typer.echo("Next: put this ID into the matching client SCOPE_ID environment variable.")
+
+
+@scope_app.command("list")
+def list_scopes(
+    context: typer.Context,
+    query: Annotated[str | None, typer.Option(help="Bounded substring query; requires --query-field.")] = None,
+    query_field: Annotated[
+        ScopeQueryField | None, typer.Option(help="Field matched by --query; requires --query.")
+    ] = None,
+    cursor: Annotated[str | None, typer.Option(help="Opaque cursor from the previous page.")] = None,
+    limit: Annotated[int, typer.Option(min=1, max=100, help="Maximum Scopes to return.")] = 50,
+) -> None:
+    """List a bounded page of Scope descriptors."""
+
+    if (query is None) != (query_field is None):
+        raise typer.BadParameter("--query and --query-field must be supplied together")  # noqa: TRY003
+
+    asyncio.run(
+        _execute(
+            context,
+            lambda client: client.list_scopes(query=query, query_field=query_field, limit=limit, cursor=cursor),
+        )
+    )
+
+
+@scope_app.command("get")
+def get_scope(context: typer.Context, scope_id: Annotated[str, typer.Argument(help="Exact Scope ID.")]) -> None:
+    """Read one exact Scope descriptor."""
+
+    asyncio.run(_execute(context, lambda client: client.get_scope(scope_id)))
+
+
+@scope_app.command("update")
+def update_scope(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Argument(help="Exact Scope ID.")],
+    title: Annotated[str, typer.Option(help="Replacement Scope title.")],
+    summary: Annotated[str, typer.Option(help="Replacement one-line description.")],
+    expected_version: Annotated[int, typer.Option(min=1, help="Current version read from `scope get`.")],
+) -> None:
+    """Update title and summary, preserving relationships behind an explicit optimistic-lock version."""
+
+    async def operation(client: PowerContextClient) -> ScopeDescriptor:
+        current = await client.get_scope(scope_id)
+        request = UpdateScopeRequest(
+            expected_version=expected_version,
+            title=title,
+            summary=summary,
+            parent_scope_id=current.parent_scope_id,
+            context_references=current.context_references,
+            external_references=current.external_references,
+        )
+        return await client.update_scope(scope_id, request)
+
+    asyncio.run(_execute(context, operation))
+
+
+@scope_app.command("default")
+def show_default_scope(context: typer.Context) -> None:
+    """Read the host's default Scope target."""
+
+    asyncio.run(_execute(context, lambda client: client.get_default_scope()))
+
+
+@scope_app.command("set-default")
+def set_default_scope(context: typer.Context, scope_id: Annotated[str, typer.Argument(help="Exact Scope ID.")]) -> None:
+    """Change the host's default Scope target used when no binding matches."""
+
+    request = SetDefaultScopeRequest(scope_id=scope_id)
+    asyncio.run(_execute(context, lambda client: client.set_default_scope(request)))
+
+
+@scope_app.command("resolve")
+def resolve_scope(
+    context: typer.Context,
+    scope_id: Annotated[
+        str | None, typer.Option(help="Explicit Scope ID, mirroring a client SCOPE_ID setting.")
+    ] = None,
+    cwd: Annotated[
+        Path | None, typer.Option(help="Workspace directory for the workspace binding key; defaults to here.")
+    ] = None,
+    session_id: Annotated[str | None, typer.Option(help="Session ID for the session binding key.")] = None,
+    integration: Annotated[str, typer.Option(help="Binding integration name.")] = _DEFAULT_BINDING_INTEGRATION,
+    allow_default: Annotated[
+        bool, typer.Option("--allow-default/--no-allow-default", help="Fall back to the default Scope when unset.")
+    ] = True,
+) -> None:
+    """Resolve a Scope the way an agent plugin does: explicit ID, then bindings, then the default."""
+
+    binding_keys = []
+    if scope_id is None:
+        if session_id is not None and session_id.strip():
+            binding_keys.append(_binding_key(integration, _BINDING_KIND_SESSION, session_id.strip()))
+        workspace = cwd if cwd is not None else Path.cwd()
+        binding_keys.append(
+            _binding_key(integration, _BINDING_KIND_WORKSPACE, _workspace_binding_external_id(workspace, integration))
+        )
+    request = ResolveScopeBindingRequest(
+        explicit_scope_id=scope_id,
+        binding_keys=binding_keys,
+        allow_default=allow_default,
+    )
+    asyncio.run(_execute(context, lambda client: client.resolve_scope_binding(request)))
+
+
+@scope_binding_app.command("set")
+def set_scope_binding(
+    context: typer.Context,
+    scope_id: Annotated[str, typer.Argument(help="Exact Scope ID to bind.")],
+    kind: Annotated[str, typer.Option(help="Binding kind, e.g. session or workspace.")],
+    external_id: Annotated[str, typer.Option(help="Integration-specific identity, e.g. a session or path hash.")],
+    integration: Annotated[str, typer.Option(help="Binding integration name.")] = _DEFAULT_BINDING_INTEGRATION,
+) -> None:
+    """Bind one external integration identity to a Scope."""
+
+    request = SetScopeBindingRequest(
+        root=ScopeBinding(key=_binding_key(integration, kind, external_id), scope_id=scope_id)
+    )
+    asyncio.run(_execute(context, lambda client: client.set_scope_binding(request)))
+
+
+@scope_binding_app.command("clear")
+def clear_scope_binding(
+    context: typer.Context,
+    kind: Annotated[str, typer.Option(help="Binding kind, e.g. session or workspace.")],
+    external_id: Annotated[str, typer.Option(help="Integration-specific identity, e.g. a session or path hash.")],
+    integration: Annotated[str, typer.Option(help="Binding integration name.")] = _DEFAULT_BINDING_INTEGRATION,
+) -> None:
+    """Clear one external integration binding."""
+
+    request = ClearScopeBindingRequest(key=_binding_key(integration, kind, external_id))
+    asyncio.run(_execute(context, lambda client: client.clear_scope_binding(request)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,19 +637,21 @@ def list_candidates(
     scope_id: Annotated[str, typer.Option(help="Application scope containing the Review Inbox.")],
     status: Annotated[CandidateStatus, typer.Option(help="Candidate lifecycle state.")] = CandidateStatus.PENDING,
     family: Annotated[CandidateFamily | None, typer.Option(help="Optional Artifact Family filter.")] = None,
+    candidate_kind: Annotated[str | None, typer.Option(help="artifact or tag; omit for both.")] = None,
     cursor: Annotated[str | None, typer.Option(help="Opaque cursor from the previous page.")] = None,
     limit: Annotated[int, typer.Option(min=1, max=100, help="Maximum Candidate heads to return.")] = 50,
 ) -> None:
     """List current Candidate heads; pending is the default Inbox view."""
 
-    request = ListArtifactCandidatesRequest(
+    request = ListCandidatesRequest(
         scope_id=scope_id,
+        candidate_kind=None if candidate_kind is None else CandidateKind(candidate_kind),
         status=status,
         family=family,
         cursor=cursor,
         limit=limit,
     )
-    asyncio.run(_execute(context, lambda client: client.list_artifact_candidates(request)))
+    asyncio.run(_execute(context, lambda client: client.list_candidates(request)))
 
 
 @candidate_app.command("show")
@@ -352,8 +662,8 @@ def show_candidate(
 ) -> None:
     """Show the current exact Candidate version and evidence."""
 
-    request = GetArtifactCandidateRequest(scope_id=scope_id, candidate_id=candidate_id)
-    asyncio.run(_execute(context, lambda client: client.get_artifact_candidate(request)))
+    request = GetCandidateRequest(scope_id=scope_id, candidate_id=candidate_id)
+    asyncio.run(_execute(context, lambda client: client.get_candidate(request)))
 
 
 @candidate_app.command("approve")
@@ -365,12 +675,12 @@ def approve_candidate(
 ) -> None:
     """Approve one exact pending Candidate version."""
 
-    request = ApproveArtifactCandidateRequest(
+    request = ApproveCandidateRequest(
         scope_id=scope_id,
         candidate_id=candidate_id,
         expected_version=expected_version,
     )
-    asyncio.run(_execute(context, lambda client: client.approve_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.approve_candidate(request)))
 
 
 @candidate_app.command("reject")
@@ -383,13 +693,42 @@ def reject_candidate(
 ) -> None:
     """Reject one exact pending Candidate version."""
 
-    request = RejectArtifactCandidateRequest(
+    request = RejectCandidateRequest(
         scope_id=scope_id,
         candidate_id=candidate_id,
         expected_version=expected_version,
         reason=reason,
     )
-    asyncio.run(_execute(context, lambda client: client.reject_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.reject_candidate(request)))
+
+
+@candidate_revise_app.command("json")
+def revise_candidate_json(
+    context: typer.Context,
+    request_file: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="UTF-8 JSON ReviseCandidateRequest for any supported family.",
+        ),
+    ],
+) -> None:
+    """Revise a complete proposal; the result remains pending human review."""
+    try:
+        request = ReviseCandidateRequest.model_validate_json(request_file.read_text(encoding="utf-8"))
+    except ValidationError as error:
+        _raise_invalid_request("Candidate revision", error)
+    asyncio.run(_execute(context, lambda client: client.revise_candidate(request)))
+
+
+@candidate_app.command("history")
+def candidate_history(
+    context: typer.Context, scope_id: Annotated[str, typer.Option()], candidate_id: Annotated[str, typer.Argument()]
+) -> None:
+    request = GetCandidateRequest(scope_id=scope_id, candidate_id=candidate_id)
+    asyncio.run(_execute(context, lambda client: client.get_candidate_history(request)))
 
 
 @candidate_revise_app.command("experience")
@@ -421,7 +760,7 @@ def revise_experience_candidate(
     try:
         sources, artifacts, target_ref = _evidence_references(source_ref, artifact_ref, target)
         _require_target_family(target_ref, family="experience")
-        request = ReviseArtifactCandidateRequest(
+        request = ReviseCandidateRequest(
             scope_id=scope_id,
             candidate_id=candidate_id,
             expected_version=expected_version,
@@ -438,7 +777,7 @@ def revise_experience_candidate(
         )
     except ValidationError as error:
         _raise_invalid_request("Experience Candidate revision", error)
-    asyncio.run(_execute(context, lambda client: client.revise_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.revise_candidate(request)))
 
 
 @candidate_revise_app.command("skill")
@@ -485,7 +824,7 @@ def revise_skill_candidate(
     try:
         sources, artifacts, target_ref = _evidence_references(source_ref, artifact_ref, target)
         _require_target_family(target_ref, family="skill")
-        request = ReviseArtifactCandidateRequest(
+        request = ReviseCandidateRequest(
             scope_id=scope_id,
             candidate_id=candidate_id,
             expected_version=expected_version,
@@ -502,7 +841,7 @@ def revise_skill_candidate(
         )
     except ValidationError as error:
         _raise_invalid_request("managed Skill Candidate revision", error)
-    asyncio.run(_execute(context, lambda client: client.revise_artifact_candidate(request)))
+    asyncio.run(_execute(context, lambda client: client.revise_candidate(request)))
 
 
 @skill_app.command("show")
@@ -1719,39 +2058,78 @@ def _print_artifact_page(response: ArtifactPage) -> None:
         typer.echo(f"Next cursor: {response.next_cursor}")
 
 
-def _print_human_response(response: _ClientResponse) -> None:
-    if isinstance(response, (DreamRun, DreamRunPage)):
-        _print_dream_response(response)
-        return
-    if isinstance(response, (ListRemoteSkillTargetsResponse, RemoteSkillPublication, RemoteSkillTarget)):
-        _print_remote_response(response)
-        return
-    if isinstance(
+def _dump_json_response(response: _ClientResponse) -> bool:
+    if not isinstance(
         response,
         (
-            ArtifactCandidate,
-            ArtifactCandidatePage,
+            Candidate,
+            CandidateHistory,
+            CandidatePage,
             ExperienceArtifact,
             ExternalSkillResolution,
             GeneratedCandidateResponse,
             ListExternalSkillsResponse,
             ScanExternalSkillsResponse,
             SkillArtifact,
+            TopicMemoryProcessingBlock,
+            TopicMemoryProcessingStatus,
+            RetryTopicMemoryProcessingResponse,
         ),
     ):
-        typer.echo(response.model_dump_json(indent=2))
-        return
+        return False
+    typer.echo(response.model_dump_json(indent=2))
+    return True
+
+
+def _print_scope_response(response: ScopeDescriptor | ScopePage | ScopeBinding | ClearScopeBindingResponse) -> None:
     match response:
-        case Capabilities():
-            typer.echo(f"Source types: {_items(response.source_types)}")
-            typer.echo(f"Artifact families: {_items(response.artifact_families)}")
-            typer.echo(f"Memory extraction: {'enabled' if response.memory_extraction else 'disabled'}")
-            typer.echo(f"Experience generation: {'enabled' if response.experience_generation else 'disabled'}")
-            typer.echo(f"Managed Skill generation: {'enabled' if response.managed_skill_generation else 'disabled'}")
-            typer.echo(f"External Skill Registry: {'enabled' if response.external_skill_registry else 'disabled'}")
-            typer.echo(f"Handoff generation: {'enabled' if response.handoff_generation else 'disabled'}")
-            typer.echo(f"Search modes: {_items(response.search_modes)}")
-            typer.echo(f"Context versions: {_items(response.context_versions)}")
+        case ScopeDescriptor():
+            _print_scope_descriptor(response)
+        case ScopePage():
+            if not response.items:
+                typer.echo("No Scopes found.")
+                return
+            for item in response.items:
+                _print_scope_descriptor(item)
+            if response.next_cursor is not None:
+                typer.echo(f"Next cursor: {response.next_cursor}")
+        case ScopeBinding():
+            key = response.key
+            typer.echo(f"Binding {key.integration}/{key.kind}/{key.external_id} -> {response.scope_id}")
+        case ClearScopeBindingResponse():
+            typer.echo("Binding cleared." if response.cleared else "Binding was not set.")
+
+
+def _print_scope_descriptor(response: ScopeDescriptor) -> None:
+    typer.echo(f"{response.scope_id}  {response.title} (version {response.version})")
+    if response.parent_scope_id is not None:
+        typer.echo(f"  Parent: {response.parent_scope_id}")
+    for reference in response.context_references:
+        typer.echo(f"  Context reference: {reference.root}")
+    for reference in response.external_references:
+        typer.echo(f"  External reference: {reference.kind}={reference.value}")
+
+
+def _print_human_response(response: _ClientResponse) -> None:
+    if isinstance(response, (DreamRun, DreamRunPage)):
+        _print_dream_response(response)
+        return
+    if isinstance(response, (ScopeDescriptor, ScopePage, ScopeBinding, ClearScopeBindingResponse)):
+        _print_scope_response(response)
+        return
+    if isinstance(response, (ListRemoteSkillTargetsResponse, RemoteSkillPublication, RemoteSkillTarget)):
+        _print_remote_response(response)
+        return
+    if _dump_json_response(response):
+        return
+    if isinstance(response, Capabilities):
+        _print_capabilities(response)
+        return
+    _print_service_response(response)
+
+
+def _print_service_response(response: _ClientResponse) -> None:
+    match response:
         case ReadinessResponse():
             typer.echo(f"Status: {response.status}")
             for name, status in sorted(response.checks.items()):
@@ -1762,6 +2140,60 @@ def _print_human_response(response: _ClientResponse) -> None:
             _print_stats(response)
         case ArtifactPage():
             _print_artifact_page(response)
+        case _:
+            return
+
+
+def _print_capabilities(response: Capabilities) -> None:
+    """Print Server capabilities, including extraction facts already in the response."""
+
+    typer.echo(f"Source types: {_items(response.source_types)}")
+    typer.echo(f"Artifact families: {_items(response.artifact_families)}")
+    typer.echo(f"Memory extraction: {'enabled' if response.memory_extraction else 'disabled'}")
+    _print_extraction_diagnostics(response.extraction)
+    typer.echo(f"Experience generation: {'enabled' if response.experience_generation else 'disabled'}")
+    typer.echo(f"Managed Skill generation: {'enabled' if response.managed_skill_generation else 'disabled'}")
+    typer.echo(f"External Skill Registry: {'enabled' if response.external_skill_registry else 'disabled'}")
+    typer.echo(f"Handoff generation: {'enabled' if response.handoff_generation else 'disabled'}")
+    typer.echo(f"Search modes: {_items(response.search_modes)}")
+    typer.echo(f"Context versions: {_items(response.context_versions)}")
+
+
+def _print_extraction_diagnostics(status: ExtractionStatus | None) -> None:
+    """Print extraction configuration, background state, and historical observations.
+
+    A missing status is unavailable. Unknown fields stay unknown. Success and failure
+    records are evidence from the observation window, not a current health verdict.
+    """
+
+    if status is None:
+        typer.echo("Extraction diagnostics: unavailable")
+        return
+    background = status.background
+    role = "absent" if background.role is None else background.role.value
+    if background.automatic_processing_enabled is None:
+        automatic_processing = "unknown"
+    elif background.automatic_processing_enabled:
+        automatic_processing = "enabled"
+    else:
+        automatic_processing = "disabled"
+    observation = status.observation
+    typer.echo(f"Extraction configuration: {status.configuration.value}")
+    typer.echo(
+        "Extraction background: "
+        f"location={background.location.value}, "
+        f"role={role}, "
+        f"state={background.state.value}, "
+        f"automatic processing={automatic_processing}"
+    )
+    typer.echo(f"Extraction observation: {observation.status.value} since {observation.since.isoformat()}")
+    if observation.last_success_at is not None:
+        typer.echo(f"Extraction last success: {observation.last_success_at.isoformat()}")
+    if observation.last_failure is not None:
+        failure = observation.last_failure
+        typer.echo(
+            f"Extraction last failure: {failure.code} at {failure.stage.value}, {failure.occurred_at.isoformat()}"
+        )
 
 
 def _print_remote_response(
@@ -1897,10 +2329,12 @@ def register_commands(cli: typer.Typer) -> set[str]:
     cli.command()(ready)
     cli.command("import-sessions")(import_sessions)
     cli.add_typer(dream_app, name="dream")
+    cli.add_typer(topic_memory_app, name="topic-memory")
     cli.add_typer(candidate_app, name="candidate")
     cli.add_typer(experience_app, name="experience")
     cli.add_typer(skill_app, name="skill")
     cli.add_typer(external_skill_app, name="external-skill")
+    cli.add_typer(scope_app, name="scope")
     return {
         "capabilities",
         "stats",
@@ -1908,10 +2342,12 @@ def register_commands(cli: typer.Typer) -> set[str]:
         "ready",
         "import-sessions",
         "dream",
+        "topic-memory",
         "candidate",
         "experience",
         "skill",
         "external-skill",
+        "scope",
     }
 
 

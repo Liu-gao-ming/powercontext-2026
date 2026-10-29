@@ -1,0 +1,31 @@
+name: "Cache pnpm Dependencies"
+description: "Restore and save the pnpm store after pnpm has been installed"
+
+inputs:
+  working-directory:
+    description: "Project directory used to resolve the pnpm store and version"
+    required: true
+  cache-dependency-glob:
+    description: "Glob matching the project's lockfiles, relative to the repository root"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve pnpm store
+      id: pnpm
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        store_path=$(pnpm store path --silent)
+        pnpm_version=$(pnpm --version)
+        echo "path=$store_path" >> "$GITHUB_OUTPUT"
+        echo "version=$pnpm_version" >> "$GITHUB_OUTPUT"
+
+    - name: Cache pnpm store
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: ${{ steps.pnpm.outputs.path }}
+        key: pnpm-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.working-directory }}-${{ steps.pnpm.outputs.version }}-${{ hashFiles(inputs.cache-dependency-glob) }}
+        restore-keys: |
+          pnpm-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.working-directory }}-${{ steps.pnpm.outputs.version }}-

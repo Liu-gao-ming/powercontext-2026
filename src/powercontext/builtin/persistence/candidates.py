@@ -16,19 +16,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel, RootModel
-from sqlalchemy import insert, select, update
+from sqlalchemy import case, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.artifacts import ArtifactRef
+from powercontext.builtin.evidence.models import content_digest
 from powercontext.builtin.persistence.codec import dump_model, load_model, stored_bytes
-from powercontext.builtin.persistence.errors import InvalidRepositoryArgumentError
+from powercontext.builtin.persistence.errors import InvalidRepositoryArgumentError, InvalidStoredPayloadError
 from powercontext.builtin.persistence.tables import (
-    ARTIFACT_CANDIDATE_HEADS_TABLE,
-    ARTIFACT_CANDIDATE_VERSIONS_TABLE,
+    CANDIDATE_HEADS_TABLE,
+    CANDIDATE_VERSIONS_TABLE,
 )
 from powercontext.builtin.review.errors import (
     CandidateConflictError,
@@ -38,8 +41,10 @@ from powercontext.builtin.review.errors import (
 )
 from powercontext.builtin.review.models import (
     MAX_CANDIDATE_PAGE_SIZE,
-    ArtifactCandidate,
-    ArtifactCandidatePage,
+    Candidate,
+    CandidateAudit,
+    CandidateCatalogItem,
+    CandidatePage,
     CandidateStatus,
 )
 from powercontext.limits import MAX_SCOPE_ID_LENGTH
@@ -75,12 +80,12 @@ class CandidateRepository:
         artifacts: tuple[ArtifactRef, ...],
         target: ArtifactRef | None,
         reason: str | None,
-    ) -> ArtifactCandidate[Any]:
+    ) -> Candidate[Any]:
         """Create the first immutable proposal version and its pending head."""
 
         _require_scope(scope_id)
         self._require_proposal(family, proposal)
-        candidate = ArtifactCandidate(
+        candidate = Candidate(
             candidate_id=candidate_id,
             version=1,
             family=family,
@@ -91,20 +96,48 @@ class CandidateRepository:
             target=target,
             reason=reason,
         )
-        existing = await self._find_head(connection, scope_id, candidate_id)
-        if existing is not None:
-            raise CandidateConflictError(candidate_id, 1, int(existing["version"]))
-        await self._insert_version(connection, scope_id, candidate)
-        await connection.execute(
-            insert(ARTIFACT_CANDIDATE_HEADS_TABLE).values(
-                scope_id=scope_id,
-                candidate_id=candidate_id,
-                family=family,
-                version=1,
-                status=CandidateStatus.PENDING.value,
-            )
-        )
-        return candidate
+        return (await self.create_many(connection, scope_id, (candidate,)))[0]
+
+    async def create_many(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        candidates: Sequence[Candidate[Any]],
+        /,
+    ) -> tuple[Candidate[Any], ...]:
+        """Persist independent pending proposals from one operation by table."""
+
+        _require_scope(scope_id)
+        if not candidates:
+            return ()
+        versions = []
+        heads = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            self._require_proposal(candidate.family, candidate.proposal)
+            if candidate.version != 1 or candidate.status is not CandidateStatus.PENDING:
+                raise InvalidCandidateError("candidate", "bulk creation requires pending first versions")
+            if candidate.candidate_id in seen:
+                raise CandidateConflictError(candidate.candidate_id, 1, 1)
+            seen.add(candidate.candidate_id)
+            versions.append(self._version_row(scope_id, candidate))
+            heads.append({
+                "scope_id": scope_id,
+                "candidate_id": candidate.candidate_id,
+                "family": candidate.family,
+                "version": 1,
+                "status": CandidateStatus.PENDING.value,
+            })
+        try:
+            await connection.execute(insert(CANDIDATE_VERSIONS_TABLE), versions)
+            await connection.execute(insert(CANDIDATE_HEADS_TABLE), heads)
+        except IntegrityError:
+            for candidate in candidates:
+                existing = await self._find_head(connection, scope_id, candidate.candidate_id)
+                if existing is not None:
+                    raise CandidateConflictError(candidate.candidate_id, 1, int(existing["version"])) from None
+            raise
+        return tuple(candidates)
 
     async def get(
         self,
@@ -112,58 +145,73 @@ class CandidateRepository:
         scope_id: str,
         candidate_id: str,
         /,
-    ) -> ArtifactCandidate[Any]:
+        *,
+        current: bool = False,
+    ) -> Candidate[Any]:
         """Return the current Candidate head and exact proposal version."""
 
         _require_scope(scope_id)
-        row = await self._find_current(connection, scope_id, candidate_id)
+        row = await self._find_current(connection, scope_id, candidate_id, current=current)
         if row is None:
             raise CandidateNotFoundError(candidate_id)
-        return self._decode_row(row)
+        return self.decode_candidate(row)
 
-    async def list(
-        self,
-        connection: AsyncConnection,
-        scope_id: str,
-        /,
-        *,
-        status: CandidateStatus,
-        family: str | None,
-        cursor: str | None,
-        limit: int,
-    ) -> ArtifactCandidatePage[Any]:
-        """List one stable Review Inbox page ordered by Candidate identity."""
+    async def page(self, connection, scope_id, *, status, family, candidate_kind, cursor, limit, metadata_only=False):
+        """Read a stable bounded window; Tag proposals retain their required target basis."""
+        from powercontext.builtin.persistence.catalog_changes import decode_tag_candidate
 
         _require_scope(scope_id)
-        if limit < 1 or limit > MAX_CANDIDATE_PAGE_SIZE:
+        if not 1 <= limit <= MAX_CANDIDATE_PAGE_SIZE:
             raise InvalidRepositoryArgumentError("limit", f"must be between 1 and {MAX_CANDIDATE_PAGE_SIZE}")
+        heads, versions = CANDIDATE_HEADS_TABLE, CANDIDATE_VERSIONS_TABLE
+        columns = (heads, versions)
+        if metadata_only:
+            columns = (
+                heads.c.candidate_id,
+                heads.c.candidate_kind,
+                heads.c.family,
+                heads.c.version,
+                heads.c.status,
+                versions.c.reason,
+                heads.c.result_payload,
+                heads.c.decision_reason,
+                case((heads.c.candidate_kind == "tag", versions.c.proposal), else_=None).label("proposal"),
+            )
         statement = (
-            select(ARTIFACT_CANDIDATE_HEADS_TABLE, ARTIFACT_CANDIDATE_VERSIONS_TABLE)
+            select(*columns)
             .join(
-                ARTIFACT_CANDIDATE_VERSIONS_TABLE,
-                (ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.scope_id == ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id)
-                & (ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.candidate_id == ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id)
-                & (ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.version == ARTIFACT_CANDIDATE_HEADS_TABLE.c.version),
+                versions,
+                (heads.c.scope_id == versions.c.scope_id)
+                & (heads.c.candidate_id == versions.c.candidate_id)
+                & (heads.c.version == versions.c.version),
             )
-            .where(
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.status == status.value,
-            )
-            .order_by(ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id)
-            .limit(limit + 1)
+            .where(heads.c.scope_id == scope_id, heads.c.status == status.value)
         )
         if family is not None:
-            if family not in self._proposal_types:
-                raise InvalidCandidateError("family", family)
-            statement = statement.where(ARTIFACT_CANDIDATE_HEADS_TABLE.c.family == family)
+            statement = statement.where(heads.c.family == family)
+        if candidate_kind is not None:
+            statement = statement.where(heads.c.candidate_kind == candidate_kind)
         if cursor is not None:
-            statement = statement.where(ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id > cursor)
-        rows = list((await connection.execute(statement)).mappings())
-        has_more = len(rows) > limit
-        selected = rows[:limit]
-        candidates = tuple(self._decode_row(row) for row in selected)
-        next_cursor = candidates[-1].candidate_id if has_more and candidates else None
-        return ArtifactCandidatePage(candidates=candidates, next_cursor=next_cursor)
+            statement = statement.where(heads.c.candidate_id > cursor)
+        rows = tuple((await connection.execute(statement.order_by(heads.c.candidate_id).limit(limit + 1))).mappings())
+        items = tuple(
+            decode_tag_candidate(row)
+            if row["candidate_kind"] == "tag"
+            else CandidateCatalogItem.model_validate(row)
+            if metadata_only
+            else self.decode_candidate(row)
+            for row in rows[:limit]
+        )
+        return items, rows[limit - 1]["candidate_id"] if len(rows) > limit else None
+
+    async def list(self, connection, scope_id, /, *, status, family, cursor, limit):
+        """List one stable Artifact Review Inbox page ordered by Candidate identity."""
+        if family is not None and family not in self._proposal_types:
+            raise InvalidCandidateError("family", family)
+        items, cursor = await self.page(
+            connection, scope_id, status=status, family=family, candidate_kind="artifact", cursor=cursor, limit=limit
+        )
+        return CandidatePage(candidates=items, next_cursor=cursor)
 
     async def revise(
         self,
@@ -178,12 +226,12 @@ class CandidateRepository:
         artifacts: tuple[ArtifactRef, ...],
         target: ArtifactRef | None,
         reason: str | None,
-    ) -> ArtifactCandidate[Any]:
+    ) -> Candidate[Any]:
         """Append a complete immutable proposal and advance the pending head."""
 
         current = await self.lock_pending(connection, scope_id, candidate_id, expected_version)
         self._require_proposal(current.family, proposal)
-        revised = ArtifactCandidate(
+        revised = Candidate(
             candidate_id=candidate_id,
             version=current.version + 1,
             family=current.family,
@@ -193,15 +241,25 @@ class CandidateRepository:
             artifacts=artifacts,
             target=target,
             reason=reason,
+            audit=None
+            if current.audit is None
+            else current.audit.model_copy(
+                update={
+                    "proposal_digest": proposal_digest(proposal),
+                    "evidence_manifest_ref": f"candidate:{candidate_id}:{current.version + 1}",
+                    "proposal_fingerprint": None,
+                }
+            ),
         )
         await self._insert_version(connection, scope_id, revised)
         advanced = await connection.execute(
-            update(ARTIFACT_CANDIDATE_HEADS_TABLE)
+            update(CANDIDATE_HEADS_TABLE)
             .where(
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.version == expected_version,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
+                CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
+                CANDIDATE_HEADS_TABLE.c.candidate_kind == "artifact",
+                CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
+                CANDIDATE_HEADS_TABLE.c.version == expected_version,
+                CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
             )
             .values(version=revised.version)
         )
@@ -218,17 +276,18 @@ class CandidateRepository:
         expected_version: int,
         reason: str,
         /,
-    ) -> ArtifactCandidate[Any]:
+    ) -> Candidate[Any]:
         """Move a pending Candidate to its rejected terminal state."""
 
         current = await self.lock_pending(connection, scope_id, candidate_id, expected_version)
         rejected = await connection.execute(
-            update(ARTIFACT_CANDIDATE_HEADS_TABLE)
+            update(CANDIDATE_HEADS_TABLE)
             .where(
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.version == expected_version,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
+                CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
+                CANDIDATE_HEADS_TABLE.c.candidate_kind == "artifact",
+                CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
+                CANDIDATE_HEADS_TABLE.c.version == expected_version,
+                CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
             )
             .values(status=CandidateStatus.REJECTED.value, decision_reason=reason)
         )
@@ -243,21 +302,22 @@ class CandidateRepository:
         scope_id: str,
         candidate_id: str,
         expected_version: int,
-    ) -> ArtifactCandidate[Any]:
+    ) -> Candidate[Any]:
         """Acquire the pending head CAS before a lifecycle write."""
 
         _require_scope(scope_id)
         locked = await connection.execute(
-            update(ARTIFACT_CANDIDATE_HEADS_TABLE)
+            update(CANDIDATE_HEADS_TABLE)
             .where(
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.version == expected_version,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
+                CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
+                CANDIDATE_HEADS_TABLE.c.candidate_kind == "artifact",
+                CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
+                CANDIDATE_HEADS_TABLE.c.version == expected_version,
+                CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
             )
-            .values(version=ARTIFACT_CANDIDATE_HEADS_TABLE.c.version)
+            .values(version=CANDIDATE_HEADS_TABLE.c.version)
         )
-        current = await self.get(connection, scope_id, candidate_id)
+        current = await self.get(connection, scope_id, candidate_id, current=True)
         if locked.rowcount != 1:
             self._raise_stale_or_terminal(current, expected_version)
         return current
@@ -270,16 +330,17 @@ class CandidateRepository:
         expected_version: int,
         result: ArtifactRef,
         /,
-    ) -> ArtifactCandidate[Any]:
+    ) -> Candidate[Any]:
         """Record an Artifact result after its commit in the same transaction."""
 
         approved = await connection.execute(
-            update(ARTIFACT_CANDIDATE_HEADS_TABLE)
+            update(CANDIDATE_HEADS_TABLE)
             .where(
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.version == expected_version,
-                ARTIFACT_CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
+                CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
+                CANDIDATE_HEADS_TABLE.c.candidate_kind == "artifact",
+                CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
+                CANDIDATE_HEADS_TABLE.c.version == expected_version,
+                CANDIDATE_HEADS_TABLE.c.status == CandidateStatus.PENDING.value,
             )
             .values(
                 status=CandidateStatus.APPROVED.value,
@@ -297,24 +358,26 @@ class CandidateRepository:
         self,
         connection: AsyncConnection,
         scope_id: str,
-        candidate: ArtifactCandidate[Any],
+        candidate: Candidate[Any],
     ) -> None:
+        await connection.execute(insert(CANDIDATE_VERSIONS_TABLE).values(**self._version_row(scope_id, candidate)))
+
+    @staticmethod
+    def _version_row(scope_id: str, candidate: Candidate[Any]) -> dict[str, Any]:
         target = candidate.target
-        await connection.execute(
-            insert(ARTIFACT_CANDIDATE_VERSIONS_TABLE).values(
-                scope_id=scope_id,
-                candidate_id=candidate.candidate_id,
-                version=candidate.version,
-                family=candidate.family,
-                proposal=dump_model(candidate.proposal, kind="candidate-proposal", name=candidate.family),
-                source_refs=dump_model(_SourceRefs(candidate.sources), kind="candidate", name="source-refs"),
-                artifact_refs=dump_model(_ArtifactRefs(candidate.artifacts), kind="candidate", name="artifact-refs"),
-                target_family=None if target is None else target.family,
-                target_artifact_id=None if target is None else target.artifact_id,
-                target_revision=None if target is None else target.revision,
-                reason=candidate.reason,
-            )
-        )
+        return {
+            "scope_id": scope_id,
+            "candidate_id": candidate.candidate_id,
+            "version": candidate.version,
+            "family": candidate.family,
+            "proposal": _encode_proposal(candidate),
+            "source_refs": dump_model(_SourceRefs(candidate.sources), kind="candidate", name="source-refs"),
+            "artifact_refs": dump_model(_ArtifactRefs(candidate.artifacts), kind="candidate", name="artifact-refs"),
+            "target_family": None if target is None else target.family,
+            "target_artifact_id": None if target is None else target.artifact_id,
+            "target_revision": None if target is None else target.revision,
+            "reason": candidate.reason,
+        }
 
     async def _find_head(
         self,
@@ -325,9 +388,10 @@ class CandidateRepository:
         return (
             (
                 await connection.execute(
-                    select(ARTIFACT_CANDIDATE_HEADS_TABLE).where(
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
+                    select(CANDIDATE_HEADS_TABLE).where(
+                        CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
+                        CANDIDATE_HEADS_TABLE.c.candidate_kind == "artifact",
+                        CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
                     )
                 )
             )
@@ -340,48 +404,43 @@ class CandidateRepository:
         connection: AsyncConnection,
         scope_id: str,
         candidate_id: str,
+        *,
+        current: bool = False,
     ) -> Mapping[Any, Any] | None:
-        return (
-            (
-                await connection.execute(
-                    select(ARTIFACT_CANDIDATE_HEADS_TABLE, ARTIFACT_CANDIDATE_VERSIONS_TABLE)
-                    .join(
-                        ARTIFACT_CANDIDATE_VERSIONS_TABLE,
-                        (ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.scope_id == ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id)
-                        & (
-                            ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.candidate_id
-                            == ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id
-                        )
-                        & (ARTIFACT_CANDIDATE_VERSIONS_TABLE.c.version == ARTIFACT_CANDIDATE_HEADS_TABLE.c.version),
-                    )
-                    .where(
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.scope_id == scope_id,
-                        ARTIFACT_CANDIDATE_HEADS_TABLE.c.candidate_id == candidate_id,
-                    )
-                )
+        heads, versions = CANDIDATE_HEADS_TABLE, CANDIDATE_VERSIONS_TABLE
+        statement = (
+            select(heads, versions)
+            .join(
+                versions,
+                (versions.c.scope_id == heads.c.scope_id)
+                & (versions.c.candidate_id == heads.c.candidate_id)
+                & (versions.c.version == heads.c.version),
             )
-            .mappings()
-            .one_or_none()
+            .where(
+                heads.c.scope_id == scope_id, heads.c.candidate_id == candidate_id, heads.c.candidate_kind == "artifact"
+            )
         )
+        if current:
+            statement = statement.with_for_update()
+        return (await connection.execute(statement)).mappings().one_or_none()
 
-    def _decode_row(self, row: Mapping[Any, Any]) -> ArtifactCandidate[Any]:
+    def decode_candidate(self, row: Mapping[Any, Any], /) -> Candidate[Any]:
+        """Decode and validate the complete stored Candidate using its public read contract."""
+
         family = str(row["family"])
         proposal_type = self._proposal_types.get(family)
         if proposal_type is None:
             raise InvalidCandidateError("family", family)
         target_family = row["target_family"]
         result_family = row["result_family"]
-        return ArtifactCandidate(
+        proposal_payload, audit = decode_candidate_proposal_envelope(stored_bytes(row["proposal"], column="proposal"))
+        proposal = load_model(proposal_type, proposal_payload, kind="candidate-proposal", name=family)
+        return Candidate(
             candidate_id=str(row["candidate_id"]),
             version=int(row["version"]),
             family=family,
             status=CandidateStatus(str(row["status"])),
-            proposal=load_model(
-                proposal_type,
-                stored_bytes(row["proposal"], column="proposal"),
-                kind="candidate-proposal",
-                name=family,
-            ),
+            proposal=proposal,
             sources=load_model(
                 _SourceRefs,
                 stored_bytes(row["source_refs"], column="source_refs"),
@@ -414,6 +473,7 @@ class CandidateRepository:
                 )
             ),
             decision_reason=None if row["decision_reason"] is None else str(row["decision_reason"]),
+            audit=audit,
         )
 
     def _require_proposal(self, family: str, proposal: BaseModel) -> None:
@@ -424,10 +484,58 @@ class CandidateRepository:
             raise InvalidCandidateError("proposal", f"expected {expected.__name__}")
 
     @staticmethod
-    def _raise_stale_or_terminal(candidate: ArtifactCandidate[Any], expected_version: int) -> None:
+    def _raise_stale_or_terminal(candidate: Candidate[Any], expected_version: int) -> None:
         if candidate.status is not CandidateStatus.PENDING:
             raise CandidateTerminalError(candidate.candidate_id, candidate.status.value)
         raise CandidateConflictError(candidate.candidate_id, expected_version, candidate.version)
+
+
+def proposal_digest(proposal: BaseModel) -> str:
+    return content_digest(json.dumps(proposal.model_dump(mode="json"), sort_keys=True, ensure_ascii=False).encode())
+
+
+def _encode_proposal(candidate: Candidate[Any]) -> bytes:
+    if candidate.audit is None:
+        return dump_model(candidate.proposal, kind="candidate-proposal", name=candidate.family)
+    return json.dumps(
+        {
+            "candidate_payload_version": 1,
+            "proposal": candidate.proposal.model_dump(mode="json"),
+            "audit": candidate.audit.model_dump(mode="json"),
+        },
+        ensure_ascii=False,
+    ).encode()
+
+
+def decode_candidate_proposal_envelope(payload: bytes, /) -> tuple[bytes, CandidateAudit | None]:
+    """Unwrap persisted proposal provenance without changing the family-owned payload."""
+
+    try:
+        decoded = json.loads(payload)
+        if isinstance(decoded, dict) and decoded.get("candidate_payload_version") == 1:
+            return json.dumps(decoded["proposal"], ensure_ascii=False).encode(), CandidateAudit.model_validate(
+                decoded["audit"]
+            )
+    except (KeyError, ValueError, TypeError) as error:
+        raise InvalidStoredPayloadError("candidate-proposal", "envelope", "invalid proposal envelope") from error
+    return payload, None
+
+
+async def attach_candidate_audit(
+    connection: AsyncConnection, scope_id: str, candidate: Candidate[Any], audit: CandidateAudit
+) -> None:
+    """Complete a newly created version inside its original uncommitted transaction."""
+    if candidate.version != 1 or candidate.audit is not None or candidate.status is not CandidateStatus.PENDING:
+        raise InvalidCandidateError("audit", "Dream audit must be assigned at proposal creation")
+    await connection.execute(
+        update(CANDIDATE_VERSIONS_TABLE)
+        .where(
+            CANDIDATE_VERSIONS_TABLE.c.scope_id == scope_id,
+            CANDIDATE_VERSIONS_TABLE.c.candidate_id == candidate.candidate_id,
+            CANDIDATE_VERSIONS_TABLE.c.version == 1,
+        )
+        .values(proposal=_encode_proposal(candidate.model_copy(update={"audit": audit})))
+    )
 
 
 def _require_scope(scope_id: object) -> None:
@@ -440,4 +548,4 @@ def _require_scope(scope_id: object) -> None:
         )
 
 
-__all__ = ["CandidateRepository"]
+__all__ = ["CandidateRepository", "decode_candidate_proposal_envelope"]

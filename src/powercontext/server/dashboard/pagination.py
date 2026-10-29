@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import Request
 
-from powercontext.server.dashboard.api import ReadError
+from powercontext.server.dashboard.errors import ReadError
 
 PAGE_SIZE = 6
 
@@ -46,8 +46,10 @@ def list_links(ctx: dict[str, Any], family: str, window: dict[str, Any]) -> dict
     params: dict[str, Any] = {}
     if family == "notes":
         params.update(artifact=None, revision=None, notes_cursor=None, notes_history=None)
-    if family == "skill":
-        params["kind"] = "skill"
+    if family in {"skill", "experience"}:
+        params["kind"] = family
+    if family == "experience":
+        params.update(experience_cursor=None, experience_history=None)
     return {
         "page": window["page"],
         **{
@@ -70,7 +72,7 @@ def cursor_links(request: Request, ctx: dict[str, Any], family: str, following: 
     params = (
         {"view": "history", "revision": None, "return_to": None}
         if family == "profile"
-        else ({"kind": family} if family != "handoff" else {})
+        else ({"kind": family} if ctx["page"] == "methods" else {})
     )
     if family == "notes":
         params = {

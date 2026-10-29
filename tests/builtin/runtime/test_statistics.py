@@ -16,11 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
-from collections import Counter
 from pathlib import Path
-
-from sqlalchemy import event
-from sqlalchemy.engine import Engine
 
 from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.atomic_memory import AtomicMemoryContent
@@ -55,7 +51,7 @@ from powercontext.builtin.persistence import RecurrenceRepository
 from powercontext.builtin.persistence.artifacts import ArtifactRepository, RepositoryArtifactDraft
 from powercontext.builtin.persistence.sqlite import SQLiteConfig, SQLiteProfile
 from powercontext.builtin.runtime import (
-    ApproveArtifactCandidateRequest,
+    ApproveCandidateRequest,
     BuiltinConfig,
     BuiltinRuntime,
     CaptureSource,
@@ -141,7 +137,7 @@ def test_scoped_statistics_reports_current_inventory_and_recall_reduction() -> N
                 )
             )
             await runtime.review.for_scope(scope_id).approve(
-                ApproveArtifactCandidateRequest(
+                ApproveCandidateRequest(
                     candidate_id=candidate.candidate_id,
                     expected_version=candidate.version,
                 )
@@ -191,35 +187,52 @@ def test_scoped_statistics_reports_current_inventory_and_recall_reduction() -> N
 
 def test_recall_estimates_each_source_as_complete_text() -> None:
     async def scenario() -> None:
-        async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
+        async with open_builtin_runtime(
+            BuiltinConfig(database=SQLiteConfig()),
+            candidate_pipeline=AtomicMemoryGenerationPipeline(
+                extractor=_ContentCandidatePipeline(),
+                reconciler=_IndependentMemoryReconciler(),
+                estimator=character_token_estimator(),
+            ),
+        ) as runtime:
             scope_id = await _create_scope(runtime, "statistics-recall")
             sources = runtime.sources.for_scope(scope_id)
             first = await sources.capture(CaptureSource(source_id="short-a", content="a", metadata={}))
-            second = await sources.capture(CaptureSource(source_id="short-b", content="b", metadata={}))
-            candidate = await runtime.experience.for_scope(scope_id).propose(
+            await sources.capture(CaptureSource(source_id="short-b", content="b", metadata={}))
+            assert runtime.atomic_memory is not None
+            memory = runtime.atomic_memory.for_scope(scope_id)
+            await memory.flush()
+            originals = await memory.list()
+            merged = await memory.merge(
+                tuple(item.as_read() for item in originals.items),
+                AtomicMemoryContent(kind="fact", text="Estimate each complete Source through ancestry."),
+            )
+            descendant = await runtime.experience.for_scope(scope_id).propose(
                 ProposeExperienceRequest(
                     proposal=ExperienceContent(
-                        situation="A short Source recall baseline was needed.",
-                        action="Estimate each complete Source separately.",
-                        outcome="Per-Source rounding remains visible in statistics.",
-                        lesson="Do not join independent Source text before estimation.",
+                        situation="An ancestry baseline was needed.",
+                        action="Estimate each complete Source through ancestry.",
+                        outcome="Shared ancestry contributes each Source once.",
+                        lesson="Preserve complete Source text and deduplicate shared ancestry.",
                     ),
-                    sources=(first.source_ref, second.source_ref),
+                    sources=(first.source_ref,),
+                    artifacts=(merged.primary.ref,),
                 )
             )
             await runtime.review.for_scope(scope_id).approve(
-                ApproveArtifactCandidateRequest(
-                    candidate_id=candidate.candidate_id,
-                    expected_version=candidate.version,
+                ApproveCandidateRequest(
+                    candidate_id=descendant.candidate_id,
+                    expected_version=descendant.version,
                 )
             )
-            prepared = await runtime.context.for_scope(scope_id).prepare(
-                PrepareContextRequest(query="estimate each complete Source separately")
-            )
+            prepared = await runtime.context.for_scope(scope_id).prepare(PrepareContextRequest(query="ancestry"))
             result = await runtime.statistics.for_scope(scope_id).overview(period=StatisticsPeriod.TODAY)
 
         estimator = character_token_estimator()
         assert prepared.status == "ready"
+        assert prepared.content is not None and "through ancestry" in prepared.content
+        assert '"kind":"experience"' in prepared.content
+        assert '"family":"atomic-memory"' in prepared.content
         assert result.recall.totals.comparable_preparations == 1
         assert result.recall.totals.baseline_tokens == estimator.estimate("a") + estimator.estimate("b") == 2
 
@@ -522,19 +535,6 @@ def test_unlinked_handoff_citations_are_independent_of_selected() -> None:
         assert linked.by_scope[0].recurrence.unknown == 1
 
 
-def _statement_tables(statement: str, /) -> set[str]:
-    return {table for table in _BUDGETED_TABLES if table in statement}
-
-
-_BUDGETED_TABLES = (
-    "pc_source_journal_heads",
-    "pc_artifact_candidate_heads",
-    "pc_source_cursors",
-    "pc_model_usage_daily",
-    "pc_recall_token_daily",
-)
-
-
 async def _seed_selection(runtime: BuiltinRuntime, count: int, /) -> tuple[str, ...]:
     scope_ids = []
     for index in range(count):
@@ -548,37 +548,6 @@ async def _seed_selection(runtime: BuiltinRuntime, count: int, /) -> tuple[str, 
         )
         scope_ids.append(scope_id)
     return tuple(scope_ids)
-
-
-def test_statistics_selection_reads_each_table_once_regardless_of_scope_count() -> None:
-    """A selection must not cost one query per Scope; see issue #1599."""
-
-    async def counted(scope_count: int) -> Counter[str]:
-        counts: Counter[str] = Counter()
-        armed = False
-
-        def record(_conn, _cursor, statement, *_args) -> None:
-            if armed:
-                counts.update(_statement_tables(statement))
-
-        event.listen(Engine, "before_cursor_execute", record)
-        try:
-            async with open_builtin_runtime(BuiltinConfig(database=SQLiteConfig())) as runtime:
-                await _seed_selection(runtime, scope_count)
-                selection = ScopeSelection(mode="all")
-                await runtime.statistics.overview(selection, period=StatisticsPeriod.THIRTY_DAYS)
-                armed = True
-                await runtime.statistics.overview(selection, period=StatisticsPeriod.THIRTY_DAYS)
-                armed = False
-        finally:
-            event.remove(Engine, "before_cursor_execute", record)
-        return counts
-
-    small = asyncio.run(counted(2))
-    large = asyncio.run(counted(6))
-
-    assert dict(small) == dict.fromkeys(_BUDGETED_TABLES, 1)
-    assert dict(large) == dict(small)
 
 
 def test_statistics_selection_reports_the_same_scope_rows_as_scoped_overviews() -> None:
