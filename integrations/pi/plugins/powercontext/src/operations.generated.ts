@@ -143,6 +143,8 @@ export const OPERATIONS = {
   revoke_access_binding: { method: 'POST', path: '/v1/access/bindings/revoke', location: "body", scopeMode: 'none', pathParameters: [], queryParams: [], headerParams: [], successStatuses: [200], emptyStatuses: [] },
   replace_access_binding: { method: 'POST', path: '/v1/access/bindings/replace', location: "body", scopeMode: 'none', pathParameters: [], queryParams: [], headerParams: [], successStatuses: [200], emptyStatuses: [] },
   list_access_audit: { method: 'POST', path: '/v1/access/audit/list', location: "body", scopeMode: 'none', pathParameters: [], queryParams: [], headerParams: [], successStatuses: [200], emptyStatuses: [] },
+  plan_access_ownership: { method: 'POST', path: '/v1/access/ownership/plan', location: "body", scopeMode: 'none', pathParameters: [], queryParams: [], headerParams: [], successStatuses: [200], emptyStatuses: [] },
+  apply_access_ownership: { method: 'POST', path: '/v1/access/ownership/apply', location: "body", scopeMode: 'none', pathParameters: [], queryParams: [], headerParams: [], successStatuses: [200], emptyStatuses: [] },
 } as const
 
 export type OperationId = keyof typeof OPERATIONS

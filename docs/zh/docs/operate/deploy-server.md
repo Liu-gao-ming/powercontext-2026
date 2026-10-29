@@ -170,6 +170,35 @@ Cookie，最长八小时；HTTPS 下设置 Secure。反向代理应正确传递�
 共享静态 token 不会强制人工审核，也不会阻止 Agent 批准自己的 Candidate。需要分离提交和审批时，应使用不同的已认证
 Principal，并仅向审核者授予审核权限。参见[分离 Agent 提交与审核](../workflows/review-candidates.md#分离-agent-提交与审核)。
 
+### 迁移认证开启前写入的数据
+
+`ACCESS_MODE=disabled` 期间接受的数据没有 Artifact owner，也没有 Candidate owner attestation。切换到 `enforced`
+之后，这些数据仍可读取，但修改会返回 `403`，审批其待审 Candidate 会返回 `503 artifact_owner_pending`；在认证模式下
+新建的数据不受影响。Server 不会推断归属，需要管理员显式迁移缺失的授权信息：
+
+1. 先备份数据库。下面的离线命令在 Server 停止时执行，切换前后都可以运行。
+2. 用 `powercontext server access-ownership-migrate --action plan` 盘点受影响的数据。`ACCESS_MODE=disabled`
+   期间同样可以运行。把已配置的后台 Principal（例如 `ACCESS_BACKGROUND_PRINCIPAL_ID`）作为
+   `background_principal` 传入 `POST /v1/access/ownership/plan`，还可以列出因缺少 `scope.contribute` 权限、
+   定时处理会被拒绝的 Scope。
+3. 用显式指定的归属 Principal 回补。单用户静态 token 部署就是 `server-token` 服务 Principal：
+
+   ```bash
+   powercontext server access-ownership-migrate \
+     --action apply --owner service:server-token --maintenance-confirmed
+   ```
+
+   `apply` 要求先用 `--maintenance-confirmed` 确认所有 Server 进程已停止。大型部署可以重复传 `--scope-id`
+   分批迁移。每一项都是一次幂等写入，中断或重复执行只会补齐仍缺失的条目；已有的 owner 和 Candidate
+   attestation 会被保留，冲突时明确报告，不会被覆盖。不同身份需要拥有不同 Scope 时，用另一个 `--owner`
+   再次执行；多用户部署由此保持明确的身份边界。
+
+   如果没有停机窗口，也可以对运行中的 Server 走 HTTP：`POST /v1/access/ownership/apply`（先用
+   `dry_run: true` 预览）。两个 HTTP 操作都要求 `server.admin`；`ACCESS_MODE=disabled` 时 `apply` 返回
+   `503 ownership_migration_unavailable`。
+4. 验证：修改一个此前不可变的 Artifact，审批一个此前被阻塞的 Candidate，并确认 `plan` 不再报告缺口。没有
+   迁移归属或 `server.admin` 权限的身份仍会收到 `403`。
+
 ## 检查部署
 
 使用 liveness 判断进程能否响应 HTTP 请求：
