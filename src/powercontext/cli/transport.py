@@ -236,6 +236,12 @@ def resolve_setup_endpoint(
     values = loaded | dict(os.environ)
     if public_url := values.get("POWERCONTEXT_SERVER_PUBLIC_URL"):
         return normalize_client_url(public_url).removesuffix("/mcp").rstrip("/")
+    listener_values = {name.upper(): value for source in (loaded, os.environ) for name, value in source.items()}
+    if listener_values.get("POWERCONTEXT_SERVER_HTTP_UDS"):
+        raise ValueError(  # noqa: TRY003
+            "The configured Server uses UDS and has no TCP endpoint. "
+            "Set --server-url or POWERCONTEXT_SERVER_PUBLIC_URL to an HTTP(S) proxy endpoint for Agent setup."
+        )
     if "POWERCONTEXT_SERVER_HTTP_PORT" not in values:
         return default
     try:

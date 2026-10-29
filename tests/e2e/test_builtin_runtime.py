@@ -38,6 +38,7 @@ from powercontext.builtin.runtime import (
     CommitConnectorCheckpoint,
     InvalidRuntimeRequestError,
     PrepareContextRequest,
+    PreparedContext,
     SubmitSourceObservation,
     WorkingNoteKind,
     open_builtin_contexts,
@@ -140,6 +141,7 @@ def test_builtin_runtime_rejects_unregistered_scope_without_persisting_data(tmp_
             prepared = await runtime.context.for_scope(registered.scope_id).prepare(
                 PrepareContextRequest(query="registered")
             )
+            assert isinstance(prepared, PreparedContext)
 
             assert captured.sequence == 1
             assert prepared.status == "empty"
@@ -200,10 +202,13 @@ def test_builtin_runtime_uses_sqlite_fts_without_vector_extension(tmp_path, monk
             prepared = await runtime.context.for_scope(project.scope_id).prepare(
                 PrepareContextRequest(query="atomic SQL provider")
             )
+            assert isinstance(prepared, PreparedContext)
             no_memory = await runtime.context.for_scope(empty.scope_id).prepare(PrepareContextRequest(query="anything"))
+            assert isinstance(no_memory, PreparedContext)
             no_match = await runtime.context.for_scope(project.scope_id).prepare(
                 PrepareContextRequest(query="unrelated-zebra-phrase")
             )
+            assert isinstance(no_match, PreparedContext)
 
             assert captured.sequence == 1
             assert flushed.current_cursor == captured.sequence
@@ -362,15 +367,19 @@ def test_prepare_context_reads_only_direct_context_references() -> None:
             direct = await runtime.context.for_scope(middle.scope_id).prepare(
                 PrepareContextRequest(query="direct context evidence")
             )
+            assert isinstance(direct, PreparedContext)
             transitive = await runtime.context.for_scope(reader.scope_id).prepare(
                 PrepareContextRequest(query="direct context evidence")
             )
+            assert isinstance(transitive, PreparedContext)
             reverse = await runtime.context.for_scope(shared.scope_id).prepare(
                 PrepareContextRequest(query="middle reverse-only evidence")
             )
+            assert isinstance(reverse, PreparedContext)
             parent_only = await runtime.context.for_scope(child.scope_id).prepare(
                 PrepareContextRequest(query="direct context evidence")
             )
+            assert isinstance(parent_only, PreparedContext)
 
             assert direct.status == "ready"
             assert direct.content is not None
@@ -394,6 +403,7 @@ def test_prepare_context_reads_only_direct_context_references() -> None:
             now_direct = await runtime.context.for_scope(reader.scope_id).prepare(
                 PrepareContextRequest(query="direct context evidence")
             )
+            assert isinstance(now_direct, PreparedContext)
             assert now_direct.status == "ready"
 
     asyncio.run(scenario())
@@ -428,6 +438,7 @@ def test_prepare_context_keeps_referenced_scope_eligible_when_local_recall_is_fu
             prepared = await runtime.context.for_scope(reader.scope_id).prepare(
                 PrepareContextRequest(query="candidate saturation evidence")
             )
+            assert isinstance(prepared, PreparedContext)
 
             assert prepared.status == "ready"
             assert prepared.content is not None
@@ -476,6 +487,7 @@ def test_prepare_build_reports_no_recall_effort_while_the_gate_is_disabled() -> 
             async with runtime._scope_operation(scope.scope_id) as descriptor:
                 build, effort = await application._prepare_build(request, descriptor)
             prepared = await runtime.context.for_scope(scope.scope_id).prepare(request)
+            assert isinstance(prepared, PreparedContext)
 
             assert effort is None
             assert build.context.status == "ready"

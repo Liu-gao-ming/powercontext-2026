@@ -55,6 +55,7 @@ from powercontext.builtin.artifacts.prompt.errors import PromptError
 from powercontext.builtin.artifacts.prompt.service import PromptService, current_prompt
 from powercontext.builtin.decision_observations import DecisionObservation
 from powercontext.builtin.inference import (
+    InferencePrivacyError,
     InferenceTimeoutError,
     InferenceUnavailableError,
     InvalidInferenceOutputError,
@@ -829,9 +830,8 @@ class AtomicMemorySourceWindowProcessor:
             if prompt is None
             else prompt.compiled_instructions
         )
-        return (
-            pipeline.estimator.estimate(f"{instructions}\n{value.model_dump_json()}") <= self.config.input_tokens_limit
-        )
+        payload = value.model_dump_json() if pipeline.input_renderer is None else pipeline.input_renderer(value)
+        return pipeline.estimator.estimate(f"{instructions}\n{payload}") <= self.config.input_tokens_limit
 
     def _require_budget(self, pipeline, value, key):
         if not self._fits(pipeline, value, key):
@@ -862,6 +862,8 @@ class AtomicMemorySourceWindowProcessor:
         )
         try:
             decision = await gate.assess(request)
+        except InferencePrivacyError:
+            raise
         except Exception:
             return None, None
         return decision, collector.observation

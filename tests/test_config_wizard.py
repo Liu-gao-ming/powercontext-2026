@@ -37,6 +37,23 @@ def available_listener(monkeypatch) -> None:
     monkeypatch.setattr(config_wizard, "_listener_port_available", lambda host, port: True)
 
 
+@pytest.mark.parametrize("setting", ["POWERCONTEXT_SERVER_HTTP_UDS", "powercontext_server_http_uds"])
+def test_wizard_rejects_uds_configuration_before_prompts_or_writes(tmp_path: Path, setting: str) -> None:
+    output = tmp_path / "server.env"
+    content = f"{setting}=/run/powercontext/core.sock\nPOWERCONTEXT_SERVER_HTTP_PORT=18000\n"
+    output.write_text(content, encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["init", "--output", str(output)], input="")
+
+    assert result.exit_code == 2
+    assert "edit UDS configuration directly" in result.output
+    assert "Where should the data live?" not in result.output
+    assert "PowerContext configuration wizard" not in result.output
+    assert "/run/powercontext/core.sock" not in result.output
+    assert output.read_text(encoding="utf-8") == content
+    assert list(tmp_path.iterdir()) == [output]
+
+
 @pytest.mark.parametrize("stored_port", [None, "8000", "19000"])
 @pytest.mark.parametrize("selected_port", ["", "18000", "8000"])
 def test_local_port_is_saved_with_matching_connection_urls(

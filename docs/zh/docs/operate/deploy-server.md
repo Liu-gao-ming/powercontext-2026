@@ -106,6 +106,79 @@ powercontext server run --env-file /etc/powercontext/powercontext.env
 缺少 model 可能影响部分制品功能，具体影响范围及配置方式请参考
 [官网配置说明](https://powercontext.oceanbase.io/en/docs/reference/configuration/)；两类 model 都已配置时不输出该提示。
 
+## 监听 Unix domain socket
+
+在 Linux 和 macOS 上，同机代理或网关可以通过 Unix domain socket（UDS）向 Server 发送 HTTP 请求。
+设置 `POWERCONTEXT_SERVER_HTTP_UDS` 即可选择该监听方式：
+
+```bash
+export POWERCONTEXT_SERVER_HTTP_UDS="$HOME/.pc-run/core.sock"
+export POWERCONTEXT_SERVER_ACCESS_MODE=enforced
+export POWERCONTEXT_SERVER_AUTH_TOKEN="$POWERCONTEXT_DEPLOYMENT_TOKEN"
+powercontext server run
+```
+
+也可以使用 `powercontext server run --uds /absolute/path/core.sock`，CLI 参数优先于环境变量。
+启用 UDS 后，Server 不创建 TCP listener，并忽略配置中的 `HTTP_HOST` 和 `HTTP_PORT`。如果有效配置已选择 UDS，
+再显式传入 `--host` 或 `--port` 会被拒绝。未设置 UDS 时沿用 TCP 行为。UDS 支持 `all` 和 `api` role，
+其中 `api` 仍要求使用 OceanBase；`background` role 的 infrastructure listener 使用 TCP，因此拒绝 UDS 配置。
+
+请选择较短的私有运行目录：
+
+- socket 路径必须是绝对路径，不含 `..` 或 NUL，按文件系统编码计算不超过 103 字节。
+  Windows 会拒绝 UDS 配置，不会回退到 TCP。
+- Server 会以 `0700` 权限创建缺失的父目录。已有的直接父目录必须是真实目录，由 Server 的有效用户拥有，且 group 和
+  other 均无访问权限；符号链接父目录会被拒绝。socket 权限为 `0600`，网关应使用同一用户运行。
+- socket 旁的 `core.sock.lock` 文件权限为 `0600`，用于串行化启动，退出后仍会保留。正常退出只删除当前进程创建的 socket。
+  崩溃后重启时，仅在 socket 身份匹配 lock 记录且连接探测确认其已失效时才回收。普通文件、符号链接、仍在监听或身份
+  未知的 socket 都会保留，并导致启动失败。请保留 lock 文件，以便崩溃恢复。
+
+使用同一用户检查 readiness 和需要鉴权的 API：
+
+```bash
+curl --fail --unix-socket "$POWERCONTEXT_SERVER_HTTP_UDS" http://localhost/health/ready
+curl --fail --unix-socket "$POWERCONTEXT_SERVER_HTTP_UDS" \
+  --header "Authorization: Bearer ${POWERCONTEXT_DEPLOYMENT_TOKEN}" \
+  http://localhost/v1/capabilities
+```
+
+Python Client 可以传入 HTTPX 的 UDS transport：
+
+```python
+import asyncio
+import os
+
+import httpx
+
+from powercontext.client import PowerContextClient
+
+
+async def main():
+    transport = httpx.AsyncHTTPTransport(uds=os.environ["POWERCONTEXT_SERVER_HTTP_UDS"], retries=0)
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as http:
+        client = PowerContextClient(
+            "http://localhost",
+            token=os.environ["POWERCONTEXT_DEPLOYMENT_TOKEN"],
+            http_client=http,
+            trust_transport_security=True,
+        )
+        print((await client.get_capabilities()).model_dump_json())
+
+
+asyncio.run(main())
+```
+
+这里的 `http://localhost` 只是路由标签，实际连接通过 socket 建立。现有 API 路径、请求与响应结构、认证和授权规则
+继续适用；socket 权限不能替代 Bearer 鉴权。`create_server_app()` 负责创建应用，上述 CLI 负责监听与生命周期。
+
+个人 `service` 命令、本机 `ops` 管理和 Desktop 本机管理仅支持 TCP listener，会拒绝 UDS 配置；配置向导也仅生成 TCP
+配置。Core 使用 UDS 时，Agent 宿主接入需要显式提供代理的 HTTP(S) URL。远端 Skill Receiver endpoint 仍要求 HTTPS
+或 loopback peer；直接 UDS 连接没有 loopback peer，不会豁免该检查。
+
+这一监听入口提供 [Rust 网关设计（RFC #2199）](https://github.com/oceanbase/powercontext/pull/2199)所需的 Core 传输能力。
+Rust 可执行程序、联合 launcher、网关配置、私有通道认证、私有路由和网关状态表仍需单独实现。设计中的网关负责原有
+公开 TCP 端口，并携带通道认证与用户认证通过 UDS 调用 Core。
+
 ## 使用 Docker 运行
 
 在仓库根目录构建镜像：

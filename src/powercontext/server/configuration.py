@@ -111,6 +111,7 @@ def server_settings_context(
     *,
     host: str | None = None,
     port: int | None = None,
+    uds: Path | None = None,
     env_file: Path | None = None,
     environment: Mapping[str, str] | None = None,
     data_dir: Path | None = None,
@@ -163,16 +164,16 @@ def server_settings_context(
         else nullcontext()
     )
     with settings_context, loaded_context, data_dir_context:
-        http_overrides: dict[str, Any] = {}
-        if host is not None:
-            http_overrides["host"] = host
-        if port is not None:
-            http_overrides["port"] = port
+        http_overrides: dict[str, Any] = {
+            name: value for name, value in {"host": host, "port": port, "uds": uds}.items() if value is not None
+        }
         settings_kwargs: dict[str, Any] = {"http": http_overrides} if http_overrides else {}
         try:
             settings = settings_class(**settings_kwargs)
         except (SettingsError, ValidationError) as error:
             raise ServerConfigurationError(error) from error
+        if settings.http.uds is not None and (host is not None or port is not None):
+            raise ServerConfigurationError(ValueError("--host and --port cannot be combined with HTTP_UDS or --uds"))
         yield settings
 
 

@@ -377,6 +377,12 @@ def init_command(
         _fail(f"{output} already exists; use --force")
     try:
         existing = output.read_text(encoding="utf-8") if output.exists() else ""
+        values = parse_environment(existing, source=str(output))
+        if any(name.upper() == "POWERCONTEXT_SERVER_HTTP_UDS" and value for name, value in values.items()):
+            raise ConfigError(  # noqa: TRY003, TRY301
+                "The template supports TCP listeners; edit UDS configuration directly in the environment file. "
+                "/ 模板目前仅支持 TCP 监听。UDS 配置请直接编辑环境文件。"
+            )
         configuration = collect_configuration(advanced=advanced)
         _validate_operational_configuration(configuration)
         _print_summary(configuration)

@@ -122,6 +122,11 @@ def run_wizard(output: Path, *, language: str | None = None, advanced: bool = Fa
         _check_output(output)
         content = output.read_text(encoding="utf-8") if output.exists() else ""
         original = parse_environment(content, source=str(output))
+        if any(name.upper() == f"{SERVER}HTTP_UDS" and value for name, value in original.items()):
+            raise WizardInputError(  # noqa: TRY003
+                "The wizard supports TCP listeners; edit UDS configuration directly in the environment file. "
+                "/ 向导目前仅支持 TCP 监听；UDS 配置请直接编辑环境文件。"
+            )
         match = re.search(r"(?m)^# powercontext-wizard-language=(en|zh)\s*$", content)
         chosen = choose_language(language, None if match is None else match.group(1))
         ui = WizardUI(chosen)

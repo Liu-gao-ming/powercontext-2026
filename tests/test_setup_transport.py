@@ -77,6 +77,46 @@ def test_explicit_remote_endpoint_overrides_file_and_local_port(tmp_path):
     assert path.read_text() == content
 
 
+@pytest.mark.parametrize("source", ["file", "process"])
+@pytest.mark.parametrize("port", [None, "18000"])
+def test_uds_server_has_no_implicit_agent_setup_endpoint(tmp_path, monkeypatch, source, port):
+    from powercontext.cli.transport import prepare_setup_transport
+
+    values = {"POWERCONTEXT_SERVER_HTTP_UDS": "/run/powercontext/core.sock"}
+    if port is not None:
+        values["POWERCONTEXT_SERVER_HTTP_PORT"] = port
+    if source == "file":
+        (tmp_path / ".env").write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+    else:
+        for key, value in values.items():
+            monkeypatch.setenv(key.lower(), value)
+
+    with pytest.raises(RuntimeError, match="uses UDS and has no TCP endpoint") as error:
+        prepare_setup_transport("pi", json_output=True)
+
+    assert "--server-url" in str(error.value)
+    assert "/run/powercontext/core.sock" not in str(error.value)
+    assert not (tmp_path / "clients.json").exists()
+
+
+@pytest.mark.parametrize("source", ["explicit", "saved", "public"])
+def test_uds_server_preserves_declared_agent_access_urls(tmp_path, monkeypatch, source):
+    from powercontext.cli.transport import prepare_setup_transport
+    from powercontext.client.transport_policy import client_config_file
+
+    url = "https://proxy.example/prefix"
+    monkeypatch.setenv("POWERCONTEXT_SERVER_HTTP_UDS", "/run/powercontext/core.sock")
+    monkeypatch.setenv("POWERCONTEXT_SERVER_HTTP_PORT", "18000")
+    if source == "saved":
+        client_config_file().write_text(json.dumps({"version": 1, "hosts": {"pi": {"server_url": url}}}))
+    elif source == "public":
+        (tmp_path / ".env").write_text(f"POWERCONTEXT_SERVER_PUBLIC_URL={url}\n")
+
+    selected = prepare_setup_transport("pi", server_url=url if source == "explicit" else None)
+
+    assert selected.server_url == url
+
+
 @pytest.mark.parametrize("configuration", ["file", "process", "both", "explicit"])
 def test_new_codex_endpoint_replaces_saved_and_native_settings(tmp_path, monkeypatch, configuration):
     """Refreshing setup persists a newly supplied URL despite stale installed settings."""
