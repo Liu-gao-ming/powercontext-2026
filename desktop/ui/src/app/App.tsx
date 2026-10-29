@@ -27,7 +27,11 @@ import observationIcon from "../assets/retrieval.svg";
 
 import { TopBar } from "./TopBar";
 import { Overview } from "./Overview";
-import { MemoryWorkspace } from "./MemoryWorkspace";
+import {
+  MemoryWorkspace,
+  SubmittedDraftRecovery,
+  type UncertainDraft,
+} from "./MemoryWorkspace";
 import { LocalServerSettings } from "./LocalServerSettings";
 import { Help } from "./Help";
 import { Diagnostics } from "./Diagnostics";
@@ -56,6 +60,9 @@ export function App() {
   const [stateLoading, setStateLoading] = useState(true);
   const stateRequest = useRef(0);
   const [dirty, setDirty] = useState(false);
+  const [uncertainDraft, setUncertainDraft] = useState<UncertainDraft | null>(
+    null,
+  );
   const [scopeOpen, setScopeOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [connectionSelection, setConnectionSelection] = useState<{
@@ -79,8 +86,14 @@ export function App() {
     );
   }
   const { confirm, confirmation } = useConfirmation(language);
-  function confirmSwitch() {
-    return !dirty || confirm(connectionMessages[language].discard);
+  async function confirmSwitch() {
+    if (
+      (dirty || uncertainDraft) &&
+      !(await confirm(connectionMessages[language].discard))
+    )
+      return false;
+    setUncertainDraft(null);
+    return true;
   }
   const activeProfile = desktop?.profiles.find(
     (p) => p.id === desktop.active?.connectionId,
@@ -318,19 +331,31 @@ export function App() {
             />
           )}
           {page === "memories" && (
-            <MemoryWorkspace
-              key={`memory-${desktop?.active?.generation ?? "none"}`}
-              state={desktop}
-              language={language}
-              onState={receiveState}
-              onDirty={setDirty}
-              onManageConnections={() => navigate("connections")}
-              onOpenScopes={openScopes}
-              onOpenLocalServer={() =>
-                navigate("settings", { section: "local-server" })
-              }
-              contextPending={contextPending}
-            />
+            <>
+              {uncertainDraft &&
+                uncertainDraft.record.context.generation !==
+                  desktop?.active?.generation && (
+                  <SubmittedDraftRecovery
+                    draft={uncertainDraft}
+                    language={language}
+                    onDiscard={() => setUncertainDraft(null)}
+                  />
+                )}
+              <MemoryWorkspace
+                key={`memory-${desktop?.active?.generation ?? "none"}`}
+                state={desktop}
+                language={language}
+                onState={receiveState}
+                onDirty={setDirty}
+                onUncertainDraft={setUncertainDraft}
+                onManageConnections={() => navigate("connections")}
+                onOpenScopes={openScopes}
+                onOpenLocalServer={() =>
+                  navigate("settings", { section: "local-server" })
+                }
+                contextPending={contextPending}
+              />
+            </>
           )}
           {page === "connections" && (
             <Connections
