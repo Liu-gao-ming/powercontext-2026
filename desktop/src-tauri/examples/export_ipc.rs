@@ -31,8 +31,8 @@ use powercontext_desktop::{
     error::SafeError,
     ipc::FoundationInfo,
     transport::{
-        ApiFailure, AtomicMemoryDetail, MemorySaveResponse, MemorySearchHit, MemorySearchResponse,
-        wire,
+        ApiFailure, AtomicMemoryDetail, ExactRecallTokenStatistics, ExactScopeStatistics,
+        ExactScopeStatisticsItem, MemorySaveResponse, MemorySearchHit, MemorySearchResponse, wire,
     },
 };
 use ts_rs::TS;
@@ -81,6 +81,9 @@ fn main() {
         MemorySearchHit::decl(&config),
         MemorySearchResponse::decl(&config),
         AtomicMemoryDetail::decl(&config),
+        ExactScopeStatistics::decl(&config),
+        ExactRecallTokenStatistics::decl(&config),
+        ExactScopeStatisticsItem::decl(&config),
     ]
     .into_iter()
     .chain(wire::declarations(&config))

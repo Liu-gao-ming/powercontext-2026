@@ -16,6 +16,8 @@
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type {
+  ExactScopeStatistics,
+  StatsPeriod,
   FoundationInfo,
   WriteOutcome,
   AtomicMemoryDetail,
@@ -33,6 +35,10 @@ export async function getFoundationInfo(): Promise<FoundationInfo | null> {
 }
 
 export const desktopApi = {
+  stats: (generation: number, period: StatsPeriod) =>
+    invoke<ExactScopeStatistics>("get_stats", { generation, period }),
+  cancelStats: (generation: number) =>
+    invoke<void>("cancel_stats_reads", { generation }),
   remember: (generation: number, text: string) =>
     invoke<WriteOutcome>("remember_memory", { generation, text }),
   search: (generation: number, query: string) =>
